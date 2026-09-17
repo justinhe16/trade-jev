@@ -1,6 +1,7 @@
 [project]
 name = "trade-jev"
 version = "0.1.0"
+license = "MIT"
 description = "Backtest Jev (TypeSafe) as a BUY/SELL/HOLD trader on NQ L10 order-book data"
 authors = [
     { name = "Justin He", email = "justinhe16@gmail.com" }

@@ -1,0 +1,908 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script>
+  // light by default; the header toggle remembers dark
+  try { if (localStorage.getItem("jev-viewer-theme") === "dark") document.documentElement.dataset.theme = "dark"; } catch (e) {}
+</script>
+<title>Jev Run Viewer</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📈</text></svg>">
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+  --grid: #e1e0d9; --axis: #c3c2b7; --ring: rgba(11,11,11,0.10); --wash: rgba(11,11,11,0.04);
+  --long: #2a78d6; --short: #eb6834; --neutral: #898781; --good: #006300; --bad: #d03b3b;
+  --p1: #1baf7a; --p2: #4a3aa7; --p3: #e87ba4; --p4: #eda100;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19; --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,0.10); --wash: rgba(255,255,255,0.05);
+    --long: #3987e5; --short: #d95926; --good: #0ca30c; --bad: #e66767;
+    --p1: #199e70; --p2: #9085e9; --p3: #d55181; --p4: #c98500;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d; --surface: #1a1a19; --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+  --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,0.10); --wash: rgba(255,255,255,0.05);
+  --long: #3987e5; --short: #d95926; --good: #0ca30c; --bad: #e66767;
+  --p1: #199e70; --p2: #9085e9; --p3: #d55181; --p4: #c98500;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--page); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 1280px; margin: 0 auto; padding: 20px 16px 48px; }
+header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 16px; margin-bottom: 16px; }
+h1 { font-size: 20px; margin: 0; font-weight: 600; }
+h3 { font-size: 13px; margin: 0 0 10px; font-weight: 600; }
+.sub { color: var(--ink-2); font-weight: 400; }
+.muted { color: var(--muted); }
+.card { background: var(--surface); border: 1px solid var(--ring); border-radius: 12px; padding: 16px; }
+.stack > * + * { margin-top: 12px; }
+button, select, input[type=text] { font: inherit; }
+.btn, .chip {
+  border: 1px solid var(--ring); background: var(--surface); color: var(--ink-2);
+  border-radius: 8px; padding: 4px 10px; cursor: pointer; font-variant-numeric: tabular-nums;
+}
+.btn:hover, .chip:hover { background: var(--wash); }
+.btn:disabled { opacity: .5; cursor: default; }
+.chip[aria-pressed="true"] { color: var(--ink); border-color: var(--ink-2); font-weight: 600; }
+.chip.loading { opacity: .6; }
+.row { display: flex; flex-wrap: wrap; gap: 6px 8px; align-items: center; }
+.pos { color: var(--good); } .neg { color: var(--bad); }
+
+/* runs */
+.runs { width: 100%; border-collapse: collapse; font-size: 13px; }
+.runs td { padding: 8px 6px; border-top: 1px solid var(--grid); vertical-align: top; }
+.runs tr:first-child td { border-top: 0; }
+.runs .id { font-weight: 600; white-space: nowrap; }
+.runs .meta { color: var(--muted); font-size: 12px; }
+@media (max-width: 800px) { .runs td { display: block; padding: 2px 0; } .runs tr td:first-child { padding-top: 10px; } }
+
+/* settings */
+.controls { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px 20px; }
+.ctl label { display: flex; justify-content: space-between; color: var(--ink-2); font-size: 13px; }
+.ctl output { color: var(--ink); font-weight: 600; font-variant-numeric: tabular-nums; }
+.ctl input[type=range] { width: 100%; accent-color: var(--ink-2); }
+.ctl .hint { color: var(--muted); font-size: 12px; }
+.presetname { border: 1px solid var(--ring); background: var(--surface); color: var(--ink); border-radius: 8px; padding: 4px 8px; width: 140px; }
+
+/* compare */
+.tablewrap { overflow: auto; }
+table.data { width: 100%; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
+table.data th { position: sticky; top: 0; background: var(--surface); text-align: right; color: var(--ink-2); font-weight: 600; padding: 4px 6px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+table.data td { text-align: right; padding: 4px 6px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+table.data th:first-child, table.data td:first-child { text-align: left; }
+table.data tr.active td { font-weight: 600; }
+table.data tbody tr { cursor: pointer; }
+table.data tbody tr:hover { background: var(--wash); }
+.sw { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+.swl { display: inline-block; width: 14px; height: 0; border-top: 2px solid; margin-right: 6px; vertical-align: 3px; }
+.x { border: 0; background: none; color: var(--muted); cursor: pointer; padding: 0 4px; font-size: 14px; }
+.x:hover { color: var(--ink); }
+
+/* tiles */
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+.tile .k { color: var(--ink-2); font-size: 12px; }
+.tile .v { font-size: 26px; font-weight: 600; margin-top: 2px; }
+.tile .d { color: var(--muted); font-size: 12px; margin-top: 2px; }
+
+/* charts */
+.player { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding-bottom: 12px; margin-bottom: 4px; border-bottom: 1px solid var(--grid); }
+.player .btn { min-width: 84px; font-weight: 600; color: var(--ink); }
+.player select { border: 1px solid var(--ring); background: var(--surface); color: var(--ink-2); border-radius: 8px; padding: 3px 6px; }
+.player input[type=range] { flex: 1 1 200px; accent-color: var(--ink-2); }
+.live { display: flex; flex-wrap: wrap; gap: 4px 14px; color: var(--ink-2); font-size: 12px; font-variant-numeric: tabular-nums; }
+.live b { color: var(--ink); }
+.chart-head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 14px; margin: 8px 0 2px; }
+.chart-head h2 { font-size: 13px; margin: 0; font-weight: 600; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 12px; color: var(--ink-2); font-size: 12px; }
+svg.chart { display: block; width: 100%; overflow: visible; touch-action: pan-y; }
+svg text { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.gridline { stroke: var(--grid); stroke-width: 1; }
+.baseline { stroke: var(--axis); stroke-width: 1; }
+.cross { stroke: var(--ink-2); stroke-width: 1; pointer-events: none; }
+.head { stroke: var(--ink); stroke-width: 1.5; pointer-events: none; }
+.brush { fill: var(--wash); stroke: var(--ink-2); stroke-width: 1; }
+#tip {
+  position: fixed; pointer-events: none; z-index: 10; display: none; max-width: 300px;
+  background: var(--surface); border: 1px solid var(--ring); border-radius: 10px; padding: 8px 10px;
+  box-shadow: 0 4px 16px rgba(0,0,0,.12); font-size: 12px; color: var(--ink-2);
+}
+#tip b { color: var(--ink); font-weight: 600; }
+#tip .kv { display: flex; justify-content: space-between; gap: 16px; font-variant-numeric: tabular-nums; }
+.workspace { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); gap: 12px; align-items: stretch; }
+.side { display: grid; grid-template-rows: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; min-height: 0; contain: size; }  /* height follows the charts */
+.side .card { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+.side .scroll { flex: 1 1 auto; min-height: 120px; overflow: auto; }
+.side pre { max-height: none; }
+.side table.data { font-size: 11.5px; }
+.side table.data th, .side table.data td { padding: 3px 4px; }
+.posnote { color: var(--muted); font-size: 12px; margin: -2px 0 8px; }
+.tag { font-size: 11px; font-weight: 600; color: var(--ink-2); border: 1px solid var(--ring); border-radius: 6px; padding: 0 5px; margin-left: 6px; }
+tr.open td { color: var(--ink-2); font-style: italic; }
+tr.latest td { background: var(--wash); }
+@media (max-width: 1000px) { .workspace { grid-template-columns: minmax(0, 1fr); } .side { grid-template-rows: auto auto; contain: none; } .side .scroll { max-height: 420px; } }
+pre { margin: 0; white-space: pre-wrap; word-break: break-word; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--ink-2); max-height: 420px; overflow: auto; }
+.probs { display: flex; gap: 12px; margin: 0 0 8px; font-variant-numeric: tabular-nums; flex-wrap: wrap; }
+.empty { color: var(--muted); padding: 24px 0; text-align: center; }
+.note { color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+<main class="stack">
+  <header>
+    <h1>Jev Run Viewer</h1>
+    <span class="sub">run once → replay any settings → compare</span>
+    <span class="muted" id="status" style="margin-left:auto"></span>
+    <button class="btn" id="theme" aria-label="Toggle dark mode"></button>
+  </header>
+
+  <section class="card">
+    <div class="row" style="justify-content:space-between; margin-bottom:8px">
+      <h3 style="margin:0">Runs <span class="sub">· pick any mix of days</span></h3>
+      <button class="btn" id="clearsel">Clear selection</button>
+    </div>
+    <table class="runs" id="runs"></table>
+  </section>
+
+  <section class="card">
+    <h3>Replay settings <span class="sub">· re-scores stored Jev answers, no API calls</span></h3>
+    <div class="controls" id="controls"></div>
+    <div class="row" style="margin-top:12px">
+      <button class="btn" id="reset">Reset to run settings</button>
+      <span class="muted" style="margin-left:8px">Save as preset</span>
+      <input type="text" class="presetname" id="presetname" placeholder="name (optional)" aria-label="Preset name">
+      <button class="btn" id="savepreset">Save</button>
+      <span class="muted" id="presethint"></span>
+    </div>
+  </section>
+
+  <section class="card">
+    <h3>Compare <span class="sub">· P&amp;L per selected day; click a row to load its settings</span></h3>
+    <div class="tablewrap"><table class="data" id="compare"></table></div>
+  </section>
+
+  <section class="card">
+    <div class="row" style="margin-bottom:12px"><span class="muted">Focus</span><div class="row" id="focus"></div></div>
+    <div class="tiles" id="tiles"></div>
+  </section>
+
+  <section class="workspace" id="workspace">
+  <div class="card" id="chartcard">
+    <div class="player">
+      <button class="btn" id="play" aria-label="Play replay">▶ Play</button>
+      <label class="legend" for="speed">Duration
+        <select id="speed">
+          <option value="5">5 s</option><option value="10" selected>10 s</option>
+          <option value="30">30 s</option><option value="60">60 s</option>
+        </select>
+      </label>
+      <input type="range" id="scrub" min="0" max="1000" value="1000" aria-label="Replay position">
+      <div class="live" id="live"></div>
+    </div>
+    <div class="chart-head">
+      <h2>Price (mid) and position</h2>
+      <div class="legend">
+        <span><span class="sw" style="background:var(--long)"></span>Long ▲ entry</span>
+        <span><span class="sw" style="background:var(--short)"></span>Short ▼ entry</span>
+        <span>○ exit</span>
+      </div>
+      <span class="legend" style="margin-left:auto">Drag to zoom · double-click to reset</span>
+    </div>
+    <svg class="chart" id="price" height="260"></svg>
+    <div class="chart-head"><h2>Equity ($, net of costs)</h2><div class="legend" id="eqlegend"></div></div>
+    <svg class="chart" id="equity" height="170"></svg>
+    <div class="chart-head">
+      <h2>Jev answer confidence</h2>
+      <div class="legend">
+        <span><span class="sw" style="background:var(--long)"></span>BUY (up)</span>
+        <span><span class="sw" style="background:var(--short)"></span>SELL (down)</span>
+        <span><span class="sw" style="background:var(--neutral)"></span>HOLD</span>
+        <span>faded = below cutoff · lines = ± cutoff · dot = trade</span>
+      </div>
+    </div>
+    <svg class="chart" id="conf" height="130"></svg>
+  </div>
+
+  <div class="side">
+    <div class="card">
+      <h3 id="statehead">What Jev saw</h3>
+      <div class="probs" id="stateprobs"></div>
+      <div class="posnote" id="posnote"></div>
+      <div class="scroll"><pre id="state">Press play, or click a point on any chart, to see the exact state sent to Jev.</pre></div>
+    </div>
+    <div class="card">
+      <h3 id="tradeshead">Trades</h3>
+      <div class="scroll" id="tradescroll">
+        <table class="data">
+          <thead><tr><th>Entry</th><th>Side</th><th>In</th><th>Out</th><th>Exit</th><th>P&amp;L</th></tr></thead>
+          <tbody id="trades"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  </section>
+
+  <p class="note">
+    A <b>run</b> is a backtest that called Jev. A <b>replay</b> re-scores its stored answers under the settings above.
+    Replays are approximate: Jev answered with the run's own positions in its state. Fills use the exact bid/ask at
+    decision time + latency; stops and targets are checked once per second and fill at their own price (no gap
+    slippage), so with stops off P&amp;L matches the Python replay exactly and with tight stops it reads optimistic.
+  </p>
+</main>
+<div id="tip" role="tooltip"></div>
+
+<script src="/replay.js"></script>
+<script>
+// ======================================================================= state
+const $ = (id) => document.getElementById(id);
+const PRESET_COLORS = ["--p1", "--p2", "--p3", "--p4"];
+const CONTROLS = [
+  { key: "minConf", label: "Confidence cutoff", min: 0, max: 1, step: 0.05, fmt: (v) => v === 0 ? "off" : "≥ " + v.toFixed(2), hint: "Ignore Jev answers below this probability" },
+  { key: "agree", label: "Agreeing answers", min: 1, max: 6, step: 1, fmt: (v) => v + " in a row", hint: "Consecutive same-side answers needed to act" },
+  { key: "minHold", label: "Minimum hold", min: 0, max: 600, step: 15, fmt: (v) => v === 0 ? "off" : v + " s", hint: "Seconds before a position may reverse" },
+  { key: "stop", label: "Stop", min: 0, max: 400, step: 10, fmt: (v) => v === 0 ? "off" : v + " ticks", hint: "Loss in ticks that force-closes" },
+  { key: "target", label: "Target", min: 0, max: 400, step: 10, fmt: (v) => v === 0 ? "off" : v + " ticks", hint: "Gain in ticks that closes" },
+  { key: "commission", label: "Commission / side", min: 0, max: 10, step: 0.25, fmt: (v) => "$" + v.toFixed(2), hint: "Charged on entry and exit" },
+];
+const KEYS = CONTROLS.map((c) => c.key);
+const store = {
+  get(k, d) { try { const v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} },
+};
+
+let RUNS = [];                 // from /api/runs
+const payloads = new Map();    // "run@day" → day payload
+const pending = new Set();     // keys being fetched
+let sel = [];                  // selected keys, ordered
+let focus = null;              // focused key
+let params = null;             // current settings
+let presets = store.get("jev-viewer-presets", []);   // [{name, params, color}]
+let view = null, pinned = null, playhead = null;
+let R = null;                  // current replay of the focused slice
+
+const keyOf = (run, day) => `${run}@${day}`;
+const parseKey = (k) => { const [run, day] = k.split("@"); return { run, day }; };
+const runOf = (id) => RUNS.find((r) => r.run_id === id);
+const upto = () => playhead == null ? view[1] : Math.min(view[1], playhead);
+
+function runDefaults(run) {
+  const g = run?.gate || { min_conf: 0, agree: 1, min_hold_s: 0 };
+  const c = run?.config || { stop_ticks: 200, target_ticks: 0, commission: 2.5 };
+  return { minConf: g.min_conf, agree: g.agree, minHold: g.min_hold_s, stop: c.stop_ticks, target: c.target_ticks, commission: c.commission };
+}
+
+// ======================================================================= formatting
+const fmtUsd = (v, sign = true) => v == null || isNaN(v) ? "–" : (sign && v > 0 ? "+" : v < 0 ? "−" : "") + "$" + Math.abs(v).toLocaleString(undefined, { maximumFractionDigits: 0 });
+const pnlCls = (v) => v > 0 ? "pos" : v < 0 ? "neg" : "";
+const fmtDur = (s) => s < 90 ? Math.round(s) + " s" : (s / 60).toFixed(1) + " min";
+const etFmt = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+const etShort = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "2-digit", minute: "2-digit", hour12: false });
+const shortRun = (id) => id.replace(/^\d{8}-/, "");
+const sliceLabel = (k) => { const { run, day } = parseKey(k); return `${day.slice(5)} · ${shortRun(run)}`; };
+const settingsLabel = (p) => `conf ${p.minConf || "off"} · agree ${p.agree} · hold ${p.minHold || "off"} · stop ${p.stop || "off"} · target ${p.target || "off"}`;
+
+// ======================================================================= URL state
+function readUrl() {
+  const q = new URLSearchParams(location.search);
+  const out = { sel: (q.get("sel") || "").split(",").filter(Boolean), focus: q.get("focus"), params: {} };
+  for (const k of KEYS) if (q.has(k) && !isNaN(+q.get(k))) out.params[k] = +q.get(k);
+  out.play = q.get("play") === "1";
+  out.at = q.get("at");  // "HH:MM[:SS]" ET → park the playhead there
+  return out;
+}
+function writeUrl() {
+  const q = new URLSearchParams();
+  if (sel.length) q.set("sel", sel.join(","));
+  if (focus) q.set("focus", focus);
+  for (const k of KEYS) q.set(k, params[k]);
+  history.replaceState(null, "", "?" + q.toString());
+}
+
+// ======================================================================= loading
+async function loadSlice(k) {
+  if (payloads.has(k) || pending.has(k)) return;
+  pending.add(k);
+  renderRuns();
+  setStatus();
+  const { run, day } = parseKey(k);
+  try {
+    const res = await fetch(`/api/day?run=${encodeURIComponent(run)}&day=${encodeURIComponent(day)}`);
+    if (!res.ok) throw new Error((await res.json()).error || res.statusText);
+    payloads.set(k, await res.json());
+  } catch (e) {
+    sel = sel.filter((x) => x !== k);
+    alert(`Couldn't load ${k}: ${e.message}`);
+  } finally {
+    pending.delete(k);
+    setStatus();
+    refresh();
+  }
+}
+function setStatus() {
+  $("status").textContent = pending.size ? `loading ${pending.size} day${pending.size > 1 ? "s" : ""}… (first open builds price data, a few seconds each)` : "";
+}
+function toggle(k) {
+  if (sel.includes(k)) {
+    sel = sel.filter((x) => x !== k);
+    if (focus === k) focus = null;
+  } else {
+    sel.push(k);
+    sel.sort((a, b) => parseKey(a).day.localeCompare(parseKey(b).day) || a.localeCompare(b));
+    if (!focus) focus = k;
+    loadSlice(k);
+  }
+  refresh();
+}
+
+// ======================================================================= runs panel
+function renderRuns() {
+  const t = $("runs");
+  if (!RUNS.length) { t.innerHTML = `<tr><td class="empty">No runs with stored Jev answers yet. Start one with <code>uv run python -m trade_jev.run --days …</code></td></tr>`; return; }
+  t.innerHTML = RUNS.map((r) => {
+    const chips = r.days.map((d) => {
+      const k = keyOf(r.run_id, d);
+      return `<button class="chip ${pending.has(k) ? "loading" : ""}" data-k="${k}" aria-pressed="${sel.includes(k)}">${d.slice(5)}</button>`;
+    }).join("");
+    const g = r.gate, c = r.config;
+    const base = Object.entries(r.baselines).map(([k, v]) => `${k} ${fmtUsd(v)}`).join(" · ");
+    return `<tr>
+      <td><div class="id">${r.run_id}</div><div class="meta">${(r.finished_at || "").replace("T", " ")}</div></td>
+      <td><div>Jev <b class="${pnlCls(r.jev_pnl)}">${fmtUsd(r.jev_pnl)}</b> · ${r.jev_calls.toLocaleString()} answers</div>
+          <div class="meta">run settings: ${settingsLabel(runDefaults(r))}</div>
+          <div class="meta">${base}</div></td>
+      <td><div class="row">${chips}<button class="btn" data-all="${r.run_id}">all</button></div></td>
+    </tr>`;
+  }).join("");
+  t.querySelectorAll(".chip").forEach((b) => b.onclick = () => toggle(b.dataset.k));
+  t.querySelectorAll("[data-all]").forEach((b) => b.onclick = () => {
+    const r = runOf(b.dataset.all);
+    const keys = r.days.map((d) => keyOf(r.run_id, d));
+    const allOn = keys.every((k) => sel.includes(k));
+    for (const k of keys) if (allOn === sel.includes(k)) toggle(k);
+  });
+}
+$("clearsel").onclick = () => { sel = []; focus = null; refresh(); };
+
+// ======================================================================= settings + presets
+function buildControls() {
+  const box = $("controls");
+  box.innerHTML = "";
+  for (const c of CONTROLS) {
+    const wrap = document.createElement("div");
+    wrap.className = "ctl";
+    wrap.innerHTML = `<label for="c-${c.key}"><span>${c.label}</span><output id="o-${c.key}"></output></label>
+      <input type="range" id="c-${c.key}" min="${c.min}" max="${c.max}" step="${c.step}">
+      <div class="hint">${c.hint}</div>`;
+    box.appendChild(wrap);
+    const input = wrap.querySelector("input");
+    input.value = params[c.key];
+    $("o-" + c.key).textContent = c.fmt(+params[c.key]);
+    input.addEventListener("input", () => {
+      params[c.key] = +input.value;
+      $("o-" + c.key).textContent = c.fmt(+input.value);
+      refresh();
+    });
+  }
+}
+function setParams(p) { params = { ...p }; buildControls(); refresh(); }
+$("reset").onclick = () => setParams(runDefaults(runOf(focus ? parseKey(focus).run : RUNS[0]?.run_id)));
+$("savepreset").onclick = () => {
+  if (presets.length >= PRESET_COLORS.length) { $("presethint").textContent = `max ${PRESET_COLORS.length} presets, remove one first`; return; }
+  const used = new Set(presets.map((p) => p.color));
+  const color = PRESET_COLORS.find((c) => !used.has(c));
+  const name = $("presetname").value.trim() || `Preset ${String.fromCharCode(65 + presets.length)}`;
+  presets.push({ name, params: { ...params }, color });
+  store.set("jev-viewer-presets", presets);
+  $("presetname").value = "";
+  $("presethint").textContent = "";
+  refresh();
+};
+
+// ======================================================================= replays
+function replayOf(k, p) {
+  const d = payloads.get(k);
+  return replay(d, p, { tick: d.tick, pointValue: d.point_value });
+}
+function statsGrid(p) {
+  const rows = sel.filter((k) => payloads.has(k)).map((k) => [k, replayOf(k, p).stats]);
+  return new Map(rows);
+}
+
+// ======================================================================= render
+function refresh() {
+  if (focus && !sel.includes(focus)) focus = null;
+  if (!focus && sel.length) focus = sel[0];
+  writeUrl();
+  renderRuns();
+  renderFocus();
+  const ready = sel.filter((k) => payloads.has(k));
+  const rows = [{ name: "Current", params, color: null }, ...presets].map((p) => ({ ...p, stats: statsGrid(p.params) }));
+  renderCompare(rows, ready);
+  const hasFocus = focus && payloads.has(focus);
+  $("workspace").style.display = hasFocus ? "" : "none";
+  if (!hasFocus) {
+    $("tiles").innerHTML = `<div class="empty">${sel.length ? "Loading…" : "Pick one or more days above to replay them."}</div>`;
+    $("trades").innerHTML = "";
+    return;
+  }
+  if (!view) view = [0, payloads.get(focus).track.bid.length];
+  R = replayOf(focus, params);
+  renderTiles(rows[0].stats, ready);
+  renderTrades();
+  draw();
+}
+
+function renderFocus() {
+  $("focus").innerHTML = sel.map((k) => `<button class="chip ${payloads.has(k) ? "" : "loading"}" data-k="${k}" aria-pressed="${k === focus}">${sliceLabel(k)}</button>`).join("") || `<span class="muted">none selected</span>`;
+  $("focus").querySelectorAll(".chip").forEach((b) => b.onclick = () => { stopPlay(); playhead = null; view = null; pinned = null; focus = b.dataset.k; showState(null); refresh(); });
+}
+
+function renderCompare(rows, ready) {
+  const t = $("compare");
+  if (!ready.length) { t.innerHTML = `<tbody><tr><td class="empty">Select days to compare settings.</td></tr></tbody>`; return; }
+  const head = `<thead><tr><th>Settings</th>${ready.map((k) => `<th>${sliceLabel(k)}</th>`).join("")}<th>Total</th><th>Worst day</th><th>Trades</th><th>Win %</th><th></th></tr></thead>`;
+  const body = rows.map((r, i) => {
+    const st = ready.map((k) => r.stats.get(k));
+    const total = st.reduce((a, s) => a + s.net, 0);
+    const trades = st.reduce((a, s) => a + s.trades, 0);
+    const wins = st.reduce((a, s) => a + s.wins, 0);
+    const worst = Math.min(...st.map((s) => s.net));
+    const sw = r.color ? `<span class="swl" style="border-color:var(${r.color})"></span>` : `<span class="swl" style="border-color:var(--ink)"></span>`;
+    const same = i > 0 && KEYS.every((k) => r.params[k] === params[k]);
+    return `<tr data-i="${i}" class="${i === 0 || same ? "active" : ""}">
+      <td title="${settingsLabel(r.params)}">${sw}${r.name}<div class="muted" style="font-weight:400">${settingsLabel(r.params)}</div></td>
+      ${st.map((s) => `<td class="${pnlCls(s.net)}">${fmtUsd(s.net)}</td>`).join("")}
+      <td class="${pnlCls(total)}"><b>${fmtUsd(total)}</b></td>
+      <td class="${pnlCls(worst)}">${fmtUsd(worst)}</td>
+      <td>${trades.toLocaleString()}</td>
+      <td>${trades ? Math.round(wins / trades * 100) + "%" : "–"}</td>
+      <td>${i > 0 ? `<button class="x" data-del="${i - 1}" aria-label="Remove preset ${r.name}">✕</button>` : ""}</td>
+    </tr>`;
+  }).join("");
+  t.innerHTML = head + "<tbody>" + body + "</tbody>";
+  t.querySelectorAll("tbody tr").forEach((tr) => tr.onclick = (ev) => {
+    const del = ev.target.closest("[data-del]");
+    if (del) { presets.splice(+del.dataset.del, 1); store.set("jev-viewer-presets", presets); refresh(); return; }
+    const i = +tr.dataset.i;
+    if (i > 0) setParams(presets[i - 1].params);
+  });
+}
+
+function renderTiles(curStats, ready) {
+  const d = payloads.get(focus), s = R.stats;
+  const tot = ready.reduce((a, k) => a + curStats.get(k).net, 0);
+  const totTrades = ready.reduce((a, k) => a + curStats.get(k).trades, 0);
+  const tiles = [
+    { k: `Replay P&L · ${sliceLabel(focus)}`, v: fmtUsd(s.net), cls: pnlCls(s.net), d: s.net > 0 ? "▲ profit" : s.net < 0 ? "▼ loss" : "flat" },
+    { k: "Trades", v: s.trades.toLocaleString(), d: `${Object.entries(s.reasons).map(([r, n]) => `${n} ${r}`).join(", ") || "none"}` },
+    { k: "Win rate", v: s.winRate == null ? "–" : Math.round(s.winRate * 100) + "%", d: s.avgHold == null ? "" : `avg hold ${fmtDur(s.avgHold)}` },
+    { k: "Max drawdown", v: fmtUsd(-s.maxDD, false), d: "peak-to-trough, marked to mid" },
+    { k: "Stored Jev answers", v: d.decisions.length.toLocaleString(), d: `${d.symbol} · run ${shortRun(d.run_id)}` },
+    { k: `All ${ready.length} selected`, v: fmtUsd(tot), cls: pnlCls(tot), d: `${totTrades.toLocaleString()} trades, current settings` },
+  ];
+  $("tiles").innerHTML = tiles.map((t) => `<div class="card tile"><div class="k">${t.k}</div><div class="v ${t.cls || ""}">${t.v}</div><div class="d">${t.d}</div></div>`).join("");
+}
+
+let tradesSig = "";
+function renderTrades(force = true) {
+  const d = payloads.get(focus), u = upto(), live = playhead != null;
+  const shown = live ? R.trades.filter((t) => t.entryT <= u) : R.trades;
+  const closed = shown.filter((t) => t.exitT <= u).length;
+  const sig = `${focus}|${shown.length}|${closed}`;
+  if (!force && sig === tradesSig) return updateOpenTrade(d, u);
+  tradesSig = sig;
+  $("tradeshead").innerHTML = `Trades · ${shown.length}${live ? ` of ${R.trades.length}` : ""} · ${sliceLabel(focus)}`
+    + (live ? `<span class="tag">LIVE</span>` : "");
+  const t0 = d.t0_ns / 1e6;
+  $("trades").innerHTML = shown.map((t, i) => {
+    const open = t.exitT > u;
+    const cls = [open ? "open" : "", live && i === shown.length - 1 ? "latest" : ""].join(" ");
+    return `<tr data-t="${t.entryT}" class="${cls}" ${open ? 'id="opentrade"' : ""} title="held ${fmtDur((open ? u : t.exitT) - t.entryT)}">
+      <td>${etShort.format(t0 + t.entryT * 1000)}</td><td>${t.side > 0 ? "Long" : "Short"}</td>
+      <td>${t.entryPx.toFixed(2)}</td><td>${open ? "–" : t.exitPx.toFixed(2)}</td>
+      <td>${open ? "open" : t.reason}</td>
+      <td data-pnl class="${open ? "" : pnlCls(t.pnl)}">${open ? "" : fmtUsd(t.pnl)}</td></tr>`;
+  }).join("");
+  $("trades").querySelectorAll("tr").forEach((tr) => tr.onclick = () => {
+    const t = +tr.dataset.t;
+    stopPlay(); playhead = null;
+    pinned = nearestDecision(t); showState(pinned);
+    view = [Math.max(0, t - 600), Math.min(d.track.bid.length, t + 600)];
+    draw(); syncScrub();
+  });
+  updateOpenTrade(d, u);
+  if (live) { const sc = $("tradescroll"); sc.scrollTop = sc.scrollHeight; }
+}
+function updateOpenTrade(d, u) {
+  const row = $("opentrade");
+  if (!row) return;
+  const t = R.trades.find((x) => x.entryT === +row.dataset.t);
+  const s = Math.max(0, Math.min(R.mid.length - 1, Math.floor(u) - 1));
+  const unreal = (R.mid[s] - t.entryPx) * t.side * d.point_value;
+  const cell = row.querySelector("[data-pnl]");
+  cell.textContent = fmtUsd(unreal);
+  cell.className = pnlCls(unreal);
+  row.title = `held ${fmtDur(u - t.entryT)} · unrealized`;
+}
+
+// ======================================================================= chart helpers
+const NS = "http://www.w3.org/2000/svg";
+const PAD = { l: 64, r: 12, t: 8, b: 22 };
+function el(tag, attrs, parent) {
+  const e = document.createElementNS(NS, tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(e);
+  return e;
+}
+function niceTicks(lo, hi, n) {
+  const span = hi - lo || 1, step0 = span / n;
+  const mag = Math.pow(10, Math.floor(Math.log10(step0)));
+  const step = [1, 2, 2.5, 5, 10].map((m) => m * mag).find((s) => s >= step0);
+  const out = [];
+  for (let v = Math.ceil(lo / step) * step; v <= hi + 1e-9; v += step) out.push(+v.toFixed(6));
+  return out;
+}
+function frame(svg) {
+  svg.innerHTML = "";
+  const W = svg.clientWidth, H = +svg.getAttribute("height");
+  return { W, H, x0: PAD.l, x1: W - PAD.r, y0: PAD.t, y1: H - PAD.b };
+}
+const xScale = (f) => (s) => f.x0 + (s - view[0]) / (view[1] - view[0]) * (f.x1 - f.x0);
+const yScale = (f, lo, hi) => (v) => f.y1 - (v - lo) / (hi - lo || 1) * (f.y1 - f.y0);
+function yAxis(svg, f, y, ticks, fmt) {
+  for (const v of ticks) {
+    el("line", { x1: f.x0, x2: f.x1, y1: y(v), y2: y(v), class: "gridline" }, svg);
+    el("text", { x: f.x0 - 8, y: y(v) + 4, "text-anchor": "end" }, svg).textContent = fmt(v);
+  }
+}
+function xAxis(svg, f, x, d, labels) {
+  if (!labels) return;
+  const [s0, s1] = view;
+  const step = [60, 300, 600, 900, 1800, 3600].find((s) => (s1 - s0) / s <= 8) || 3600;
+  const t0 = d.t0_ns / 1e9;
+  for (let s = Math.ceil((t0 + s0) / step) * step - t0; s <= s1; s += step) {
+    el("text", { x: x(s), y: f.y1 + 16, "text-anchor": "middle" }, svg).textContent = etShort.format((t0 + s) * 1000);
+  }
+}
+function densePath(arr, x, y, s0, s1, pxW) {
+  const cols = Math.max(1, Math.floor(pxW)), per = (s1 - s0) / cols;
+  let d = "";
+  if (per <= 1) {
+    for (let s = Math.max(0, Math.floor(s0)); s <= Math.min(arr.length - 1, Math.ceil(s1)); s++) d += (d ? "L" : "M") + x(s).toFixed(1) + "," + y(arr[s]).toFixed(1);
+    return d;
+  }
+  for (let c = 0; c < cols; c++) {
+    const a = Math.floor(s0 + c * per), b = Math.min(arr.length, Math.floor(s0 + (c + 1) * per) + 1);
+    if (a >= b) continue;
+    let lo = Infinity, hi = -Infinity;
+    for (let s = a; s < b; s++) { if (arr[s] < lo) lo = arr[s]; if (arr[s] > hi) hi = arr[s]; }
+    const px = x((a + b) / 2).toFixed(1);
+    d += (d ? "L" : "M") + px + "," + y(hi).toFixed(1) + "L" + px + "," + y(lo).toFixed(1);
+  }
+  return d;
+}
+function rangeOf(arr, s0, s1) {
+  let lo = Infinity, hi = -Infinity;
+  for (let s = Math.max(0, Math.floor(s0)); s < Math.min(arr.length, Math.ceil(s1)); s++) { if (arr[s] < lo) lo = arr[s]; if (arr[s] > hi) hi = arr[s]; }
+  return [lo, hi];
+}
+function playHead(svg, f, x) {
+  if (playhead == null || playhead < view[0] || playhead > view[1]) return;
+  el("line", { x1: x(playhead), x2: x(playhead), y1: f.y0, y2: f.y1, class: "head" }, svg);
+}
+
+// ======================================================================= charts
+let presetReplays = [];   // [{preset, equity}] for the focused slice
+function draw() {
+  const d = payloads.get(focus);
+  if (!d) return;
+  if (!view) view = [0, d.track.bid.length];
+  presetReplays = presets.map((p) => ({ p, equity: replayOf(focus, p.params).equity }));
+  drawPrice(d); drawEquity(d); drawConf(d); renderLive(d);
+  syncSide();
+}
+
+function drawPrice(d) {
+  const svg = $("price"), f = frame(svg), x = xScale(f), [s0] = view, U = upto();
+  let [lo, hi] = rangeOf(R.mid, s0, view[1]);
+  const pad = (hi - lo) * 0.06 || 1; lo -= pad; hi += pad;
+  const y = yScale(f, lo, hi);
+  yAxis(svg, f, y, niceTicks(lo, hi, 5), (v) => v.toLocaleString(undefined, { maximumFractionDigits: 2 }));
+  el("line", { x1: f.x0, x2: f.x1, y1: f.y1, y2: f.y1, class: "baseline" }, svg);
+  xAxis(svg, f, x, d, true);
+  el("clipPath", { id: "clip-price" }, svg).appendChild(el("rect", { x: f.x0, y: 0, width: f.x1 - f.x0, height: f.H }));
+  const g = el("g", { "clip-path": "url(#clip-price)" }, svg);
+  for (const t of R.trades) {
+    if (t.exitT < s0 || t.entryT > U) continue;
+    const a = x(t.entryT), b = x(Math.min(t.exitT, U));
+    el("rect", { x: a, y: f.y0, width: Math.max(1, b - a), height: f.y1 - f.y0, fill: t.side > 0 ? "var(--long)" : "var(--short)", opacity: 0.12 }, g);
+  }
+  el("path", { d: densePath(R.mid, x, y, s0, U, f.x1 - f.x0), fill: "none", stroke: "var(--ink-2)", "stroke-width": 1.5, "stroke-linejoin": "round" }, g);
+  const vis = R.trades.filter((t) => t.entryT <= U && t.exitT >= s0);
+  if (vis.length < 400) {
+    for (const t of vis) {
+      const col = t.side > 0 ? "var(--long)" : "var(--short)";
+      const ex = x(t.entryT), ey = y(t.entryPx);
+      const tri = t.side > 0 ? `M${ex},${ey - 5}L${ex + 5},${ey + 4}L${ex - 5},${ey + 4}Z` : `M${ex},${ey + 5}L${ex + 5},${ey - 4}L${ex - 5},${ey - 4}Z`;
+      el("path", { d: tri, fill: col, stroke: "var(--surface)", "stroke-width": 2, "paint-order": "stroke" }, g);
+      if (t.exitT <= U) el("circle", { cx: x(t.exitT), cy: y(t.exitPx), r: 4, fill: "var(--surface)", stroke: col, "stroke-width": 2 }, g);
+    }
+  }
+  playHead(svg, f, x);
+  attachInteraction(svg, f, d);
+}
+
+function drawEquity(d) {
+  const svg = $("equity"), f = frame(svg), x = xScale(f), [s0, s1] = view, U = upto();
+  const series = [{ name: "Current", color: "var(--ink)", eq: R.equity, w: 2 },
+    ...presetReplays.map(({ p, equity }) => ({ name: p.name, color: `var(${p.color})`, eq: equity, w: 1.75 }))];
+  let lo = 0, hi = 0;
+  for (const s of series) { const [a, b] = rangeOf(s.eq, s0, s1); lo = Math.min(lo, a); hi = Math.max(hi, b); }
+  const pad = (hi - lo) * 0.08 || 50; lo -= pad; hi += pad;
+  const y = yScale(f, lo, hi);
+  yAxis(svg, f, y, niceTicks(lo, hi, 4), (v) => fmtUsd(v));
+  el("line", { x1: f.x0, x2: f.x1, y1: y(0), y2: y(0), class: "baseline" }, svg);
+  for (const s of series.slice(1).concat(series.slice(0, 1))) {  // current on top
+    el("path", { d: densePath(s.eq, x, y, s0, U, f.x1 - f.x0), fill: "none", stroke: s.color, "stroke-width": s.w, "stroke-linejoin": "round" }, svg);
+  }
+  $("eqlegend").innerHTML = series.length > 1
+    ? series.map((s) => `<span><span class="swl" style="border-color:${s.color}"></span>${s.name}</span>`).join("")
+    : "";
+  playHead(svg, f, x);
+  attachInteraction(svg, f, d);
+}
+
+function drawConf(d) {
+  const svg = $("conf"), f = frame(svg), x = xScale(f), [s0, s1] = view, U = upto();
+  const y = yScale(f, -1, 1);
+  yAxis(svg, f, y, [-1, -0.5, 0.5, 1], (v) => (v > 0 ? "BUY " : "SELL ") + Math.abs(v).toFixed(1));
+  el("line", { x1: f.x0, x2: f.x1, y1: y(0), y2: y(0), class: "baseline" }, svg);
+  if (params.minConf > 0) for (const v of [params.minConf, -params.minConf]) el("line", { x1: f.x0, x2: f.x1, y1: y(v), y2: y(v), stroke: "var(--ink-2)", "stroke-width": 1 }, svg);
+  xAxis(svg, f, x, d, true);
+  const nAll = d.decisions.filter((q) => q.t >= s0 && q.t <= s1).length;
+  const w = Math.max(1, Math.min(6, (f.x1 - f.x0) / Math.max(nAll, 1) - 1));
+  d.decisions.forEach((q, i) => {
+    if (q.t < s0 || q.t > U) return;
+    const p = q.p[q.raw] ?? 0, conf = p >= params.minConf;
+    if (q.raw === "HOLD") {
+      el("rect", { x: x(q.t) - w / 2, y: y(0) - 1, width: w, height: 2, fill: "var(--neutral)", opacity: conf ? 0.9 : 0.35 }, svg);
+      return;
+    }
+    const v = q.raw === "BUY" ? p : -p;
+    el("rect", { x: x(q.t) - w / 2, y: Math.min(y(v), y(0)), width: w, height: Math.max(1, Math.abs(y(v) - y(0))), rx: Math.min(2, w / 2),
+      fill: q.raw === "BUY" ? "var(--long)" : "var(--short)", opacity: conf ? 1 : 0.28 }, svg);
+    const ga = R.gated[i].action;
+    if (nAll < 600 && ga !== "HOLD" && (ga === "BUY" ? 1 : -1) !== R.gated[i].pos) {
+      el("circle", { cx: x(q.t), cy: y(v) + (v > 0 ? -6 : 6), r: 2.5, fill: "var(--ink)" }, svg);
+    }
+  });
+  if (pinned != null) {
+    const q = d.decisions[pinned];
+    if (q && q.t >= s0 && q.t <= s1) el("line", { x1: x(q.t), x2: x(q.t), y1: f.y0, y2: f.y1, stroke: "var(--ink)", "stroke-width": 1.5 }, svg);
+  }
+  playHead(svg, f, x);
+  attachInteraction(svg, f, d);
+}
+
+// ======================================================================= interaction
+const SVGS = ["price", "equity", "conf"];
+function nearestDecision(t) {
+  const ds = payloads.get(focus).decisions;
+  let lo = 0, hi = ds.length - 1;
+  while (lo < hi) { const m = (lo + hi) >> 1; if (ds[m].t < t) lo = m + 1; else hi = m; }
+  if (lo > 0 && Math.abs(ds[lo - 1].t - t) < Math.abs(ds[lo].t - t)) lo--;
+  return lo;
+}
+function attachInteraction(svg, f, d) {
+  const [s0, s1] = view;
+  const inv = (px) => s0 + (px - f.x0) / (f.x1 - f.x0) * (s1 - s0);
+  const hit = el("rect", { x: f.x0, y: 0, width: f.x1 - f.x0, height: f.H, fill: "transparent", style: "cursor:crosshair" }, svg);
+  let from = null, brush = null;
+  const local = (ev) => ev.clientX - svg.getBoundingClientRect().left;
+  const clamp = (px) => Math.max(f.x0, Math.min(f.x1, px));
+  hit.addEventListener("pointermove", (ev) => {
+    const px = clamp(local(ev));
+    if (from != null) { brush.setAttribute("x", Math.min(from, px)); brush.setAttribute("width", Math.abs(px - from)); return; }
+    crosshair(inv(px), ev);
+  });
+  hit.addEventListener("pointerleave", () => { if (from == null) hideCross(); });
+  hit.addEventListener("pointerdown", (ev) => {
+    if (ev.pointerType !== "mouse") return;
+    from = local(ev);
+    brush = el("rect", { x: from, y: f.y0, width: 0, height: f.y1 - f.y0, class: "brush" }, svg);
+    hit.setPointerCapture(ev.pointerId);
+  });
+  hit.addEventListener("pointerup", (ev) => {
+    const px = clamp(local(ev));
+    if (from != null && Math.abs(px - from) > 6) {
+      const a = inv(Math.min(from, px)), b = inv(Math.max(from, px));
+      from = null;
+      if (b - a >= 30) { view = [Math.max(0, a), Math.min(d.track.bid.length, b)]; draw(); syncScrub(); return; }
+    }
+    from = null;
+    pinned = nearestDecision(inv(px));
+    showState(pinned);
+    draw();
+  });
+  hit.addEventListener("dblclick", () => { stopPlay(); playhead = null; view = null; draw(); syncScrub(); });
+}
+function hideCross() {
+  for (const id of SVGS) $(id).querySelectorAll(".cross").forEach((e) => e.remove());
+  $("tip").style.display = "none";
+}
+function crosshair(s, ev) {
+  const d = payloads.get(focus);
+  hideCross();
+  for (const id of SVGS) {
+    const svg = $(id), H = +svg.getAttribute("height"), W = svg.clientWidth;
+    const px = PAD.l + (s - view[0]) / (view[1] - view[0]) * (W - PAD.r - PAD.l);
+    el("line", { x1: px, x2: px, y1: PAD.t, y2: H - PAD.b, class: "cross" }, svg);
+  }
+  const si = Math.max(0, Math.min(R.mid.length - 1, Math.round(s)));
+  const k = nearestDecision(s), q = d.decisions[k], g = R.gated[k], pos = R.position[si];
+  const presetRows = presetReplays.map(({ p, equity }) => `<div class="kv"><span><span class="swl" style="border-color:var(${p.color})"></span>${p.name}</span><b>${fmtUsd(equity[si])}</b></div>`).join("");
+  const tip = $("tip");
+  tip.innerHTML = `<b>${etFmt.format(d.t0_ns / 1e6 + s * 1000)} ET</b>
+    <div class="kv"><span>Mid</span><b>${R.mid[si].toFixed(2)}</b></div>
+    <div class="kv"><span>Position</span><b>${pos > 0 ? "Long" : pos < 0 ? "Short" : "Flat"}</b></div>
+    <div class="kv"><span>Equity</span><b>${fmtUsd(R.equity[si])}</b></div>
+    ${presetRows}
+    <div style="margin-top:6px">Jev @ ${q.et}: <b>${q.raw}</b> → ${g.action === "HOLD" ? "held" : g.action}</div>
+    <div>${["BUY", "SELL", "HOLD"].map((a) => `${a} ${(q.p[a] ?? 0).toFixed(2)}`).join(" · ")}</div>`;
+  tip.style.display = "block";
+  const r = tip.getBoundingClientRect();
+  let left = ev.clientX + 14, top = ev.clientY + 14;
+  if (left + r.width > innerWidth - 8) left = ev.clientX - r.width - 14;
+  if (top + r.height > innerHeight - 8) top = ev.clientY - r.height - 14;
+  tip.style.left = left + "px"; tip.style.top = top + "px";
+}
+// JSON with short arrays kept on one line, so an order book reads like a ladder
+function compactJson(v, ind = "") {
+  if (Array.isArray(v)) {
+    if (v.every((x) => x === null || typeof x !== "object")) return JSON.stringify(v).replaceAll(",", ", ");
+    const inner = ind + "  ";
+    return "[\n" + v.map((x) => inner + compactJson(x, inner)).join(",\n") + "\n" + ind + "]";
+  }
+  if (v && typeof v === "object") {
+    const inner = ind + "  ";
+    return "{\n" + Object.entries(v).map(([k, x]) => `${inner}"${k}": ${compactJson(x, inner)}`).join(",\n") + "\n" + ind + "}";
+  }
+  return JSON.stringify(v);
+}
+function showState(k, live = false) {
+  if (k == null || !focus || !payloads.has(focus)) {
+    $("statehead").textContent = "What Jev saw";
+    $("stateprobs").innerHTML = "";
+    $("posnote").textContent = "";
+    $("state").textContent = "Press play, or click a point on any chart, to see the exact state sent to Jev.";
+    return;
+  }
+  const q = payloads.get(focus).decisions[k], g = R.gated[k];
+  $("statehead").innerHTML = `What Jev saw · ${q.et} ET · ${sliceLabel(focus)}` + (live ? `<span class="tag">LIVE</span>` : "");
+  $("stateprobs").innerHTML = ["BUY", "SELL", "HOLD"].map((a) =>
+    `<span><span class="sw" style="background:var(${a === "BUY" ? "--long" : a === "SELL" ? "--short" : "--neutral"})"></span>${a} <b>${(q.p[a] ?? 0).toFixed(2)}</b></span>`).join("")
+    + `<span>answer <b>${q.raw}</b> → acted <b>${g.action === "HOLD" ? "no" : g.action}</b></span>`;
+  $("state").textContent = q.state ? compactJson(q.state) : "(state not stored for this decision)";
+  const saw = q.state?.position?.side ?? "?";
+  const now = g.pos > 0 ? "long" : g.pos < 0 ? "short" : "flat";
+  $("posnote").textContent = saw === now
+    ? `Position: ${now}`
+    : `Replay position: ${now} · Jev saw: ${saw} (from the original run)`;
+}
+
+// side panels follow the playhead while it's active; otherwise they show the pinned point / all trades
+let liveDecision = null;
+function syncSide() {
+  renderTrades(false);
+  if (playhead == null) {
+    if (liveDecision != null) { liveDecision = null; renderTrades(true); showState(pinned); }
+    return;
+  }
+  const ds = payloads.get(focus).decisions;
+  let k = nearestDecision(playhead);
+  if (ds[k].t > playhead && k > 0) k--;
+  if (k !== liveDecision) { liveDecision = k; showState(k, true); }
+}
+
+// ======================================================================= playback
+let raf = null, playT0 = 0, playFrom = 0;
+function stopPlay() {
+  if (raf) cancelAnimationFrame(raf);
+  raf = null;
+  $("play").textContent = "▶ Play";
+  $("play").setAttribute("aria-label", "Play replay");
+}
+function syncScrub() {
+  if (!view) return;
+  const [a, b] = view;
+  $("scrub").value = playhead == null ? 1000 : Math.round((playhead - a) / (b - a) * 1000);
+}
+function frameTick(ts) {
+  const [a, b] = view, dur = +$("speed").value * 1000;
+  if (!playT0) playT0 = ts;
+  playhead = playFrom + (ts - playT0) / dur * (b - a);
+  if (playhead >= b) { playhead = null; stopPlay(); draw(); syncScrub(); return; }
+  draw(); syncScrub();
+  raf = requestAnimationFrame(frameTick);
+}
+$("play").onclick = () => {
+  if (raf) { stopPlay(); return; }
+  if (!focus || !payloads.has(focus)) return;
+  const [a, b] = view;
+  playFrom = playhead == null || playhead >= b ? a : playhead;
+  playT0 = 0;
+  $("play").textContent = "❚❚ Pause";
+  $("play").setAttribute("aria-label", "Pause replay");
+  raf = requestAnimationFrame(frameTick);
+};
+$("scrub").oninput = () => {
+  stopPlay();
+  const [a, b] = view, v = +$("scrub").value;
+  playhead = v >= 1000 ? null : a + v / 1000 * (b - a);
+  draw();
+};
+function renderLive(d) {
+  const u = upto();
+  const s = Math.max(0, Math.min(R.mid.length - 1, Math.floor(u) - 1));
+  const entered = R.trades.filter((t) => t.entryT <= u);
+  const closed = R.trades.filter((t) => t.exitT <= u).length;
+  const pos = R.position[s], eq = R.equity[s], last = entered.at(-1);
+  $("live").innerHTML = `<span><b>${etFmt.format(d.t0_ns / 1e6 + u * 1000)}</b> ET</span>
+    <span>Position <b>${pos > 0 ? "Long" : pos < 0 ? "Short" : "Flat"}</b></span>
+    <span>Equity <b class="${pnlCls(eq)}">${fmtUsd(eq)}</b></span>
+    <span>Trades <b>${entered.length}</b> (${closed} closed)</span>
+    ${last ? `<span>Last entry <b>${last.side > 0 ? "Long" : "Short"}</b> @ ${last.entryPx.toFixed(2)}</span>` : ""}`;
+}
+
+let rz;
+new ResizeObserver(() => { cancelAnimationFrame(rz); rz = requestAnimationFrame(() => focus && payloads.has(focus) && draw()); }).observe(document.body);
+
+// ======================================================================= theme
+function syncThemeButton() {
+  const dark = document.documentElement.dataset.theme === "dark";
+  $("theme").textContent = dark ? "☀ Light" : "☾ Dark";
+  $("theme").setAttribute("aria-pressed", dark);
+}
+$("theme").onclick = () => {
+  const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+  document.documentElement.dataset.theme = next;
+  try { localStorage.setItem("jev-viewer-theme", next); } catch (e) {}
+  syncThemeButton();
+};
+syncThemeButton();
+
+// ======================================================================= boot
+(async function boot() {
+  const u = readUrl();
+  try {
+    RUNS = await (await fetch("/api/runs")).json();
+  } catch (e) {
+    $("status").textContent = "Can't reach the viewer server. Start it with: uv run python -m trade_jev.view";
+    return;
+  }
+  const valid = new Set(RUNS.flatMap((r) => r.days.map((d) => keyOf(r.run_id, d))));
+  sel = u.sel.filter((k) => valid.has(k));
+  if (!sel.length && RUNS.length) sel = RUNS[0].days.map((d) => keyOf(RUNS[0].run_id, d));
+  focus = sel.includes(u.focus) ? u.focus : sel[0] || null;
+  params = { ...runDefaults(runOf(focus ? parseKey(focus).run : RUNS[0]?.run_id)), ...u.params };
+  buildControls();
+  refresh();
+  await Promise.all(sel.map(loadSlice));
+  if (u.at && focus && payloads.has(focus)) {
+    const d = payloads.get(focus);
+    const [h, m, sec = 0] = u.at.split(":").map(Number);
+    const [h0, m0, s0] = etFmt.format(d.t0_ns / 1e6).split(":").map(Number);
+    const t = (h * 3600 + m * 60 + sec) - (h0 * 3600 + m0 * 60 + s0);
+    if (t > 0 && t < d.track.bid.length) { playhead = t; draw(); syncScrub(); }
+  }
+  if (u.play) $("play").click();
+})();
+</script>
+</body>
+</html>

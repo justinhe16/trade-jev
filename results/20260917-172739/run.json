@@ -1,0 +1,186 @@
+{
+  "run_id": "20260917-172739",
+  "policy": "jev[raw_l10]",
+  "model": "jev-latest",
+  "encoder": "raw_l10",
+  "days": [
+    "2026-06-23"
+  ],
+  "config": {
+    "cadence_s": 15.0,
+    "start_et": "09:30:00",
+    "end_et": "15:55:00",
+    "latency_ms": 250.0,
+    "commission": 2.5,
+    "stop_ticks": 20,
+    "target_ticks": 40
+  },
+  "gate": null,
+  "jev_api_calls": 1540,
+  "jev_cost_usd": 0.0608,
+  "wall_time_s": 437.7,
+  "results": {
+    "jev[raw_l10]": {
+      "net_pnl": -33380.0,
+      "trades": 1219,
+      "win_rate": 0.266,
+      "max_drawdown": 33645.0,
+      "actions": {
+        "BUY": 643,
+        "SELL": 874,
+        "HOLD": 23
+      }
+    },
+    "hold": {
+      "net_pnl": 0.0,
+      "trades": 0,
+      "win_rate": null,
+      "max_drawdown": 0.0,
+      "actions": {
+        "HOLD": 1540
+      }
+    },
+    "random": {
+      "net_pnl": -7465.0,
+      "trades": 303,
+      "win_rate": 0.277,
+      "max_drawdown": 8125.0,
+      "actions": {
+        "HOLD": 1225,
+        "BUY": 162,
+        "SELL": 153
+      }
+    },
+    "imbalance": {
+      "net_pnl": -1155.0,
+      "trades": 38,
+      "win_rate": 0.263,
+      "max_drawdown": 1670.0,
+      "actions": {
+        "HOLD": 1502,
+        "SELL": 17,
+        "BUY": 21
+      }
+    }
+  },
+  "metrics": {
+    "jev[raw_l10]": {
+      "all": {
+        "days": 1,
+        "net_pnl": -33380.0,
+        "daily_pnl": {
+          "2026-06-23": -33380.0
+        },
+        "trades": 1219,
+        "trades_per_day": 1219.0,
+        "win_rate": 0.266,
+        "avg_win": 177.19,
+        "avg_loss": -101.44,
+        "avg_points": -1.119,
+        "sharpe_daily_ann": null,
+        "max_drawdown": 33645.0,
+        "exit_reasons": {
+          "target": 286,
+          "stop": 826,
+          "jev": 107
+        },
+        "actions": {
+          "BUY": 643,
+          "SELL": 874,
+          "HOLD": 23
+        },
+        "decisions": 1540,
+        "api_calls": 1540,
+        "avg_tokens": 940.1,
+        "api_cost_usd": 0.0608
+      }
+    },
+    "hold": {
+      "all": {
+        "days": 1,
+        "net_pnl": 0.0,
+        "daily_pnl": {
+          "2026-06-23": 0
+        },
+        "trades": 0,
+        "trades_per_day": 0.0,
+        "win_rate": null,
+        "avg_win": null,
+        "avg_loss": null,
+        "avg_points": null,
+        "sharpe_daily_ann": null,
+        "max_drawdown": 0.0,
+        "exit_reasons": {},
+        "actions": {
+          "HOLD": 1540
+        },
+        "decisions": 1540,
+        "api_calls": 0,
+        "avg_tokens": null,
+        "api_cost_usd": 0.0
+      }
+    },
+    "random": {
+      "all": {
+        "days": 1,
+        "net_pnl": -7465.0,
+        "daily_pnl": {
+          "2026-06-23": -7465.0
+        },
+        "trades": 303,
+        "trades_per_day": 303.0,
+        "win_rate": 0.277,
+        "avg_win": 182.56,
+        "avg_loss": -104.11,
+        "avg_points": -0.982,
+        "sharpe_daily_ann": null,
+        "max_drawdown": 8125.0,
+        "exit_reasons": {
+          "target": 76,
+          "stop": 214,
+          "jev": 13
+        },
+        "actions": {
+          "HOLD": 1225,
+          "BUY": 162,
+          "SELL": 153
+        },
+        "decisions": 1540,
+        "api_calls": 0,
+        "avg_tokens": null,
+        "api_cost_usd": 0.0
+      }
+    },
+    "imbalance": {
+      "all": {
+        "days": 1,
+        "net_pnl": -1155.0,
+        "daily_pnl": {
+          "2026-06-23": -1155.0
+        },
+        "trades": 38,
+        "trades_per_day": 38.0,
+        "win_rate": 0.263,
+        "avg_win": 181.0,
+        "avg_loss": -105.89,
+        "avg_points": -1.27,
+        "sharpe_daily_ann": null,
+        "max_drawdown": 1670.0,
+        "exit_reasons": {
+          "stop": 28,
+          "target": 9,
+          "jev": 1
+        },
+        "actions": {
+          "HOLD": 1502,
+          "SELL": 17,
+          "BUY": 21
+        },
+        "decisions": 1540,
+        "api_calls": 0,
+        "avg_tokens": null,
+        "api_cost_usd": 0.0
+      }
+    }
+  }
+}

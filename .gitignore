@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.env
+
+# licensed market data (see data/DATA.md); only the synthetic sample is committed
+data/databento/
+
+# local run outputs: raw Jev answers incl. the order books Jev saw
+# (share with scripts/publish_run.py → results/, which is committed)
+cache/
+runs/*
+!runs/index.jsonl

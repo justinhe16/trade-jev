@@ -1,0 +1,24 @@
+[project]
+name = "trade-jev"
+version = "0.1.0"
+description = "Backtest Jev (TypeSafe) as a BUY/SELL/HOLD trader on NQ L10 order-book data"
+authors = [
+    { name = "Justin He", email = "justinhe16@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.5.3",
+    "pandas>=3.0.5",
+    "pyarrow>=25.0.1",
+    "python-dotenv>=1.2.3",
+    "typesafe-sdk>=0.6.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.32,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

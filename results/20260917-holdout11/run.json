@@ -1,0 +1,500 @@
+{
+  "run_id": "20260917-holdout11",
+  "policy": "jev[raw_l10]",
+  "model": "jev-latest",
+  "encoder": "raw_l10",
+  "days": [
+    "2026-06-11",
+    "2026-06-12",
+    "2026-06-15",
+    "2026-06-16",
+    "2026-06-17",
+    "2026-06-18",
+    "2026-06-19",
+    "2026-06-22",
+    "2026-06-24",
+    "2026-06-25",
+    "2026-06-26"
+  ],
+  "config": {
+    "cadence_s": 15.0,
+    "start_et": "09:30:00",
+    "end_et": "15:55:00",
+    "latency_ms": 250.0,
+    "commission": 2.5,
+    "stop_ticks": 400,
+    "target_ticks": 0
+  },
+  "gate": {
+    "min_conf": 0.5,
+    "agree": 2,
+    "min_hold_s": 120.0
+  },
+  "jev_api_calls": 16241,
+  "jev_cost_usd": 0.6591,
+  "wall_time_s": 1504.8,
+  "results": {
+    "jev[raw_l10]": {
+      "net_pnl": 7835.0,
+      "trades": 904,
+      "win_rate": 0.413,
+      "max_drawdown": 27730.0,
+      "actions": {
+        "HOLD": 13930,
+        "SELL": 1706,
+        "BUY": 605
+      },
+      "holdout_net_pnl": 14255.0
+    },
+    "hold": {
+      "net_pnl": 0.0,
+      "trades": 0,
+      "win_rate": null,
+      "max_drawdown": 0.0,
+      "actions": {
+        "HOLD": 16241
+      },
+      "holdout_net_pnl": 0.0
+    },
+    "random": {
+      "net_pnl": -3505.0,
+      "trades": 1554,
+      "win_rate": 0.471,
+      "max_drawdown": 33525.0,
+      "actions": {
+        "HOLD": 13060,
+        "SELL": 1633,
+        "BUY": 1548
+      },
+      "holdout_net_pnl": 11445.0
+    },
+    "imbalance": {
+      "net_pnl": -29180.0,
+      "trades": 150,
+      "win_rate": 0.407,
+      "max_drawdown": 42815.0,
+      "actions": {
+        "HOLD": 15939,
+        "SELL": 162,
+        "BUY": 140
+      },
+      "holdout_net_pnl": -2675.0
+    }
+  },
+  "metrics": {
+    "jev[raw_l10]": {
+      "all": {
+        "days": 11,
+        "net_pnl": 7835.0,
+        "daily_pnl": {
+          "2026-06-11": 6590.0,
+          "2026-06-12": -5235.0,
+          "2026-06-15": -9235.0,
+          "2026-06-16": -1435.0,
+          "2026-06-17": 2895.0,
+          "2026-06-18": -1175.0,
+          "2026-06-19": -2820.0,
+          "2026-06-22": 8250.0,
+          "2026-06-24": -13630.0,
+          "2026-06-25": 23670.0,
+          "2026-06-26": -40.0
+        },
+        "trades": 904,
+        "trades_per_day": 82.2,
+        "win_rate": 0.413,
+        "avg_win": 676.29,
+        "avg_loss": -460.3,
+        "avg_points": 0.683,
+        "sharpe_daily_ann": 1.14,
+        "max_drawdown": 27730.0,
+        "exit_reasons": {
+          "jev": 877,
+          "stop": 16,
+          "eod": 11
+        },
+        "actions": {
+          "HOLD": 13930,
+          "SELL": 1706,
+          "BUY": 605
+        },
+        "decisions": 16241,
+        "api_calls": 16241,
+        "avg_tokens": 966.3,
+        "api_cost_usd": 0.6591
+      },
+      "dev": {
+        "days": 5,
+        "net_pnl": -6420.0,
+        "daily_pnl": {
+          "2026-06-11": 6590.0,
+          "2026-06-12": -5235.0,
+          "2026-06-15": -9235.0,
+          "2026-06-16": -1435.0,
+          "2026-06-17": 2895.0
+        },
+        "trades": 456,
+        "trades_per_day": 91.2,
+        "win_rate": 0.39,
+        "avg_win": 683.34,
+        "avg_loss": -460.63,
+        "avg_points": -0.454,
+        "sharpe_daily_ann": -3.24,
+        "max_drawdown": 27730.0,
+        "exit_reasons": {
+          "jev": 441,
+          "stop": 10,
+          "eod": 5
+        },
+        "actions": {
+          "HOLD": 6605,
+          "SELL": 785,
+          "BUY": 310
+        },
+        "decisions": 7700,
+        "api_calls": 7700,
+        "avg_tokens": 966.2,
+        "api_cost_usd": 0.3125
+      },
+      "holdout": {
+        "days": 6,
+        "net_pnl": 14255.0,
+        "daily_pnl": {
+          "2026-06-18": -1175.0,
+          "2026-06-19": -2820.0,
+          "2026-06-22": 8250.0,
+          "2026-06-24": -13630.0,
+          "2026-06-25": 23670.0,
+          "2026-06-26": -40.0
+        },
+        "trades": 448,
+        "trades_per_day": 74.7,
+        "win_rate": 0.435,
+        "avg_win": 669.85,
+        "avg_loss": -459.94,
+        "avg_points": 1.841,
+        "sharpe_daily_ann": 3.0,
+        "max_drawdown": 18160.0,
+        "exit_reasons": {
+          "jev": 436,
+          "stop": 6,
+          "eod": 6
+        },
+        "actions": {
+          "HOLD": 7325,
+          "SELL": 921,
+          "BUY": 295
+        },
+        "decisions": 8541,
+        "api_calls": 8541,
+        "avg_tokens": 966.4,
+        "api_cost_usd": 0.3467
+      }
+    },
+    "hold": {
+      "all": {
+        "days": 11,
+        "net_pnl": 0.0,
+        "daily_pnl": {
+          "2026-06-11": 0,
+          "2026-06-12": 0,
+          "2026-06-15": 0,
+          "2026-06-16": 0,
+          "2026-06-17": 0,
+          "2026-06-18": 0,
+          "2026-06-19": 0,
+          "2026-06-22": 0,
+          "2026-06-24": 0,
+          "2026-06-25": 0,
+          "2026-06-26": 0
+        },
+        "trades": 0,
+        "trades_per_day": 0.0,
+        "win_rate": null,
+        "avg_win": null,
+        "avg_loss": null,
+        "avg_points": null,
+        "sharpe_daily_ann": null,
+        "max_drawdown": 0.0,
+        "exit_reasons": {},
+        "actions": {
+          "HOLD": 16241
+        },
+        "decisions": 16241,
+        "api_calls": 0,
+        "avg_tokens": null,
+        "api_cost_usd": 0.0
+      },
+      "dev": {
+        "days": 5,
+        "net_pnl": 0.0,
+        "daily_pnl": {
+          "2026-06-11": 0,
+          "2026-06-12": 0,
+          "2026-06-15": 0,
+          "2026-06-16": 0,
+          "2026-06-17": 0
+        },
+        "trades": 0,
+        "trades_per_day": 0.0,
+        "win_rate": null,
+        "avg_win": null,
+        "avg_loss": null,
+        "avg_points": null,
+        "sharpe_daily_ann": null,
+        "max_drawdown": 0.0,
+        "exit_reasons": {},
+        "actions": {
+          "HOLD": 7700
+        },
+        "decisions": 7700,
+        "api_calls": 0,
+        "avg_tokens": null,
+        "api_cost_usd": 0.0
+      },
+      "holdout": {
+        "days": 6,
+        "net_pnl": 0.0,
+        "daily_pnl": {
+          "2026-06-18": 0,
+          "2026-06-19": 0,
+          "2026-06-22": 0,
+          "2026-06-24": 0,
+          "2026-06-25": 0,
+          "2026-06-26": 0
+        },
+        "trades": 0,
+        "trades_per_day": 0.0,
+        "win_rate": null,
+        "avg_win": null,
+        "avg_loss": null,
+        "avg_points": null,
+        "sharpe_daily_ann": null,
+        "max_drawdown": 0.0,
+        "exit_reasons": {},
+        "actions": {
+          "HOLD": 8541
+        },
+        "decisions": 8541,
+        "api_calls": 0,
+        "avg_tokens": null,
+        "api_cost_usd": 0.0
+      }
+    },
+    "random": {
+      "all": {
+        "days": 11,
+        "net_pnl": -3505.0,
+        "daily_pnl": {
+          "2026-06-11": -7290.0,
+          "2026-06-12": -15760.0,
+          "2026-06-15": -4820.0,
+          "2026-06-16": 5125.0,
+          "2026-06-17": 7795.0,
+          "2026-06-18": -2555.0,
+          "2026-06-19": -2545.0,
+          "2026-06-22": 4265.0,
+          "2026-06-24": 9770.0,
+          "2026-06-25": 2515.0,
+          "2026-06-26": -5.0
+        },
+        "trades": 1554,
+        "trades_per_day": 141.3,
+        "win_rate": 0.471,
+        "avg_win": 454.75,
+        "avg_loss": -409.23,
+        "avg_points": 0.137,
+        "sharpe_daily_ann": -0.69,
+        "max_drawdown": 33525.0,
+        "exit_reasons": {
+          "jev": 1507,
+          "stop": 36,
+          "eod": 11
+        },
+        "actions": {
+          "HOLD": 13060,
+          "SELL": 1633,
+          "BUY": 1548
+        },
+        "decisions": 16241,
+        "api_calls": 0,
+        "avg_tokens": null,
+        "api_cost_usd": 0.0
+      },
+      "dev": {
+        "days": 5,
+        "net_pnl": -14950.0,
+        "daily_pnl": {
+          "2026-06-11": -7290.0,
+          "2026-06-12": -15760.0,
+          "2026-06-15": -4820.0,
+          "2026-06-16": 5125.0,
+          "2026-06-17": 7795.0
+        },
+        "trades": 739,
+        "trades_per_day": 147.8,
+        "win_rate": 0.459,
+        "avg_win": 466.61,
+        "avg_loss": -432.82,
+        "avg_points": -0.762,
+        "sharpe_daily_ann": -4.95,
+        "max_drawdown": 33525.0,
+        "exit_reasons": {
+          "jev": 713,
+          "stop": 21,
+          "eod": 5
+        },
+        "actions": {
+          "HOLD": 6156,
+          "SELL": 773,
+          "BUY": 771
+        },
+        "decisions": 7700,
+        "api_calls": 0,
+        "avg_tokens": null,
+        "api_cost_usd": 0.0
+      },
+      "holdout": {
+        "days": 6,
+        "net_pnl": 11445.0,
+        "daily_pnl": {
+          "2026-06-18": -2555.0,
+          "2026-06-19": -2545.0,
+          "2026-06-22": 4265.0,
+          "2026-06-24": 9770.0,
+          "2026-06-25": 2515.0,
+          "2026-06-26": -5.0
+        },
+        "trades": 815,
+        "trades_per_day": 135.8,
+        "win_rate": 0.482,
+        "avg_win": 444.53,
+        "avg_loss": -386.86,
+        "avg_points": 0.952,
+        "sharpe_daily_ann": 6.42,
+        "max_drawdown": 22570.0,
+        "exit_reasons": {
+          "jev": 794,
+          "stop": 15,
+          "eod": 6
+        },
+        "actions": {
+          "HOLD": 6904,
+          "BUY": 777,
+          "SELL": 860
+        },
+        "decisions": 8541,
+        "api_calls": 0,
+        "avg_tokens": null,
+        "api_cost_usd": 0.0
+      }
+    },
+    "imbalance": {
+      "all": {
+        "days": 11,
+        "net_pnl": -29180.0,
+        "daily_pnl": {
+          "2026-06-11": 1100.0,
+          "2026-06-12": -10390.0,
+          "2026-06-15": -7885.0,
+          "2026-06-16": -2870.0,
+          "2026-06-17": -6460.0,
+          "2026-06-18": -8400.0,
+          "2026-06-19": -1105.0,
+          "2026-06-22": 1665.0,
+          "2026-06-24": -720.0,
+          "2026-06-25": -3080.0,
+          "2026-06-26": 8965.0
+        },
+        "trades": 150,
+        "trades_per_day": 13.6,
+        "win_rate": 0.407,
+        "avg_win": 1218.03,
+        "avg_loss": -1162.7,
+        "avg_points": -9.477,
+        "sharpe_daily_ann": -7.58,
+        "max_drawdown": 42815.0,
+        "exit_reasons": {
+          "stop": 34,
+          "jev": 106,
+          "eod": 10
+        },
+        "actions": {
+          "HOLD": 15939,
+          "SELL": 162,
+          "BUY": 140
+        },
+        "decisions": 16241,
+        "api_calls": 0,
+        "avg_tokens": null,
+        "api_cost_usd": 0.0
+      },
+      "dev": {
+        "days": 5,
+        "net_pnl": -26505.0,
+        "daily_pnl": {
+          "2026-06-11": 1100.0,
+          "2026-06-12": -10390.0,
+          "2026-06-15": -7885.0,
+          "2026-06-16": -2870.0,
+          "2026-06-17": -6460.0
+        },
+        "trades": 72,
+        "trades_per_day": 14.4,
+        "win_rate": 0.361,
+        "avg_win": 1231.92,
+        "avg_loss": -1272.5,
+        "avg_points": -18.156,
+        "sharpe_daily_ann": -18.72,
+        "max_drawdown": 34355.0,
+        "exit_reasons": {
+          "stop": 21,
+          "jev": 46,
+          "eod": 5
+        },
+        "actions": {
+          "HOLD": 7562,
+          "SELL": 76,
+          "BUY": 62
+        },
+        "decisions": 7700,
+        "api_calls": 0,
+        "avg_tokens": null,
+        "api_cost_usd": 0.0
+      },
+      "holdout": {
+        "days": 6,
+        "net_pnl": -2675.0,
+        "daily_pnl": {
+          "2026-06-18": -8400.0,
+          "2026-06-19": -1105.0,
+          "2026-06-22": 1665.0,
+          "2026-06-24": -720.0,
+          "2026-06-25": -3080.0,
+          "2026-06-26": 8965.0
+        },
+        "trades": 78,
+        "trades_per_day": 13.0,
+        "win_rate": 0.449,
+        "avg_win": 1207.71,
+        "avg_loss": -1045.23,
+        "avg_points": -1.465,
+        "sharpe_daily_ann": -1.24,
+        "max_drawdown": 11825.0,
+        "exit_reasons": {
+          "stop": 13,
+          "jev": 60,
+          "eod": 5
+        },
+        "actions": {
+          "HOLD": 8377,
+          "BUY": 78,
+          "SELL": 86
+        },
+        "decisions": 8541,
+        "api_calls": 0,
+        "avg_tokens": null,
+        "api_cost_usd": 0.0
+      }
+    }
+  }
+}

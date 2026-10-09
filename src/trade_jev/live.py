@@ -455,6 +455,7 @@ class Engine:
             if side and side != bk.pos.side:  # as Book.go: already on that side → no order
                 heapq.heappush(self.fills, (send_ns + secs(self.cfg.latency_ms / 1000), self.seq, name, side, send_ns))
                 self.seq += 1
+                self.on_change("order", policy=name, side=side, t=t, send_ns=send_ns)
         self.on_change("decision", t=t)
 
     def _close_session(self, last: int) -> None:
@@ -467,6 +468,9 @@ class Engine:
                 px = float(self.day.bid[last] if bk.pos.side > 0 else self.day.ask[last]) * TICK
                 bk._close(last, px, "eod")
         self.on_change("closed")
+
+    def order_pending(self, name: str) -> bool:
+        return any(f[2] == name for f in self.fills)
 
     def streak(self) -> dict:
         """Trailing run of confident same-side answers, capped at `agree`."""
@@ -510,9 +514,56 @@ class Bus:
                     pass
 
 
+class IntentLink:
+    """Sends order intents and heartbeats to the executor (POST JSON, in order, never blocking the engine)."""
+
+    def __init__(self, url: str, heartbeat, every_s: float = 2.0, timeout_s: float = 1.0):
+        self.url, self.heartbeat, self.every_s, self.timeout_s = url.rstrip("/"), heartbeat, every_s, timeout_s
+        self.q: queue.Queue = queue.Queue(maxsize=200)
+        self.sent = self.errors = 0
+        self.last_error: str | None = None
+        threading.Thread(target=self._worker, daemon=True).start()
+        threading.Thread(target=self._beat, daemon=True).start()
+
+    def send(self, path: str, msg: dict) -> None:
+        try:
+            self.q.put_nowait((path, msg))
+        except queue.Full:
+            self.errors += 1
+            self.last_error = "queue full: executor not keeping up"
+
+    def beat_now(self) -> None:
+        self.send("/heartbeat", self.heartbeat())
+
+    def _beat(self) -> None:
+        while True:
+            time.sleep(self.every_s)
+            self.beat_now()
+
+    def _worker(self) -> None:
+        import urllib.request
+        while True:
+            path, msg = self.q.get()
+            req = urllib.request.Request(self.url + path, json.dumps(msg).encode(),
+                                         {"Content-Type": "application/json"})
+            try:
+                urllib.request.urlopen(req, timeout=self.timeout_s).read()
+                self.sent += 1
+                self.last_error = None
+            except Exception as e:  # noqa: BLE001 — executor down or slow; logged, shown on the page
+                self.errors += 1
+                self.last_error = f"{type(e).__name__}: {e}"[:200]
+                if path == "/intent":
+                    print(f"[exec] intent {msg.get('seq')} not delivered: {self.last_error}", flush=True)
+
+    def stats(self) -> dict:
+        return {"url": self.url, "sent": self.sent, "errors": self.errors, "last_error": self.last_error}
+
+
 class Session:
     def __init__(self, args, cfg: Config, gate: Settings, day: str, symbol: str, source, jev,
-                 baselines: list[str], run_dir: Path | None, recorder: Recorder | None):
+                 baselines: list[str], run_dir: Path | None, recorder: Recorder | None,
+                 exec_url: str | None = None):
         self.args, self.cfg, self.gate, self.source = args, cfg, gate, source
         self.run_dir, self.recorder = run_dir, recorder
         self.bus = Bus()
@@ -532,6 +583,15 @@ class Session:
         self.last_tick = 0.0
         self.written = False
         self.t_start = time.time()
+        # executor link (Phase 2): intents for the Jev paper position, arm state, executor status
+        self.armed = False
+        self.target = 0
+        self.intent_seq = 0
+        self.intents: list[dict] = []
+        self.executor: dict | None = None
+        self.executor_rx = 0.0
+        self.disarm_reason: str | None = None
+        self.link = IntentLink(exec_url, self.heartbeat) if exec_url else None
         self.dec_fh = None
         if run_dir and self.engine.jev_name:
             p = run_dir / self.engine.jev_name / "decisions.jsonl"
@@ -574,6 +634,10 @@ class Session:
     async def _flusher(self) -> None:
         while True:
             await asyncio.sleep(0.25)
+            if self.armed and self.executor_rx and time.monotonic() - self.executor_rx > 10:
+                self.set_armed(False, "executor stopped reporting")
+            if self.armed and self.status_now == "STALE":
+                self.set_armed(False, "feed stale")
             if self.dirty:
                 self._rebuild()
                 self.bus.publish("update", {"status": self.status_now})
@@ -595,6 +659,7 @@ class Session:
             flusher.cancel()
             await self.engine.finish()
             self.status = "CLOSED"
+            self.set_armed(False, "session closed")
             self._rebuild()
             self.bus.publish("update", {"status": self.status})
 
@@ -624,7 +689,72 @@ class Session:
             self.dec_fh.flush()
         if kind in ("fill", "exit", "closed") and (kw.get("policy") in (None, jn)):
             self._update_signal(kind, kw)
+        if e.jev_name and kw.get("policy") in (None, e.jev_name):
+            self._intent(kind, kw)
         self.dirty = True
+
+    # -- executor link
+
+    def _intent(self, kind: str, kw: dict) -> None:
+        """Turn Jev paper-position changes into intents: an order queued → ±1; a stop/target exit or the
+        session end → 0 (unless a new order is already queued, which will land on its own side)."""
+        e = self.engine
+        if kind == "order":
+            target, reason, t = kw["side"], "jev", kw["t"]
+        elif kind == "exit" and not e.order_pending(e.jev_name):
+            target, reason, t = 0, kw["trade"].reason, kw["trade"].exit_ns
+        elif kind == "closed":
+            target, reason, t = 0, "eod", int(e.day.ts[-1]) if e.day.n else 0
+        elif kind == "fill" and self.intents and self.intents[-1]["target"] == kw["side"]:
+            bk = e.books[e.jev_name]
+            if bk.pos.side == kw["side"]:
+                self.intents[-1]["paper_fill_px"] = bk.pos.entry_px
+            return
+        else:
+            return
+        if target == self.target:
+            return
+        self.target = target
+        self.intent_seq += 1
+        q = self.quote
+        catch_up = bool(self.source.live and t and (time.time_ns() - t) / 1e9 > CATCH_UP_S)
+        msg = {"type": "intent", "seq": self.intent_seq, "day": e.day.day, "symbol": e.day.symbol,
+               "mode": self.mode, "t_ns": int(t), "send_ns": int(kw.get("send_ns") or t), "sent_wall_ns": time.time_ns(),
+               "target": target, "reason": reason,
+               "ref": {"bid": q["bid"] * TICK if q["bid"] is not None else None,
+                       "ask": q["ask"] * TICK if q["ask"] is not None else None},
+               "stop_ticks": self.cfg.stop_ticks, "target_ticks": self.cfg.target_ticks,
+               "armed": self.armed, "catch_up": catch_up, "paper_fill_px": None}
+        self.intents.append(msg)
+        if self.link:
+            self.link.send("/intent", msg)
+
+    def heartbeat(self) -> dict:
+        return {"type": "heartbeat", "seq_last": self.intent_seq, "target": self.target, "armed": self.armed,
+                "status": self.status_now, "mode": self.mode, "sent_wall_ns": time.time_ns()}
+
+    def set_armed(self, armed: bool, reason: str | None = None) -> dict:
+        armed = bool(armed)
+        if armed and (self.link is None or not self.executor_rx or self.status in ("CLOSED", "STALE")):
+            raise ValueError("can't arm: needs a connected executor and an open session")
+        changed = armed != self.armed
+        self.armed = armed
+        self.disarm_reason = None if armed else reason
+        if changed:
+            print(f"[exec] {'ARMED' if armed else 'disarmed'}{f' ({reason})' if reason and not armed else ''}", flush=True)
+            if self.link:
+                self.link.beat_now()
+            self.dirty = True
+            self.bus.publish("update", {"kind": "arm"})
+        return {"armed": self.armed, "reason": self.disarm_reason}
+
+    def on_executor_status(self, body: dict) -> dict:
+        self.executor = {k: body.get(k) for k in (
+            "broker", "armed_ack", "halted", "position", "working_orders", "last_action", "last_latency_ms",
+            "day_pnl", "orders_today", "errors", "alert", "preflight")}
+        self.executor_rx = time.monotonic()
+        self.dirty = True
+        return {"ok": True, "armed": self.armed}
 
     def _update_signal(self, kind: str, kw: dict) -> None:
         e = self.engine
@@ -690,10 +820,19 @@ class Session:
             "decisions": decs,
             "decided": len(e.decided), "grid": len(e.grid),
             "manual": self.manual,
+            "exec": None if self.link is None else {
+                "armed": self.armed, "disarm_reason": self.disarm_reason, "target": self.target,
+                "link": self.link.stats(), "status": self.executor,
+                "intents": self.intents[-50:]},
         }
 
     def state(self, window_s: int = 3600) -> dict:
-        return {**self.snapshot, "status": self.status_now, "quote": self.tick(), "track": self.track[-window_s:]}
+        st = {**self.snapshot, "status": self.status_now, "quote": self.tick(), "track": self.track[-window_s:]}
+        if st.get("exec"):
+            age = time.monotonic() - self.executor_rx if self.executor_rx else None
+            st["exec"] = {**st["exec"], "armed": self.armed, "disarm_reason": self.disarm_reason,
+                          "status_age_s": round(age, 1) if age is not None else None}
+        return st
 
     def decision_state(self, i: int) -> dict | None:
         e = self.engine
@@ -704,7 +843,14 @@ class Session:
         rec = {"action": str(body.get("action", "")).upper()[:10], "price": float(body["price"]),
                "contracts": int(body.get("contracts", 1)), "note": str(body.get("note", ""))[:200],
                "t_ns": time.time_ns(), "time_et": datetime.now(ET).strftime("%H:%M:%S"),
-               "paper_side": self.signal["side"], "paper_entry_px": self.signal["entry_px"]}
+               "paper_side": self.signal["side"], "paper_entry_px": self.signal["entry_px"],
+               "source": "executor" if body.get("source") == "executor" else "manual"}
+        if rec["source"] == "executor":
+            seq = int(body.get("seq") or 0)
+            intent = next((i for i in self.intents if i["seq"] == seq), None)
+            rec.update(seq=seq, ack_ms=body.get("ack_ms"), latency_ms=body.get("latency_ms"),
+                       paper_entry_px=intent.get("paper_fill_px") if intent else None,
+                       paper_side=intent["target"] if intent else None)
         self.manual.append(rec)
         if self.run_dir:
             with (self.run_dir / "manual_fills.jsonl").open("a") as fh:
@@ -795,6 +941,8 @@ async def amain() -> None:
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--no-open", action="store_true")
     ap.add_argument("--no-save", action="store_true", help="don't write runs/ or data/live/")
+    ap.add_argument("--exec-url", default=None,
+                    help="send order intents to an executor, e.g. http://127.0.0.1:8766 (arm it on the Live page)")
     args = ap.parse_args()
 
     cfg = Config(**{f.name: getattr(args, f.name) for f in fields(Config)})
@@ -850,7 +998,7 @@ async def amain() -> None:
         jev.timeout_s = args.jev_timeout
 
     baselines = [b for b in args.baselines.split(",") if b]
-    session = Session(args, cfg, gate, day, symbol, source, jev, baselines, run_dir, recorder)
+    session = Session(args, cfg, gate, day, symbol, source, jev, baselines, run_dir, recorder, args.exec_url)
     if run_dir:
         write_config(run_dir, cfg, [day], list(session.engine.policies), args.encoder, args.model,
                      {"min_conf": gate.min_conf, "agree": gate.agree, "min_hold_s": gate.min_hold_s},

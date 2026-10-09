@@ -165,3 +165,32 @@ def test_front_month_rolls_before_expiry():
     assert f("2026-10-02") == "NQZ6"
     assert f("2026-12-10") == "NQH7"
     assert f("2026-06-15") == "NQU6"
+
+
+class MemSource:
+    live, speed = False, 0
+
+    def __init__(self, b, chunk=50):
+        self.b, self.chunk = b, chunk
+
+    async def batches(self):
+        for i in range(0, len(self.b), self.chunk):
+            yield self.b[i:i + self.chunk]
+
+
+def test_intents_follow_the_jev_paper_trades():
+    from trade_jev.live import Session
+    b = synthetic()
+    cfg = Config(cadence_s=5, start_et="09:30:00", end_et="09:35:00", stop_ticks=6, target_ticks=8)
+    s = Session(None, cfg, Settings(0.6, 2, 0, 6, 8), DAY, "NQU6", MemSource(b), Script(), [], None, None)
+    asyncio.run(s.run())
+    trades = s.engine.results[s.engine.jev_name].trades
+    intents = s.intents
+    assert len(trades) > 3
+    assert [i["seq"] for i in intents] == list(range(1, len(intents) + 1))
+    assert all(a["target"] != b_["target"] for a, b_ in zip(intents, intents[1:]))   # only changes
+    assert intents[-1]["target"] == 0                                                # flat at the end
+    entries = [i for i in intents if i["target"]]
+    assert [i["target"] for i in entries] == [t.side for t in trades]                # one per trade
+    assert [i["paper_fill_px"] for i in entries] == [t.entry_px for t in trades]
+    assert all(i["ref"]["ask"] is not None and i["mode"] == "replay" for i in intents)

@@ -14,3 +14,9 @@ runs/*
 
 # days recorded by the live runner (licensed data)
 data/live/
+
+# executor logs (orders, fills, latencies)
+runs/executor/
+
+# private broker backends, selectors and mapping tools (separate private repo; see README "Executor")
+private/

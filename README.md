@@ -89,6 +89,15 @@ uv run python scripts/check_live_parity.py runs/<id> [runs/<id> ...]   # live en
 
 A session writes `runs/live-<day>/`, the same layout as a run plus `manual_fills.jsonl`, and records the feed to `data/live/` in the day-file format. It then opens in Replay and works with the replay scripts. The only built-in difference from the backtest is that the order goes out when Jev answers, not at the decision time; each decision records `jev_ms` and `send_ns`.
 
+### Executor (automation)
+
+`trade_jev.executor` places the live runner's signals at a broker, inside hard limits (1 contract, daily loss halt, entry cap, heartbeat and read-back checks; see the Docs tab). It starts disarmed; arm it on the Live page. `--broker fake` is built in for rehearsals and tests. Real broker backends are kept out of this repo: `--broker NAME` loads `private/NAME.py` (gitignored), which implements the interface in `src/trade_jev/executor/broker.py`. Add `--dry-run` to highlight without placing orders. Web-based backends need the `browser` extra (`uv sync --extra browser`).
+
+```bash
+uv run python -m trade_jev.executor --broker fake --allow-replay
+uv run python -m trade_jev.live --from-file 2026-06-23 --speed 60 --stored-answers runs/<id> --exec-url http://127.0.0.1:8766
+```
+
 ## 7) Test
 
 Unit tests, plus a check that the page's replays match the Python replays.

@@ -8,7 +8,9 @@ Serves viz/index.html (Replay), viz/live.html (Live), viz/docs.html (Docs) plus 
   GET /api/live/state            live session snapshot ({"active": false} without trade_jev.live)
   GET /api/live/stream           server-sent events: tick (quote, ~4/s) and update (refetch state)
   GET /api/live/decision?i=<n>   the full state Jev saw for decision n
-  POST /api/live/fill            log a manual fill {action, price, contracts, note}
+  POST /api/live/fill            log a fill {action, price, contracts, note} (manual, or from the executor)
+  POST /api/live/arm             arm / disarm the executor {armed}
+  POST /api/live/executor        executor status report (trade_jev.executor posts this every ~2s)
 """
 
 from __future__ import annotations
@@ -177,15 +179,19 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         url = urlparse(self.path)
         live = getattr(self.server, "live", None)
-        if url.path != "/api/live/fill":
+        routes = {"/api/live/fill": "add_manual_fill", "/api/live/executor": "on_executor_status",
+                  "/api/live/arm": "arm"}
+        if url.path not in routes:
             return self._error(HTTPStatus.NOT_FOUND, "not found")
         if live is None:
             return self._error(HTTPStatus.CONFLICT, "no live session")
         try:
             body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
-            self._json(live.add_manual_fill(body))
+            if url.path == "/api/live/arm":
+                return self._json(live.set_armed(body.get("armed"), "disarmed on the Live page"))
+            self._json(getattr(live, routes[url.path])(body))
         except (KeyError, ValueError, TypeError) as e:
-            self._error(HTTPStatus.BAD_REQUEST, f"bad fill: {e}")
+            self._error(HTTPStatus.BAD_REQUEST, str(e))
 
     def do_GET(self):
         url = urlparse(self.path)

@@ -80,7 +80,7 @@ ol.steps li { margin: 6px 0; }
 
   <nav class="toc" aria-label="Sections">
     <a href="#what">What it is</a><a href="#cases">Use cases</a><a href="#run">How to run</a>
-    <a href="#timing">Timing vs the backtest</a><a href="#cost">Costs</a><a href="#next">Next steps</a>
+    <a href="#auto">Automation</a><a href="#timing">Timing vs the backtest</a><a href="#cost">Costs</a><a href="#next">Next steps</a>
   </nav>
 
   <h2 id="what">What it is</h2>
@@ -155,6 +155,28 @@ echo "DATABENTO_API_KEY=..." >> .env      # live only; rehearsals don't need it<
     <tr><td><code>runs/rehearsal-&lt;day&gt;-&lt;time&gt;/</code></td><td>Rehearsal runs (no feed recording).</td></tr>
   </table></div>
 
+  <h2 id="auto">Automation (executor)</h2>
+  <p>The executor places the live runner's signals at a broker. The live runner sends an <strong>intent</strong> (be long / short / flat, with a sequence number and the current quote) to <code>localhost:8766</code> the moment Jev's answer passes the filters. The executor compares it with the real position, acts only on the difference, and reports fills back to the Live page. It always starts <strong>disarmed</strong>; you arm it with the button on the Executor card.</p>
+<pre><code># terminal 1: executor (fake broker for rehearsals; a real broker backend is private, see below)
+uv run python -m trade_jev.executor --broker fake --allow-replay
+# terminal 2: live runner, sending intents to it
+uv run python -m trade_jev.live --from-file 2026-06-23 --speed 60 \
+  --stored-answers runs/20260917-172739 --exec-url http://127.0.0.1:8766
+# then open /live and press Arm</code></pre>
+  <div class="tablewrap"><table>
+    <tr><th>Rule</th><th>What the executor does</th></tr>
+    <tr><td>New signal</td><td>Acts only when the paper position changes (a new sequence number). Flat → enter; opposite side → flatten, check it's flat, then enter. Never more than 1 contract.</td></tr>
+    <tr><td>Entry order</td><td>Marketable limit: ask + 2 ticks to buy, bid − 2 ticks to sell (<code>--slip-ticks</code>), with a broker-side bracket for the 200-tick stop and 100-tick target.</td></tr>
+    <tr><td>Broker exited first</td><td>If the broker's stop or target filled while paper is still in the trade, it stays flat and shows an alert. It never re-enters on its own.</td></tr>
+    <tr><td>Paper flat, real position open</td><td>Flattens. Note: <strong>arming while you hold a position the paper doesn't</strong> flattens it.</td></tr>
+    <tr><td>Refuses</td><td>Disarmed, catch-up signals, intents older than 5s, replay intents (unless <code>--allow-replay</code>), and entries outside 09:30–15:55 ET. Exits are always allowed.</td></tr>
+    <tr><td>Daily loss −$2,000</td><td>Flattens and halts for the rest of the day (<code>--max-daily-loss</code>). Can't be cleared that day.</td></tr>
+    <tr><td>40 entries a day</td><td>Halts new entries (<code>--max-orders</code>). Flattens don't count.</td></tr>
+    <tr><td>Errors</td><td>A failed order, a position that doesn't match after an action, or no heartbeat from the live runner for 15s (flattens if in a position): halts. Disarm, then arm again to resume.</td></tr>
+    <tr><td>Auto-disarm</td><td>The live runner disarms when the session closes, the feed goes stale, or the executor stops reporting for 10s.</td></tr>
+  </table></div>
+  <p class="small">Every intent, decision, broker action and latency is logged to <code>runs/executor/&lt;day&gt;.jsonl</code>. Real broker backends are not part of this repo: <code>--broker NAME</code> loads <code>private/NAME.py</code> (gitignored), which implements the small broker interface in <code>src/trade_jev/executor/broker.py</code>. Add <code>--dry-run</code> to locate and highlight without ever placing an order.</p>
+
   <h2 id="timing">Timing vs the backtest</h2>
   <p>The registered settings were chosen on one clock, and the live runner uses the same clock: the same decision times, look-backs and fill delay. It warns at startup if any of them is changed. Only Jev's response time and your reaction time differ, and the first is recorded on every decision (<code>jev_ms</code>, <code>send_ns</code>).</p>
   <div class="tablewrap"><table>
@@ -202,7 +224,7 @@ echo "DATABENTO_API_KEY=..." >> .env      # live only; rehearsals don't need it<
         <li>worst day better than −$2,000; Jev errors/timeouts &lt; 1% of calls.</li>
       </ul></li>
     <li><strong>If it passes:</strong> trade <strong>MNQ, 1 contract</strong>, by hand with broker brackets; log every fill and compare with the paper P&amp;L weekly. Stop if live results fall outside the forward-test range.</li>
-    <li><strong>Later:</strong> broker API automation (a Tradovate or IBKR paper account first). This likely moves you to the professional non-display license.</li>
+    <li><strong>Later:</strong> broker automation (on a paper/demo account first). This likely moves you to the professional non-display license.</li>
   </ol>
 </main>
 <script>

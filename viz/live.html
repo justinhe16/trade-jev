@@ -102,6 +102,12 @@ pre { margin: 0; white-space: pre-wrap; word-break: break-word; font: 12px/1.5 u
 .form input.wide { width: 200px; }
 .empty { color: var(--muted); padding: 16px 0; text-align: center; }
 .note { color: var(--muted); font-size: 12px; }
+.execgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px 16px; font-variant-numeric: tabular-nums; }
+.execgrid .k { color: var(--muted); font-size: 12px; } .execgrid .v { font-weight: 600; }
+.btn.arm { font-weight: 600; min-width: 96px; }
+.btn.arm[aria-pressed="true"] { background: var(--bad); color: #fff; border-color: var(--bad); }
+.btn.arm:disabled { opacity: .45; cursor: default; }
+.warnline { color: var(--bad); margin-top: 8px; font-weight: 600; }
 code { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--wash); border-radius: 4px; padding: 1px 4px; }
 </style>
 </head>
@@ -140,6 +146,16 @@ uv run python -m trade_jev.live --from-file 2026-06-23 --speed 60  # rehearsal f
         <div class="probs" id="probs"></div>
         <div class="note" id="lastdec" style="margin-top:6px"></div>
       </div>
+    </section>
+
+    <section class="card" id="execcard" hidden>
+      <div class="row" style="justify-content:space-between; margin-bottom:8px">
+        <h3 style="margin:0">Executor <span class="sub" id="execsub"></span></h3>
+        <button class="btn arm" id="armbtn" aria-pressed="false" disabled>Arm</button>
+      </div>
+      <div class="execgrid" id="execgrid"></div>
+      <div class="note warnline" id="execalert" hidden></div>
+      <div class="scroll" style="max-height:180px; margin-top:8px"><table class="data" id="intents"></table></div>
     </section>
 
     <section class="card"><div class="health" id="health"></div></section>
@@ -212,7 +228,7 @@ function render() {
   if (!st.active) { setStatus("IDLE"); return; }
   setStatus(st.status);
   $("meta").textContent = `${st.symbol} · ${st.day} · ${st.mode === "live" ? "live" : "replay" + (st.speed ? ` ×${st.speed}` : " (max speed)")}${st.run_dir ? " · " + st.run_dir : ""}`;
-  renderSignal(st); renderHealth(st); renderChart(st); renderPnl(st); renderDecs(st); renderTrades(st); renderManual(st);
+  renderSignal(st); renderExec(st); renderHealth(st); renderChart(st); renderPnl(st); renderDecs(st); renderTrades(st); renderManual(st);
 }
 
 function setStatus(s) {
@@ -249,6 +265,51 @@ function renderSignal(st) {
   }).join("");
   $("lastdec").textContent = last ? `last answer ${last.et} ET: ${last.raw}${last.err ? " · error: " + last.err : ""}${last.jev_ms != null ? ` · ${Math.round(last.jev_ms)} ms` : ""}` : "no answers yet";
 }
+
+function renderExec(st) {
+  const x = st.exec; $("execcard").hidden = !x; if (!x) return;
+  const es = x.status, connected = es && x.status_age_s != null && x.status_age_s < 10;
+  const btn = $("armbtn");
+  btn.disabled = !connected && !x.armed;
+  btn.setAttribute("aria-pressed", x.armed);
+  btn.textContent = x.armed ? "ARMED · disarm" : "Arm";
+  $("execsub").textContent = connected ? `· ${es.broker}${es.halted ? " · HALTED" : es.armed_ack ? " · armed" : " · disarmed"}`
+    : `· not connected (${x.link.url})`;
+  const real = es?.position, paper = st.policies[st.signal_policy]?.side ?? 0;
+  const realSide = real ? real.side : null;
+  const mismatch = connected && realSide != null && realSide !== paper;
+  const items = [
+    ["Real position", real ? `${sideWord(real.side)}${real.qty ? " " + real.qty : ""}${real.avg_px ? " @ " + fmtPx(real.avg_px) : ""}` : "–"],
+    ["Paper position", sideWord(paper)],
+    ["Last action", es?.last_action ? `${es.last_action.et} #${es.last_action.seq}: ${es.last_action.result}` : "–"],
+    ["Answer → ack", es?.last_latency_ms != null ? Math.round(es.last_latency_ms) + " ms" : "–"],
+    ["Entries today", es ? es.orders_today : "–"],
+    ["Day P&L", es?.day_pnl != null ? fmtUsd(es.day_pnl) : "–"],
+    ["Link", `${x.link.sent} sent · ${x.link.errors} errors`],
+  ];
+  $("execgrid").innerHTML = items.map(([k, v]) => `<div><div class="k">${k}</div><div class="v">${esc(v)}</div></div>`).join("");
+  const alerts = [];
+  if (!x.armed && x.disarm_reason && x.disarm_reason !== "disarmed on the Live page") alerts.push("Disarmed: " + x.disarm_reason);
+  if (es?.halted) alerts.push("Halted: " + es.halted + " (disarm, then arm again to resume)");
+  if (es?.alert && es.alert !== es.halted) alerts.push(es.alert);
+  if (mismatch) alerts.push(`Real position (${sideWord(realSide)}) differs from paper (${sideWord(paper)})`);
+  if (es?.preflight && !es.preflight.ok) alerts.push("Preflight: " + es.preflight.problems.join("; "));
+  if (x.link.last_error) alerts.push("Link: " + x.link.last_error);
+  $("execalert").hidden = !alerts.length; $("execalert").textContent = alerts.join(" · ");
+  const rows = x.intents.slice().reverse().slice(0, 30);
+  $("intents").innerHTML = rows.length ? `<thead><tr><th>#</th><th>Target</th><th>Why</th><th>Sent armed</th><th>Paper fill</th></tr></thead><tbody>` +
+    rows.map((i) => `<tr><td>${i.seq}</td><td>${sideWord(i.target)}</td><td>${i.reason}${i.catch_up ? " (catch-up)" : ""}</td><td>${i.armed ? "yes" : "no"}</td><td>${i.paper_fill_px != null ? fmtPx(i.paper_fill_px) : "–"}</td></tr>`).join("") + "</tbody>"
+    : `<tbody><tr><td class="empty">No intents yet.</td></tr></tbody>`;
+}
+
+$("armbtn").onclick = async () => {
+  const x = S.state?.exec; if (!x) return;
+  const want = !x.armed;
+  if (want && !confirm("Arm the executor? It will place REAL orders on the next signal change.")) return;
+  const r = await fetch("/api/live/arm", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ armed: want }) });
+  if (!r.ok) alert((await r.json()).error || "could not change arm state");
+  refresh();
+};
 
 function renderHealth(st) {
   const q = st.quote, j = st.jev;
@@ -324,13 +385,18 @@ function renderTrades(st) {
 
 function renderManual(st) {
   const m = st.manual.slice().reverse();
-  $("manual").innerHTML = m.length ? `<thead><tr><th>Time ET</th><th>Action</th><th>Price</th><th>Qty</th><th>Paper entry</th><th>Slippage</th><th>Note</th></tr></thead><tbody>` +
-    m.map((f) => {
+  $("manual").innerHTML = m.length ? `<thead><tr><th>Time ET</th><th>Action</th><th>Price</th><th>Qty</th><th>Paper entry</th><th>Slippage</th><th>Latency</th><th>Note</th></tr></thead><tbody>` +
+    m.map((f0) => {
+      let f = f0;
       // slippage in ticks vs the paper entry, signed so positive = worse than paper
+      if (f.seq && st.exec) {  // executor fill: compare with the paper fill of the same intent
+        const it = st.exec.intents.find((i) => i.seq === f.seq);
+        if (it) { f = { ...f, paper_entry_px: it.paper_fill_px, paper_side: it.target }; }
+      }
       const dir = f.action === "BUY" ? 1 : f.action === "SELL" ? -1 : 0;
       const slip = dir && f.paper_entry_px != null && f.paper_side === dir ? (f.price - f.paper_entry_px) * dir / st.tick : null;
       return `<tr><td>${f.time_et}</td><td>${f.action}</td><td>${fmtPx(f.price)}</td><td>${f.contracts}</td><td>${f.paper_entry_px != null ? fmtPx(f.paper_entry_px) : "–"}</td>
-        <td class="${slip > 0 ? "neg" : slip < 0 ? "pos" : ""}">${slip != null ? slip.toFixed(0) + " ticks" : "–"}</td><td style="text-align:left">${esc(f.note)}</td></tr>`;
+        <td class="${slip > 0 ? "neg" : slip < 0 ? "pos" : ""}">${slip != null ? slip.toFixed(0) + " ticks" : "–"}</td><td>${f.latency_ms != null ? Math.round(f.latency_ms) + " ms" : "–"}</td><td style="text-align:left">${f.source === "executor" ? "🤖 " : ""}${esc(f.note)}</td></tr>`;
     }).join("") + "</tbody>" : `<tbody><tr><td class="empty">No fills logged.</td></tr></tbody>`;
 }
 

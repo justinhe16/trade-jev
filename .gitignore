@@ -18,5 +18,5 @@ data/live/
 # executor logs (orders, fills, latencies)
 runs/executor/
 
-# private broker backends, selectors and mapping tools (separate private repo; see README "Executor")
+# private broker backends, selectors and mapping tools (local only, moved between machines by hand)
 private/

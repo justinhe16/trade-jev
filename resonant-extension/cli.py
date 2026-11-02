@@ -638,14 +638,21 @@ def cmd_stop(cfg: Config, now: datetime) -> dict[str, Any]:
 
 
 def _mark_stopped(day: str) -> None:
-    """Remember that the owner stopped today's session, so watch doesn't call it dead."""
+    """Remember that the owner stopped today's session, so watch doesn't call it dead.
+    Best effort: it runs after the signal went out, so a failed write must not exit 1."""
     path = data_dir() / STOPPED
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(day)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(day)
+    except OSError:
+        pass
 
 
 def _clear_stopped() -> None:
-    (data_dir() / STOPPED).unlink(missing_ok=True)
+    try:
+        (data_dir() / STOPPED).unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def _stopped_today(day: str) -> bool:

@@ -579,3 +579,11 @@ def test_unknown_policy_echo_is_clipped(db: PaperDB) -> None:
 
 def test_watch_schedule_catches_missing_at_0935() -> None:
     assert '"5,20,35,50 9-15 * * 1-5"' in (EXT_DIR / "resonant.yaml").read_text()
+
+
+def test_stop_marker_write_failure_still_reports_success(data_dir: Path, launchd, monkeypatch) -> None:
+    def boom(self, *a, **k):
+        raise OSError("read-only")
+
+    monkeypatch.setattr(Path, "write_text", boom)
+    assert cli.run(["stop"], now=et(MON, "12:00"))["stopped"] is True

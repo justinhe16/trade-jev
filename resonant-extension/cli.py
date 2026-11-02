@@ -1,0 +1,820 @@
+#!/usr/bin/env python3
+"""trade-jev Resonant extension: paper-trading status, P&L, trades, start/stop, two jobs.
+
+Stdlib only. Resonant runs this as ``python -I -S cli.py <cmd>`` with ``PATH=/usr/bin:/bin``
+and ``HOME``/``RESONANT_EXT_DATA`` set to the extension's data dir (never the real home).
+Every command prints exactly one JSON object on stdout and exits 0; a failure prints one
+line to stderr and exits 1, and a failed run changed nothing.
+
+Data comes from the paper runner's SQLite DB, opened read-only (``mode=ro``). The default
+path is ``DEFAULT_DB``; ``$RESONANT_EXT_DATA/config.json`` may override it (see README).
+A missing DB is not an error: it means no paper session has run yet.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+from contextlib import closing
+from dataclasses import dataclass, field
+from datetime import date, datetime, time, timedelta, timezone
+from pathlib import Path
+from typing import Any
+from zoneinfo import ZoneInfo
+
+# emit.py is the SDK's stdlib helper, copied next to this file. ``-I`` keeps this directory
+# off sys.path, so add it before importing.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from emit import report  # noqa: E402
+
+DEFAULT_DB = "/Users/justinhe/trade-jev/data/paper.db"
+DEFAULT_LABEL = "com.tradejev.paper"
+LAUNCHCTL = "/bin/launchctl"
+LAUNCHCTL_TIMEOUT_S = 10
+ET = ZoneInfo("America/New_York")
+
+STALE_S = 180  # a running session whose heartbeat is older than this is likely dead
+OPEN = time(9, 30)
+CLOSE = time(16, 0)
+MISSING_AFTER = time(9, 35)  # no session row by this time on a trading day = down
+NO_SESSIONS = "no paper sessions yet"
+
+DEFAULT_TRADES = 20
+MAX_TRADES = 50
+RESULT_BUDGET = 3800  # bytes of JSON; the model sees at most 4 KB of a result
+PNL_BUCKET = 50  # close summary state: P&L rounded to this, so tiny revisions aren't news
+DOWN_KEY = "trade-jev/down"
+WATCH_STATE = "watch_state.json"
+STOPPED = "stopped_day"  # written by `stop`: watch stays quiet for that ET day
+
+# NYSE full-day closures. A weekday listed here never raises "no session"; the runner's own
+# `holiday` rows cover the rest, and config.json may add days ("holidays": [...]).
+NYSE_HOLIDAYS = frozenset(
+    {
+        "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25",
+        "2026-06-19", "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25",
+        "2027-01-01", "2027-01-18", "2027-02-15", "2027-03-26", "2027-05-31",
+        "2027-06-18", "2027-07-05", "2027-09-06", "2027-11-25", "2027-12-24",
+    }
+)  # fmt: skip
+
+
+class Fail(Exception):
+    """A clean failure: its message is the one stderr line, and the exit code is 1."""
+
+
+# --- config and DB -------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Config:
+    db_path: Path = Path(DEFAULT_DB)
+    label: str = DEFAULT_LABEL
+    holidays: frozenset[str] = field(default_factory=frozenset)
+
+
+def data_dir() -> Path:
+    return Path(os.environ.get("RESONANT_EXT_DATA") or os.environ.get("HOME") or ".")
+
+
+def load_config() -> Config:
+    """``config.json`` in the data dir: ``{"db_path", "launchd_label", "holidays"}``, all
+    optional. A malformed file is an error rather than a silent fallback to the default."""
+    path = data_dir() / "config.json"
+    if not path.exists():
+        return Config()
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, ValueError) as e:
+        raise Fail(f"config.json unreadable: {type(e).__name__}") from None
+    if not isinstance(raw, dict):
+        raise Fail("config.json must be a JSON object")
+    db = raw.get("db_path", DEFAULT_DB)
+    label = raw.get("launchd_label", DEFAULT_LABEL)
+    holidays = raw.get("holidays", [])
+    if not isinstance(db, str) or not db:
+        raise Fail("config.json: db_path must be a non-empty string")
+    if not isinstance(label, str) or not label.replace(".", "").replace("-", "").isalnum():
+        raise Fail("config.json: launchd_label must look like com.tradejev.paper")
+    if not isinstance(holidays, list) or not all(isinstance(h, str) for h in holidays):
+        raise Fail("config.json: holidays must be a list of YYYY-MM-DD strings")
+    return Config(Path(db).expanduser(), label, frozenset(holidays))
+
+
+def connect(cfg: Config) -> sqlite3.Connection | None:
+    """The DB read-only, or None when it doesn't exist yet (or its tables don't)."""
+    if not cfg.db_path.exists():
+        return None
+    uri = cfg.db_path.resolve().as_uri() + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=5)
+    conn.row_factory = sqlite3.Row
+    names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "paper_sessions" not in names:
+        conn.close()
+        return None
+    return conn
+
+
+def has_table(conn: sqlite3.Connection, name: str) -> bool:
+    row = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,))
+    return row.fetchone() is not None
+
+
+# --- small helpers ---------------------------------------------------------------------------
+
+
+def is_jev(policy: str) -> bool:
+    """The one place that says which policy is Jev: its name contains "jev" (any case).
+    Everything else (hold, random, imbalance, ...) is a baseline."""
+    return "jev" in policy.lower()
+
+
+def pick_jev(policies: list[str]) -> str | None:
+    """The Jev policy among ``policies`` (the first by name if several match)."""
+    jevs = sorted(p for p in policies if is_jev(p))
+    return jevs[0] if jevs else None
+
+
+def money(x: float | None) -> str:
+    """``+$420`` / ``−$110`` (a real minus sign, as in the owner's example)."""
+    if x is None:
+        return "n/a"
+    v = round(x)
+    return f"{'−' if v < 0 else '+'}${abs(v):,}"
+
+
+def parse_ts(s: str | None) -> datetime | None:
+    """An ISO timestamp as an aware UTC datetime; naive means UTC. None if unparseable."""
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+
+
+def ns_to_et(ns: int | None) -> str | None:
+    if ns is None:
+        return None
+    return datetime.fromtimestamp(ns / 1e9, ET).strftime("%H:%M:%S")
+
+
+def clip(s: Any, n: int = 160) -> str | None:
+    if s is None:
+        return None
+    s = " ".join(str(s).split())
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def num(x: Any) -> float | None:
+    return None if x is None else round(float(x), 2)
+
+
+def fit(out: dict[str, Any], list_key: str) -> dict[str, Any]:
+    """Drop the oldest entries of ``out[list_key]`` until the JSON fits the result budget."""
+    items = out.get(list_key)
+    dropped = 0
+    while isinstance(items, list) and items and len(json.dumps(out)) > RESULT_BUDGET:
+        items.pop(0)
+        dropped += 1
+    if dropped:
+        out["omitted"] = out.get("omitted", 0) + dropped
+    return out
+
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def job_now() -> datetime:
+    """A job's due time (so a caught-up run reports the day it was due for), else now."""
+    due = parse_ts(os.environ.get("RESONANT_JOB_DUE_AT"))
+    return due or now_utc()
+
+
+def is_trading_day(d: date, cfg: Config) -> bool:
+    iso = d.isoformat()
+    return d.weekday() < 5 and iso not in NYSE_HOLIDAYS and iso not in cfg.holidays
+
+
+# --- sessions and P&L -----------------------------------------------------------------------
+
+
+def sessions_on(conn: sqlite3.Connection, days: list[str]) -> list[sqlite3.Row]:
+    marks = ",".join("?" * len(days))
+    return conn.execute(
+        f"SELECT * FROM paper_sessions WHERE day IN ({marks}) ORDER BY started_at",  # noqa: S608
+        days,
+    ).fetchall()
+
+
+def latest_session(conn: sqlite3.Connection, day: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM paper_sessions WHERE day=? ORDER BY started_at DESC, rowid DESC LIMIT 1",
+        (day,),
+    ).fetchone()
+
+
+def latest_trading_day(conn: sqlite3.Connection) -> str | None:
+    row = conn.execute(
+        "SELECT day FROM paper_sessions WHERE status != 'holiday' ORDER BY day DESC LIMIT 1"
+    ).fetchone()
+    return row["day"] if row else None
+
+
+def health_of(session: sqlite3.Row, now: datetime) -> tuple[str, int | None]:
+    """(health, heartbeat age in s). Health is the status, except a ``running`` session
+    whose heartbeat is older than ``STALE_S`` (or missing) is ``stale``."""
+    status = session["status"]
+    hb = parse_ts(session["heartbeat_at"]) or parse_ts(session["started_at"])
+    age = int((now - hb).total_seconds()) if hb else None
+    if status == "running" and (age is None or age > STALE_S):
+        return "stale", age
+    return status, age
+
+
+def policy_stats(conn: sqlite3.Connection, session_ids: list[str]) -> dict[str, dict[str, Any]]:
+    """Per policy over the sessions: pnl/trades/wins from paper_trades (always current, even
+    mid-session); drawdown, Jev calls and cost from paper_summary when it has a row. A policy
+    with summary rows but no trade rows takes its pnl/trades/wins from the summary."""
+    if not session_ids:
+        return {}
+    marks = ",".join("?" * len(session_ids))
+    stats: dict[str, dict[str, Any]] = {}
+
+    def entry(policy: str) -> dict[str, Any]:
+        return stats.setdefault(
+            policy,
+            {"pnl": 0.0, "trades": 0, "wins": 0, "max_drawdown": None, "jev_calls": None,
+             "jev_cost_usd": None, "_traded": False, "_summary": None},
+        )  # fmt: skip
+
+    if has_table(conn, "paper_trades"):
+        for r in conn.execute(
+            f"SELECT policy, COUNT(*) n, COALESCE(SUM(pnl), 0) pnl, "  # noqa: S608
+            f"SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) wins "
+            f"FROM paper_trades WHERE session_id IN ({marks}) AND exit_ns IS NOT NULL "
+            f"GROUP BY policy",
+            session_ids,
+        ):
+            e = entry(r["policy"])
+            e.update(pnl=float(r["pnl"]), trades=int(r["n"]), wins=int(r["wins"] or 0))
+            e["_traded"] = True
+    if has_table(conn, "paper_summary"):
+        for r in conn.execute(
+            f"SELECT * FROM paper_summary WHERE session_id IN ({marks})",  # noqa: S608
+            session_ids,
+        ):
+            e = entry(r["policy"])
+            s = e["_summary"] = e["_summary"] or {"pnl": 0.0, "trades": 0, "wins": 0}
+            s["pnl"] += float(r["pnl"] or 0)
+            s["trades"] += int(r["trades"] or 0)
+            s["wins"] += int(r["wins"] or 0)
+            if r["max_drawdown"] is not None:
+                dd = float(r["max_drawdown"])
+                cur = e["max_drawdown"]
+                e["max_drawdown"] = dd if cur is None or abs(dd) > abs(cur) else cur
+            if r["jev_calls"] is not None:
+                e["jev_calls"] = (e["jev_calls"] or 0) + int(r["jev_calls"])
+            if r["jev_cost_usd"] is not None:
+                e["jev_cost_usd"] = (e["jev_cost_usd"] or 0.0) + float(r["jev_cost_usd"])
+    for e in stats.values():
+        summary = e.pop("_summary")
+        if not e.pop("_traded") and summary:
+            e.update(summary)
+        e["pnl"] = num(e["pnl"])
+        e["max_drawdown"] = num(e["max_drawdown"])
+        e["jev_cost_usd"] = None if e["jev_cost_usd"] is None else round(e["jev_cost_usd"], 4)
+    return stats
+
+
+def jev_position(conn: sqlite3.Connection, session_id: str, policy: str) -> Any:
+    if not has_table(conn, "paper_decisions"):
+        return None
+    row = conn.execute(
+        "SELECT position FROM paper_decisions WHERE session_id=? AND policy=? "
+        "ORDER BY t_ns DESC LIMIT 1",
+        (session_id, policy),
+    ).fetchone()
+    return row["position"] if row else None
+
+
+def resolve_days(arg: str, conn: sqlite3.Connection, today: date) -> tuple[str, list[str]]:
+    """``date`` arg → (label, ET days). ``""``/``latest``: the latest session day; ``today``;
+    ``yesterday``; ``YYYY-MM-DD``; ``week`` (Monday..today); ``month`` (the 1st..today);
+    ``YYYY-MM-DD..YYYY-MM-DD`` (inclusive, at most 366 days)."""
+    a = (arg or "").strip().lower()
+    if a in ("", "latest", "last"):
+        day = latest_trading_day(conn)
+        return ("latest", [day] if day else [])
+    if a == "today":
+        return ("today", [today.isoformat()])
+    if a == "yesterday":
+        return ("yesterday", [(today - timedelta(days=1)).isoformat()])
+    if a in ("week", "this week"):
+        start = today - timedelta(days=today.weekday())
+    elif a in ("month", "this month"):
+        start = today.replace(day=1)
+    elif ".." in a:
+        lo, _, hi = a.partition("..")
+        start, today = _parse_day(lo), _parse_day(hi)
+        if start > today or (today - start).days > 366:
+            raise Fail("date range must be ascending and at most 366 days")
+        a = f"{start}..{today}"
+    else:
+        return (a, [_parse_day(a).isoformat()])
+    days = [(start + timedelta(days=i)).isoformat() for i in range((today - start).days + 1)]
+    return (a, days)
+
+
+def _parse_day(s: str) -> date:
+    try:
+        return date.fromisoformat(s.strip())
+    except ValueError:
+        raise Fail(
+            f"bad date {clip(s, 40)!r}: use YYYY-MM-DD, latest, today, week, month or A..B"
+        ) from None
+
+
+# --- launchd ----------------------------------------------------------------------------------
+
+
+def launchctl(*args: str) -> subprocess.CompletedProcess[str]:
+    """``/bin/launchctl <args>`` (absolute path: nothing is looked up on PATH)."""
+    return subprocess.run(  # noqa: S603 - fixed binary, argv built from validated config
+        [LAUNCHCTL, *args],
+        capture_output=True,
+        text=True,
+        timeout=LAUNCHCTL_TIMEOUT_S,
+        stdin=subprocess.DEVNULL,
+        check=False,
+    )
+
+
+def service(cfg: Config) -> str:
+    return f"gui/{os.getuid()}/{cfg.label}"
+
+
+def launchd_state(cfg: Config) -> dict[str, Any]:
+    """Best effort: {"loaded": bool|None, "state": "running"|"not running"|..., "pid"}."""
+    try:
+        proc = launchctl("print", service(cfg))
+    except (OSError, subprocess.SubprocessError):
+        return {"loaded": None, "label": cfg.label}
+    if proc.returncode != 0:
+        return {"loaded": False, "label": cfg.label}
+    out: dict[str, Any] = {"loaded": True, "label": cfg.label}
+    for line in proc.stdout.splitlines():
+        key, sep, val = line.strip().partition(" = ")
+        if not sep:
+            continue
+        if key == "state" and "state" not in out:
+            out["state"] = val.strip()
+        elif key == "pid" and "pid" not in out and val.strip().isdigit():
+            out["pid"] = int(val.strip())
+    return out
+
+
+# --- tools ------------------------------------------------------------------------------------
+
+
+def no_sessions(**extra: Any) -> dict[str, Any]:
+    return {"sessions": 0, "summary": NO_SESSIONS, **extra}
+
+
+def cmd_status(cfg: Config, now: datetime) -> dict[str, Any]:
+    today = now.astimezone(ET).date().isoformat()
+    launchd = launchd_state(cfg)
+    conn = connect(cfg)
+    if conn is None:
+        return no_sessions(day=today, running=False, launchd=launchd)
+    with closing(conn):
+        s = latest_session(conn, today)
+        if s is None:
+            last = latest_trading_day(conn)
+            return {
+                "day": today,
+                "running": False,
+                "session": None,
+                "last_session_day": last,
+                "launchd": launchd,
+                "summary": f"no session today ({today}); last session {last or 'never'}",
+            }
+        health, age = health_of(s, now)
+        stats = policy_stats(conn, [s["session_id"]])
+        jev = pick_jev(list(stats)) or pick_jev(_decision_policies(conn, s["session_id"]))
+        j = stats.get(jev or "", {})
+        position = jev_position(conn, s["session_id"], jev) if jev else None
+    out = {
+        "day": today,
+        "running": health == "running",
+        "session": {
+            "id": s["session_id"],
+            "symbol": s["symbol"],
+            "status": s["status"],
+            "health": health,
+            "started_at": s["started_at"],
+            "ended_at": s["ended_at"],
+            "heartbeat_age_s": age,
+            "error": clip(s["error"]),
+        },
+        "jev": {
+            "policy": jev,
+            "position": position,
+            "pnl": j.get("pnl", 0.0),
+            "trades": j.get("trades", 0),
+            "wins": j.get("wins", 0),
+        },
+        "launchd": launchd,
+    }
+    label = "stale/likely dead" if health == "stale" else health
+    out["summary"] = (
+        f"{s['symbol']} paper session {label}; Jev {money(out['jev']['pnl'])} "
+        f"({out['jev']['trades']} trades), position {position if position is not None else '?'}"
+    )
+    return out
+
+
+def _decision_policies(conn: sqlite3.Connection, session_id: str) -> list[str]:
+    if not has_table(conn, "paper_decisions"):
+        return []
+    rows = conn.execute(
+        "SELECT DISTINCT policy FROM paper_decisions WHERE session_id=?", (session_id,)
+    )
+    return [r["policy"] for r in rows]
+
+
+def cmd_pnl(cfg: Config, now: datetime, date_arg: str) -> dict[str, Any]:
+    conn = connect(cfg)
+    if conn is None:
+        return no_sessions()
+    with closing(conn):
+        label, days = resolve_days(date_arg, conn, now.astimezone(ET).date())
+        sessions = [s for s in sessions_on(conn, days) if s["status"] != "holiday"] if days else []
+        if not sessions:
+            return {"range": label, "days": days[:1] + days[-1:], "sessions": 0,
+                    "summary": f"no paper sessions for {label}"}  # fmt: skip
+        stats = policy_stats(conn, [s["session_id"] for s in sessions])
+        by_day: dict[str, list[str]] = {}
+        for s in sessions:
+            by_day.setdefault(s["day"], []).append(s["session_id"])
+        daily = []
+        if len(by_day) > 1:
+            for d, ids in sorted(by_day.items()):
+                ds = policy_stats(conn, ids)
+                jp = pick_jev(list(ds))
+                statuses = sorted({s["status"] for s in sessions if s["day"] == d})
+                daily.append({
+                    "day": d,
+                    "jev_pnl": ds[jp]["pnl"] if jp else None,
+                    "jev_trades": ds[jp]["trades"] if jp else 0,
+                    "status": "/".join(statuses),
+                })  # fmt: skip
+    jev = pick_jev(list(stats))
+    policies = [
+        {"policy": p, "jev": is_jev(p), **v}
+        for p, v in sorted(stats.items(), key=lambda kv: (not is_jev(kv[0]), kv[0]))
+    ]
+    out: dict[str, Any] = {
+        "range": label,
+        "from": min(by_day),
+        "to": max(by_day),
+        "trading_days": len(by_day),
+        "sessions": len(sessions),
+        "jev_policy": jev,
+        "policies": policies,
+    }
+    if jev:
+        jp = stats[jev]["pnl"] or 0.0
+        out["jev_minus_baseline"] = {
+            p: num(jp - (v["pnl"] or 0.0)) for p, v in stats.items() if not is_jev(p)
+        }
+    if len(by_day) == 1:
+        out["status"] = "/".join(sorted({s["status"] for s in sessions}))
+    out["summary"] = summary_line(sessions[-1]["symbol"], stats, len(by_day))
+    if daily:
+        out["daily"] = daily
+        fit(out, "daily")
+    return out
+
+
+def summary_line(symbol: str | None, stats: dict[str, dict[str, Any]], ndays: int = 1) -> str:
+    """``Paper NQ: Jev +$420 (6 trades), hold −$110, random +$30``."""
+    jev = pick_jev(list(stats))
+    head = f"Paper {symbol or '?'}"
+    if ndays > 1:
+        head += f" ({ndays} days)"
+    parts = []
+    if jev:
+        parts.append(f"Jev {money(stats[jev]['pnl'])} ({stats[jev]['trades']} trades)")
+    parts += [f"{p} {money(v['pnl'])}" for p, v in sorted(stats.items()) if not is_jev(p)]
+    return f"{head}: {', '.join(parts) or 'no trades'}"
+
+
+def cmd_trades(
+    cfg: Config, now: datetime, date_arg: str, policy_arg: str, limit: int
+) -> dict[str, Any]:
+    conn = connect(cfg)
+    if conn is None:
+        return no_sessions(trades=[])
+    limit = DEFAULT_TRADES if limit <= 0 else min(limit, MAX_TRADES)
+    with closing(conn):
+        label, days = resolve_days(date_arg, conn, now.astimezone(ET).date())
+        sessions = [s for s in sessions_on(conn, days) if s["status"] != "holiday"] if days else []
+        if not sessions or not has_table(conn, "paper_trades"):
+            return {"range": label, "trades": [], "summary": f"no paper sessions for {label}"}
+        ids = [s["session_id"] for s in sessions]
+        marks = ",".join("?" * len(ids))
+        known = [
+            r["policy"]
+            for r in conn.execute(
+                f"SELECT DISTINCT policy FROM paper_trades WHERE session_id IN ({marks})",  # noqa: S608
+                ids,
+            )
+        ]
+        want = (policy_arg or "").strip()
+        if want.lower() in ("", "jev"):
+            policy = pick_jev(known)
+        else:
+            policy = next((p for p in known if p.lower() == want.lower()), None)
+        if policy is None:
+            return {"range": label, "policy": clip(want, 40) or "jev", "trades": [],
+                    "policies": known[:20],
+                    "summary": f"no trades for policy {clip(want, 40) or 'jev'} in {label}"}  # fmt: skip
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM paper_trades WHERE session_id IN ({marks}) AND policy=?",  # noqa: S608
+            [*ids, policy],
+        ).fetchone()[0]
+        rows = conn.execute(
+            f"SELECT * FROM paper_trades WHERE session_id IN ({marks}) AND policy=? "  # noqa: S608
+            f"ORDER BY entry_ns DESC LIMIT ?",
+            [*ids, policy, limit],
+        ).fetchall()
+    multi_day = len({s["day"] for s in sessions}) > 1
+    day_of = {s["session_id"]: s["day"] for s in sessions}
+    trades = []
+    for r in reversed(rows):
+        t: dict[str, Any] = {
+            "in": ns_to_et(r["entry_ns"]),
+            "out": ns_to_et(r["exit_ns"]),
+            "side": r["side"],
+            "entry": r["entry_px"],
+            "exit": r["exit_px"],
+            "why": r["reason"],
+            "pts": num(r["points"]),
+            "pnl": num(r["pnl"]),
+        }
+        if multi_day:
+            t = {"day": day_of.get(r["session_id"]), **t}
+        trades.append(t)
+    out: dict[str, Any] = {
+        "range": label,
+        "policy": policy,
+        "total": total,
+        "shown": len(trades),
+        "times": "ET",
+        "trades": trades,
+    }
+    fit(out, "trades")
+    out["shown"] = len(out["trades"])
+    out["summary"] = f"{policy}: {total} trades in {label}, showing the last {out['shown']}"
+    return out
+
+
+def cmd_start(cfg: Config, now: datetime) -> dict[str, Any]:
+    """Kickstart the launchd job. Refuses (exit 1, nothing done) when the job isn't loaded;
+    reports without acting when today's session is already running and healthy."""
+    st = launchd_state(cfg)
+    if st["loaded"] is False:
+        raise Fail(f"launchd job {cfg.label} isn't loaded; load its plist first")
+    if st.get("state") == "running":
+        return {"started": False, "reason": "already running", "launchd": st,
+                "summary": f"{cfg.label} is already running"}  # fmt: skip
+    try:
+        proc = launchctl("kickstart", service(cfg))
+    except subprocess.TimeoutExpired:
+        # It may have gone through: never exit 1 (that promises nothing happened).
+        _clear_stopped()
+        return {"started": "unknown", "reason": "launchctl timed out",
+                "summary": f"kickstart of {cfg.label} timed out; check trade_jev_status"}  # fmt: skip
+    except (OSError, subprocess.SubprocessError) as e:
+        raise Fail(f"launchctl kickstart failed: {type(e).__name__}") from None
+    if proc.returncode != 0:
+        raise Fail(f"launchctl kickstart exited {proc.returncode}: {clip(proc.stderr, 120)}")
+    _clear_stopped()
+    return {"started": True, "service": service(cfg),
+            "summary": f"kickstarted {cfg.label}; status will show the session once it's up"}  # fmt: skip
+
+
+def cmd_stop(cfg: Config, now: datetime) -> dict[str, Any]:
+    """SIGTERM the launchd job's process. Nothing to do (exit 0) when it isn't running."""
+    st = launchd_state(cfg)
+    if st["loaded"] is False:
+        return {"stopped": False, "reason": "job not loaded", "launchd": st,
+                "summary": f"{cfg.label} isn't loaded; nothing to stop"}  # fmt: skip
+    if st["loaded"] and st.get("state") not in (None, "running"):
+        return {"stopped": False, "reason": f"not running ({st.get('state')})", "launchd": st,
+                "summary": f"{cfg.label} isn't running; nothing to stop"}  # fmt: skip
+    day = now.astimezone(ET).date().isoformat()
+    try:
+        proc = launchctl("kill", "SIGTERM", service(cfg))
+    except subprocess.TimeoutExpired:
+        # It may have gone through: never exit 1 (that promises nothing happened).
+        _mark_stopped(day)
+        return {"stopped": "unknown", "reason": "launchctl timed out",
+                "summary": f"SIGTERM to {cfg.label} timed out; check trade_jev_status"}  # fmt: skip
+    except (OSError, subprocess.SubprocessError) as e:
+        raise Fail(f"launchctl kill failed: {type(e).__name__}") from None
+    if proc.returncode != 0:
+        raise Fail(f"launchctl kill exited {proc.returncode}: {clip(proc.stderr, 120)}")
+    _mark_stopped(day)
+    return {"stopped": True, "service": service(cfg),
+            "summary": f"sent SIGTERM to {cfg.label}"}  # fmt: skip
+
+
+def _mark_stopped(day: str) -> None:
+    """Remember that the owner stopped today's session, so watch doesn't call it dead.
+    Best effort: it runs after the signal went out, so a failed write must not exit 1."""
+    path = data_dir() / STOPPED
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(day)
+    except OSError:
+        pass
+
+
+def _clear_stopped() -> None:
+    try:
+        (data_dir() / STOPPED).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _stopped_today(day: str) -> bool:
+    try:
+        return (data_dir() / STOPPED).read_text().strip() == day
+    except OSError:
+        return False
+
+
+def cmd_health(cfg: Config, now: datetime) -> dict[str, Any]:
+    """Healthy (exit 0) when the config parses and the DB, if present, opens read-only and
+    answers a query. A missing DB is healthy: no session has run yet."""
+    conn = connect(cfg)
+    if conn is None:
+        return {"ok": True, "db": "absent", "summary": NO_SESSIONS}
+    with closing(conn):
+        n = conn.execute("SELECT COUNT(*) FROM paper_sessions").fetchone()[0]
+    return {"ok": True, "db": "ok", "sessions": n}
+
+
+# --- jobs -------------------------------------------------------------------------------------
+
+
+def cmd_close_summary(cfg: Config, now: datetime) -> dict[str, Any]:
+    """After the close: one normal-urgency report per trading day, keyed by the day, with
+    the Jev and baseline P&L. Nothing on a holiday or a day with no session."""
+    day = now.astimezone(ET).date().isoformat()
+    conn = connect(cfg)
+    if conn is None:
+        return {"reported": False, "day": day, "summary": NO_SESSIONS}
+    with closing(conn):
+        sessions = [s for s in sessions_on(conn, [day]) if s["status"] != "holiday"]
+        if not sessions:
+            return {"reported": False, "day": day, "summary": f"no paper session on {day}"}
+        stats = policy_stats(conn, [s["session_id"] for s in sessions])
+    last = sessions[-1]
+    title = summary_line(last["symbol"], stats)
+    if last["status"] != "done":
+        title += f" ({last['status']})"
+    jev = pick_jev(list(stats))
+    jpnl = stats[jev]["pnl"] if jev else None
+    state = {
+        "day": day,
+        "status": last["status"],
+        "jev_bucket": None if jpnl is None else round(jpnl / PNL_BUCKET) * PNL_BUCKET,
+        "jev_trades": stats[jev]["trades"] if jev else 0,
+    }
+    report(f"trade-jev/pnl/{day}", title, urgency="normal", state=state, ttl="24h")
+    return {"reported": True, "day": day, "title": title, "state": state}
+
+
+def down_reason(conn: sqlite3.Connection | None, now: datetime) -> str | None:
+    """Why paper trading is down right now, or None when it's fine (or not expected up)."""
+    et = now.astimezone(ET)
+    day = et.date().isoformat()
+    s = latest_session(conn, day) if conn is not None else None
+    if s is None:
+        if et.time() >= MISSING_AFTER:
+            return "no session started"
+        return None
+    health, age = health_of(s, now)  # holiday, done and aborted (stopped on purpose) are fine
+    if health == "crashed":
+        err = clip(s["error"], 100)
+        return "session crashed" + (f": {err}" if err else "")
+    if health == "stale":
+        mins = f"{age // 60} min" if age is not None else "ever"
+        return f"session stale (no heartbeat for {mins}), likely dead"
+    return None
+
+
+def cmd_watch(cfg: Config, now: datetime) -> dict[str, Any]:
+    """Every 15 min in market hours: an urgent ``trade-jev/down`` while today's session is
+    crashed or stale, or missing by 09:35; a clear once it's healthy again. A clear is sent
+    only after a down report (remembered in the data dir), so a healthy day says nothing."""
+    et = now.astimezone(ET)
+    day = et.date().isoformat()
+    if not is_trading_day(et.date(), cfg) or not OPEN <= et.time() <= CLOSE:
+        return {"checked": False, "summary": "outside market hours"}
+    conn = connect(cfg)
+    try:
+        # Stopped on purpose today (trade_jev_stop): a stale or missing session isn't news.
+        reason = None if _stopped_today(day) else down_reason(conn, now)
+    finally:
+        if conn is not None:
+            conn.close()
+    state_path = data_dir() / WATCH_STATE
+    was_down = _read_state(state_path).get("down")
+    if reason:
+        kind = reason.split(":")[0].split(" (")[0]
+        report(DOWN_KEY, f"Paper trading down: {reason}", urgency="urgent",
+               state={"day": day, "reason": kind}, ttl="12h")  # fmt: skip
+        _write_state(state_path, {"down": {"day": day, "reason": kind}})
+        return {"checked": True, "down": True, "reason": reason}
+    if was_down:
+        report(DOWN_KEY, "Paper trading healthy again", urgency="urgent", clear=True,
+               state={"day": day, "reason": "ok"})  # fmt: skip
+        _write_state(state_path, {"down": None})
+        return {"checked": True, "down": False, "cleared": True}
+    return {"checked": True, "down": False}
+
+
+def _read_state(path: Path) -> dict[str, Any]:
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _write_state(path: Path, state: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state))
+    tmp.replace(path)
+
+
+# --- main -------------------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="cli.py")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    for name in ("status", "start", "stop", "health", "close-summary", "watch"):
+        sub.add_parser(name)
+    pnl = sub.add_parser("pnl")
+    pnl.add_argument("--date", default="")
+    tr = sub.add_parser("trades")
+    tr.add_argument("--date", default="")
+    tr.add_argument("--policy", default="")
+    tr.add_argument("--limit", type=int, default=0)
+    return p
+
+
+def run(argv: list[str], now: datetime | None = None) -> dict[str, Any]:
+    args = build_parser().parse_args(argv)
+    cfg = load_config()
+    if args.cmd == "pnl":
+        return cmd_pnl(cfg, now or now_utc(), args.date)
+    if args.cmd == "trades":
+        return cmd_trades(cfg, now or now_utc(), args.date, args.policy, args.limit)
+    if args.cmd in ("close-summary", "watch"):
+        fn = cmd_close_summary if args.cmd == "close-summary" else cmd_watch
+        # close-summary reports the day it was due for; watch is about right now.
+        return fn(cfg, now or (job_now() if args.cmd == "close-summary" else now_utc()))
+    fn = {"status": cmd_status, "start": cmd_start, "stop": cmd_stop, "health": cmd_health}[
+        args.cmd
+    ]
+    return fn(cfg, now or now_utc())
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        out = run(sys.argv[1:] if argv is None else argv)
+    except Fail as e:
+        print(f"trade-jev: {e}", file=sys.stderr)
+        return 1
+    except sqlite3.Error as e:
+        print(f"trade-jev: database error: {type(e).__name__}: {clip(e, 120)}", file=sys.stderr)
+        return 1
+    print(json.dumps(out, separators=(",", ":"), default=str))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

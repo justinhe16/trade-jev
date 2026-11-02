@@ -358,10 +358,11 @@ def test_revoked_token_with_a_future_expiry_accumulates_failures_to_the_alert(st
 def test_a_transient_error_does_not_blacklist_fresh_env_tokens(store, dotenv):
     put_store(store, left_s=-100, age_s=3000)
     put_env(dotenv, "ACC-ENV", "MD-ENV", age_s=5)
-    http = RenewHttp(tv.TradovateError("OSError: unreachable"), (503, {}), renewed())
+    http = RenewHttp(tv.TradovateError("OSError: unreachable"), (503, {}), (429, {}), (408, {}), renewed())
     k = keepalive(store, dotenv, http)
-    assert tick(k) == "failed" and tick(k) == "failed"                         # network error, then a 5xx: retried
-    assert tick(k) == "adopted-env" and http.bearers == ["ACC-ENV"] * 3
+    for _ in range(4):                                                         # network error, 5xx, 429, 408: retried
+        assert tick(k) == "failed"
+    assert tick(k) == "adopted-env" and http.bearers == ["ACC-ENV"] * 5
 
 
 def test_a_refused_store_write_keeps_the_store_on_disk(store, dotenv, monkeypatch):

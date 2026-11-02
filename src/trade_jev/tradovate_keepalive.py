@@ -47,8 +47,12 @@ def _log(msg: str) -> None:
     print(f"[tvtoken] {time.strftime('%F %T')} {msg}", flush=True)
 
 
+TRANSIENT_HTTP = (408, 429)  # timeout / rate limit: retry, never blacklist a seed
+
+
 class Rejected(RuntimeError):
-    """A definitive answer: HTTP 4xx or errorText. Transport errors and 5xx are plain RuntimeError (retried)."""
+    """A definitive answer: HTTP 4xx (not 408/429) or errorText. Transport errors, 5xx, 408 and 429 are plain
+    RuntimeError (retried)."""
 
 
 class Keepalive:
@@ -80,7 +84,8 @@ class Keepalive:
             raise RuntimeError(f"renew failed: {redact(e, secrets)}") from None
         if status >= 400 or d.get("errorText") or not d.get("accessToken"):
             text = redact(f"renew failed: {d.get('errorText') or 'HTTP ' + str(status)}", secrets)
-            raise (Rejected if status < 500 else RuntimeError)(text)
+            transient = status >= 500 or status in TRANSIENT_HTTP or (status < 400 and not d.get("errorText"))
+            raise (RuntimeError if transient else Rejected)(text)
         exp = tt.parse_expiration(d.get("expirationTime")) or self.clock() + DEFAULT_LIFETIME_S
         return exp, d.get("mdAccessToken") or md, d["accessToken"]
 

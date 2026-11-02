@@ -293,6 +293,7 @@ class TradovateAuth:
             await asyncio.gather(t, return_exceptions=True)
 
     async def _renew_loop(self) -> None:
+        fails = 0
         while True:
             await self.sleep(max(30.0, self.expires_at - RENEW_MARGIN_S - self.clock()))
             try:
@@ -300,8 +301,12 @@ class TradovateAuth:
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001
-                _log(f"token refresh failed: {self.redact(e)}; retrying in 60s")
-                self.expires_at = self.clock() + RENEW_MARGIN_S + 60
+                fails += 1
+                wait = min(60 * 2 ** (fails - 1), 900)  # 1, 2, 4 ... 15 min: no login hammering in an outage
+                _log(f"token refresh failed ({fails}): {self.redact(e)}; retrying in {wait}s")
+                self.expires_at = self.clock() + RENEW_MARGIN_S + wait
+            else:
+                fails = 0
 
     async def contract_id(self, symbol: str) -> int:
         """GET contract/find (read-only reference data)."""
@@ -486,10 +491,14 @@ class TickDecoder:
                 continue
             if c.get("eoh"):
                 self.eoh = True
+                continue  # the marker closes the history; its own ticks (if any) are history
             tks = c.get("tks")
             if not isinstance(tks, list) or not self.eoh:
                 continue
             bp, bt = c.get("bp") or 0, c.get("bt") or 0
+            if isinstance(bt, str):  # an ISO base time instead of epoch ms
+                n = _ts_ns(bt)
+                bt = n // 1_000_000 if n is not None else 0
             ts = c.get("ts") or TICK
             px = lambda v: int(round((bp + v) * ts / TICK))  # noqa: E731
             batch = []
@@ -525,6 +534,7 @@ class MdSocket:
         self.pending: dict[int, asyncio.Future] = {}
         self.dropped = asyncio.Event()
         self.drop_reason = ""
+        self.event_errors = 0
         self.tasks: list[asyncio.Task] = []
 
     async def wait_open(self, timeout: float = 10.0) -> None:
@@ -580,7 +590,12 @@ class MdSocket:
                         self._drop(f"shutdown {m.get('d')}")
                         return
                     elif "e" in m:
-                        self.on_event(m)
+                        try:
+                            self.on_event(m)
+                        except Exception as e:  # noqa: BLE001 — one bad event must not drop the socket
+                            self.event_errors += 1
+                            if self.event_errors <= 3:
+                                _log(f"event skipped ({type(e).__name__})")
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001 — ConnectionClosed and friends
@@ -773,7 +788,10 @@ class TradovateSource:
                 await sock.wait_open()
                 sock.start()
                 await sock.authorize(token)
-            except Exception as e:  # noqa: BLE001
+            except BaseException as e:  # noqa: BLE001
+                if not isinstance(e, Exception):
+                    await sock.close()
+                    raise
                 last = f"{self._host(url)}: authorize with {kind} failed ({self.auth.redact(f'{type(e).__name__}: {e}')})"
                 _log(last)
                 await sock.close()
@@ -900,7 +918,7 @@ class TradovateSource:
             self._stop.set()
             try:
                 await asyncio.wait_for(task, 8.0)
-            except (asyncio.CancelledError, TimeoutError, Exception):  # noqa: BLE001
+            except (TimeoutError, Exception):  # noqa: BLE001
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
 

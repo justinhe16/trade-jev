@@ -75,8 +75,11 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
     con.execute("PRAGMA synchronous=NORMAL")
     con.executescript(SCHEMA)
     if "source" not in {r[1] for r in con.execute("PRAGMA table_info(paper_sessions)")}:
-        con.execute("ALTER TABLE paper_sessions ADD COLUMN source TEXT")  # older DBs; idempotent
-        con.commit()
+        try:
+            con.execute("ALTER TABLE paper_sessions ADD COLUMN source TEXT")  # older DBs; idempotent
+            con.commit()
+        except sqlite3.OperationalError:  # another process added it first
+            pass
     return con
 
 

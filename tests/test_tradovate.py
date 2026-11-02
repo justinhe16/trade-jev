@@ -92,7 +92,7 @@ def test_parse_dom_compact_form_and_missing_side():
 
 # ---------------------------------------------------------------- ticks
 
-def packet(i, tks, bp=80000, bt=1_800_000_000_000, ts=0.25, eoh=None):
+def packet(i, tks, bp=80000, bt=1_800_000_000_000, ts=0.25, eoh=None):  # bt: epoch ms or ISO
     out = [{"id": i, "s": 1, "td": "2027-06-02", "bp": bp, "bt": bt, "ts": ts, "tks": tks}]
     if eoh is not None:
         out.append({"id": eoh, "eoh": True})
@@ -123,6 +123,34 @@ def test_tick_size_scaling_converts_to_quarter_ticks():
     dec.eoh = True
     [t] = dec.feed(packet(1, [{"t": 1, "p": 4, "s": 1, "id": 1}], bp=10000, ts=0.5))   # (10000+4)*0.5 = 5002.0
     assert t.price == 20008
+
+
+def test_tick_decoder_iso_base_time_and_eoh_packet_ticks_are_history():
+    dec = tv.TickDecoder()
+    marker = {"id": 1, "eoh": True, "tks": [{"t": 1, "p": 1, "s": 5, "id": 1}]}
+    assert dec.feed({"charts": [marker]}) == [] and dec.eoh
+    [t] = dec.feed(packet(1, [{"t": 500, "p": 1, "s": 1, "id": 2}], bt="2027-06-02T13:30:00Z"))
+    assert t.ts_ns == int(datetime(2027, 6, 2, 13, 30, tzinfo=timezone.utc).timestamp()) * 10**9 + 500_000_000
+
+
+def test_a_bad_event_does_not_drop_the_socket():
+    events, _ = market_script(start="09:30:00", stop="09:30:30", step_s=2)
+
+    async def go():
+        async with FakeMd([events]) as md:
+            src = make_source(md.url, stop="09:30:20")
+            orig = src._on_event
+            calls = [0]
+
+            def flaky(m):
+                calls[0] += 1
+                if calls[0] == 5:
+                    raise ValueError("boom")
+                orig(m)
+            src._on_event = flaky
+            await drain(src)
+            return src
+    assert asyncio.run(go()).reconnects == 0
 
 
 def test_aggressor_rule():

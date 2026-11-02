@@ -118,6 +118,12 @@ scripts/install_launchd.sh      # copies deploy/launchd/*.plist to ~/Library/Lau
 
 **The record:** `data/paper.db` (override with `TRADE_JEV_PAPER_DB`), SQLite in WAL mode, created on first use. It has four tables: `paper_sessions` (one row per day: `running | done | crashed | holiday | aborted`, with a heartbeat at least every 60s while running), `paper_trades` (every policy's trades, written as they close), `paper_decisions` (the Jev decision log) and `paper_summary` (per-policy totals, written at the end). A `running` row with a stale heartbeat means the process died. The schema is in `src/trade_jev/paperdb.py`. The usual `runs/live-<day>/` files are still written.
 
+**Behaviour of `trade_jev.live` (also when run by hand):**
+- On a weekend or holiday it exits 0 and writes a `holiday` row.
+- A live session closes 2 minutes after its end even if the feed has gone quiet.
+- Ctrl-C exits 130 and marks the session `aborted`.
+- Jev errors (bad key, outage) count as HOLD and show in the decision log's error column.
+
 **View:** `http://127.0.0.1:8765/paper` shows a per-day table (status, Jev P&L against the baselines, trades, wins, drawdown, Jev cost) and a drill-down with each session's trades and Jev decisions. It updates every 5s while a session runs. `uv run python -m trade_jev.view` serves it standalone, with no run or live session needed.
 
 ```bash

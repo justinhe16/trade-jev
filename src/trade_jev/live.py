@@ -661,7 +661,7 @@ class Session:
         timeout = max(0.0, (self.deadline_ns - time.time_ns()) / 1e9) if self.deadline_ns else None
         batches = self.source.batches()
         try:
-            async with asyncio.timeout(timeout):  # a feed that goes quiet (13:00 ET halt) can't hang us
+            async with asyncio.timeout(timeout) as deadline:  # a quiet feed (13:00 ET halt) can't hang us
                 async for b in batches:
                     self.on_batch(b)
                     await self.engine.feed(b)
@@ -670,6 +670,8 @@ class Session:
                     if self.status == "WAITING" and self.engine.decided:
                         self.status = "REPLAY" if not self.source.live else "LIVE"
         except TimeoutError:
+            if not deadline.expired():
+                raise  # a timeout inside the feed is a failure, not the session end
             print("feed past the session end with no more data; closing the session", flush=True)
         finally:
             await batches.aclose()
@@ -709,14 +711,22 @@ class Session:
                 self.dec_fh.write(json.dumps(last) + "\n")
                 self.dec_fh.flush()
             if self.paper:
-                self.paper.decision(e.jev_name, last)
+                self._paper_safe(self.paper.decision, e.jev_name, last)
         if self.paper:
-            self._paper_trades()
+            self._paper_safe(self._paper_trades)
         if kind in ("fill", "exit", "closed") and (kw.get("policy") in (None, jn)):
             self._update_signal(kind, kw)
         if e.jev_name and kw.get("policy") in (None, e.jev_name):
             self._intent(kind, kw)
         self.dirty = True
+
+    @staticmethod
+    def _paper_safe(fn, *a) -> None:
+        """The paper record must never stop the session: a bad row is logged and skipped."""
+        try:
+            fn(*a)
+        except Exception as e:  # noqa: BLE001
+            print(f"[paperdb] not recorded: {type(e).__name__}: {e}", flush=True)
 
     def _paper_trades(self) -> None:
         """Queue every newly closed trade (stop, target, reversal, session end) of every policy."""
@@ -1154,7 +1164,14 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\nstopped.")
         code = 130
-    sys.exit(code)
+    except Exception:  # noqa: BLE001 — already recorded as `crashed`; print and exit 1
+        traceback.print_exc()
+        code = 1
+    # Everything is written by now (outputs, feed recording, paper DB joined). Exit hard so a stray
+    # non-daemon thread (feed client, SDK) can't keep an unattended run alive past the session.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)
 
 
 if __name__ == "__main__":

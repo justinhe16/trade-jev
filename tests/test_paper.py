@@ -300,3 +300,12 @@ def test_paper_routes_list_and_drill_down(server, db):
     s = json.loads(get(server + "/api/paper/session?id=live-2026-11-02")[2])
     assert s["settings"] == {"min_conf": 0.7} and len(s["trades"]) == 1
     assert s["decisions"][0]["raw_action"] == "BUY" and s["decisions"][0]["probs"] == {"BUY": 0.6}
+
+
+def test_writer_survives_a_bad_statement(db):
+    rec = paperdb.Recorder("live-2026-11-04")
+    rec._put("INSERT INTO no_such_table VALUES (1)")
+    rec.trade("hold", Trade("2026-11-04", 1, 10, 100.0, 20, 101.0, "eod", 1.0, 15.0))
+    rec.close()
+    assert rec.errors == 1
+    assert len(rows(db, "SELECT * FROM paper_trades")) == 1

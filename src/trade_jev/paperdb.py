@@ -124,18 +124,19 @@ class Recorder:
                 except queue.Empty:
                     break
             stop = None in items
-            try:
-                for it in items:
-                    if it is not None:
-                        self.con.execute(*it)
-                self.con.commit()
-            except sqlite3.Error as e:
-                self.errors += 1
-                print(f"[paperdb] write failed: {e}", flush=True)
+            for it in items:  # one bad statement loses only itself; nothing may kill this thread
+                if it is None:
+                    continue
                 try:
-                    self.con.rollback()
-                except sqlite3.Error:
-                    pass
+                    self.con.execute(*it)
+                except Exception as e:  # noqa: BLE001
+                    self.errors += 1
+                    print(f"[paperdb] write failed: {type(e).__name__}: {e}", flush=True)
+            try:
+                self.con.commit()
+            except Exception as e:  # noqa: BLE001
+                self.errors += 1
+                print(f"[paperdb] commit failed: {type(e).__name__}: {e}", flush=True)
             if stop:
                 self.con.close()
                 return

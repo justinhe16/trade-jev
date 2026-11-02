@@ -48,6 +48,6 @@ fi
 # lockf -t 0: exit at once if another session holds the lock. caffeinate -i: no idle sleep meanwhile.
 /usr/bin/lockf -t 0 "$REPO/logs/paper.lock" \
     /usr/bin/caffeinate -i \
-    "$UV" run python -m trade_jev.live --exit-at-close --no-open --port "$PORT" && status=0 || status=$?
+    "$UV" run --frozen python -m trade_jev.live --exit-at-close --no-open --port "$PORT" && status=0 || status=$?
 echo "=== $(date '+%F %T %Z') exit $status"
 exit $status

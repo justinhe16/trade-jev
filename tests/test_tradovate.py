@@ -446,8 +446,10 @@ def market_script(start="09:29:20", stop="09:37:10", step_s=2, history=True):
 class FakeMd:
     """Local md websocket: o / authorize / [] / subscribeDOM / getChart / cancelChart, then a script."""
 
-    def __init__(self, scripts, accept=("MD-1", "ACC-1"), refuse=()):
+    def __init__(self, scripts, accept=("MD-1", "ACC-1"), refuse=(), auth_delay=0.0, strict=False):
         self.scripts, self.accept, self.refuse = scripts, set(accept), set(refuse)
+        self.auth_delay, self.strict = auth_delay, strict   # strict: before authorize 200, requests vanish (like Tradovate)
+        self.early: list[str] = []                           # endpoints that arrived before the authorize answer
         self.n = 0
         self.requests: list[tuple[int, str, str]] = []
         self.auths: list[tuple[int, str]] = []
@@ -465,6 +467,13 @@ class FakeMd:
         idx, self.n = self.n, self.n + 1
         await ws.send("o")
         subs, streamer = set(), None
+        authed, bg = [False], []
+
+        async def answer_authorize(reply):
+            await asyncio.sleep(self.auth_delay)
+            if reply["s"] == 200:
+                authed[0] = True
+            await ws.send("a" + json.dumps([reply]))
 
         async def hb():
             while True:
@@ -495,7 +504,12 @@ class FakeMd:
                     self.auths.append((idx, body))
                     if body not in self.accept:
                         reply = {"s": 401, "i": int(id_), "d": "bad token"}
-                elif endpoint in self.refuse:
+                    bg.append(asyncio.create_task(answer_authorize(reply)))   # the read loop keeps reading meanwhile
+                    continue
+                if self.strict and not authed[0]:
+                    self.early.append(endpoint)                                # silently dropped: no answer at all
+                    continue
+                if endpoint in self.refuse:
                     reply = {"s": 403, "i": int(id_), "d": "not entitled ACC-1"}
                 elif endpoint == "md/getChart":
                     reply["d"] = {"historicalId": 11 + idx * 10, "realtimeId": 12 + idx * 10}
@@ -509,6 +523,8 @@ class FakeMd:
             pass
         finally:
             hbt.cancel()
+            for t in bg:
+                t.cancel()
             if streamer:
                 streamer.cancel()
 
@@ -1021,3 +1037,271 @@ def test_api_key_rejection_crashes_the_session_with_the_plain_reason(tradovate_e
     assert s["status"] == "crashed" and "this account has no API key: cid/sec rejected" in s["error"]
     assert "sec-SECRET" not in s["error"] and "***" in s["error"]
     assert "sec-SECRET" not in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------- token mode
+
+import os  # noqa: E402
+import time  # noqa: E402
+
+from trade_jev import tradovate_token as tt  # noqa: E402
+
+
+def token_store():
+    return tt.token_store_path()
+
+
+def put_store(access="ACC-1", md="MD-1", left_s=4800.0):
+    p = token_store()
+    p.unlink(missing_ok=True)
+    assert tt.write_store(p, access, md, time.time() + left_s)
+
+
+def token_cfg(env="demo"):
+    return tv.TradovateConfig(env=env, mode="token", store_path=str(token_store()), dotenv=str(tt.dotenv_path()))
+
+
+def token_auth(http=None, **kw):
+    a = tv.TradovateAuth(token_cfg(), http=http or FakeHttp(), sleep=kw.pop("sleep", asyncio.sleep), **kw)
+    return a
+
+
+def with_quote(events):
+    q = {"e": "md", "d": {"quotes": [{"id": 1, "contractId": 777}]}}
+    return lambda idx: [q, *(events(idx) if callable(events) else events)]
+
+
+def calls_to(http, suffix):
+    return [c for c in http.calls if c[1].endswith(suffix)]
+
+
+def test_md_socket_waits_for_the_authorize_answer_before_subscribing():
+    events, _ = market_script(start="09:30:00", stop="09:30:30", step_s=2)
+
+    async def go():
+        async with FakeMd([events], auth_delay=0.4, strict=True) as md:
+            src = make_source(md.url, stop="09:30:20")
+            await drain(src)
+            return src, md
+    src, md = asyncio.run(go())
+    assert md.early == [] and src.dom_updates > 0                      # nothing was sent before the 200
+    names = [e for _, e, _ in md.requests]
+    assert names[0] == "authorize" and names.index("md/subscribeDOM") > 0
+
+
+def test_negative_control_the_strict_fake_really_drops_early_requests():
+    async def go():
+        async with FakeMd([None], auth_delay=0.4, strict=True) as md:
+            ws = await websockets.connect(md.url)
+            sock = tv.MdSocket(ws, lambda m: None)
+            await sock.wait_open()
+            sock.start()
+            auth = asyncio.create_task(sock.authorize("MD-1"))
+            with pytest.raises(TimeoutError):                          # subscribing without waiting: silently nothing
+                await sock.request("md/subscribeDOM", {"symbol": "NQZ6"}, timeout=0.15)
+            await auth                                                  # the authorize itself still answers 200
+            await sock.request("md/subscribeDOM", {"symbol": "NQZ6"}, timeout=1.0)   # and now subscribing works
+            await sock.close()
+            return md
+    md = asyncio.run(go())
+    assert md.early == ["md/subscribeDOM"]
+
+
+def test_token_mode_source_uses_the_store_tokens_without_any_login(capsys):
+    put_store("ACC-1", "MD-1")
+    events, _ = market_script(start="09:30:00", stop="09:30:30", step_s=2)
+    http = FakeHttp()
+
+    async def go():
+        async with FakeMd([events], accept=["MD-1"]) as md:
+            src = tv.TradovateSource("NQZ6", ns("09:30:20"), flush_s=0.02, config=token_cfg(), auth=token_auth(http),
+                                     md_urls=[md.url], backoff_s=0.05, backoff_max_s=0.2)
+            await drain(src)
+            return src, md
+    src, md = asyncio.run(go())
+    assert md.auths[0][1] == "MD-1" and src.md_token_kind == "mdAccessToken" and src.dom_updates > 0
+    assert calls_to(http, "/auth/accesstokenrequest") == []                     # no username / password login
+    assert calls_to(http, "/auth/renewaccesstoken") == []                       # a valid store is only adopted
+    assert http.calls[0][1] == "https://live.tradovateapi.com/v1/contract/find?name=NQZ6"
+    out = capsys.readouterr().out
+    assert "adopted from the store" in out and not any(s in out for s in SECRETS)
+
+
+def test_session_adopts_a_newer_store_without_http():
+    put_store("ACC-1", "MD-1", left_s=600)                                      # inside the session's 15 min margin
+    http = FakeHttp(renew=[(200, login_ok("ACC-2", "MD-2")[1])])
+    a = token_auth(http)
+    put_store("ACC-2", "MD-2", left_s=4800)                                     # the keep-alive got there first
+    asyncio.run(a.ensure_fresh())
+    assert (a.access_token, a.md_token) == ("ACC-2", "MD-2") and http.calls == []
+
+
+def test_session_renews_by_itself_when_the_store_is_due_and_writes_it():
+    put_store("ACC-1", "MD-1", left_s=600)
+    http = FakeHttp(renew=[(200, login_ok("ACC-2", "MD-2")[1])])
+    a = token_auth(http)
+    asyncio.run(a.ensure_fresh())
+    assert http.calls[0][2]["Authorization"] == "Bearer ACC-1" and len(http.calls) == 1
+    assert (a.access_token, a.md_token, a.user_status) == ("ACC-2", "MD-2", "Active")
+    assert tt.read_store(token_store()).access == "ACC-2"
+    st = tt.read_status(tt.status_path(token_store()))
+    assert st["writer"] == "session" and st["consecutive_failures"] == 0 and st["expires_at"]
+    assert "ACC-2" not in json.dumps(st)
+
+
+def test_session_renewal_refused_is_a_plain_auth_error_never_a_password_login(capsys):
+    put_store("ACC-1", "MD-1", left_s=600)
+    http = FakeHttp(renew=[(401, {"errorText": "token ACC-1 rejected"})])
+    a = token_auth(http)
+    with pytest.raises(tv.AuthError) as e:
+        asyncio.run(a.ensure_fresh())
+    assert not isinstance(e.value, tv.TokenExpired) and "ACC-1" not in str(e.value)
+    assert calls_to(http, "/auth/accesstokenrequest") == []
+    st = tt.read_status(tt.status_path(token_store()))
+    assert st["consecutive_failures"] == 1 and "ACC-1" not in st["last_error"]
+    assert tt.read_store(token_store()).access == "ACC-1"
+
+
+def test_token_expired_then_fresh_tokens_recover_without_a_restart():
+    put_store("ACC-1", "MD-1", left_s=-60)
+    http = FakeHttp()
+    a = token_auth(http)
+    with pytest.raises(tv.TokenExpired):
+        asyncio.run(a.ensure_fresh())
+    assert http.calls == [] and issubclass(tv.TokenExpired, tv.AuthError)       # a dead token is never sent
+    put_store("ACC-2", "MD-2", left_s=4800)                                     # the keep-alive / the owner
+    asyncio.run(a.ensure_fresh())
+    assert a.access_token == "ACC-2"
+
+
+def test_fresh_env_tokens_are_used_when_the_store_is_dead(isolated_tradovate_token_files):
+    put_store("ACC-1", "MD-1", left_s=-60)
+    tt.dotenv_path().write_text("TRADOVATE_ACCESS_TOKEN=ACC-2\nTRADOVATE_MD_ACCESS_TOKEN=MD-2\n")
+    http = FakeHttp(renew=[(200, login_ok("ACC-2", "MD-2")[1])])
+    a = token_auth(http)
+    asyncio.run(a.ensure_fresh())
+    assert http.calls[0][2]["Authorization"] == "Bearer ACC-2"
+    assert tt.read_store(token_store()).access == "ACC-2"
+    assert tt.read_status(tt.status_path(token_store()))["source"] == "env"
+
+
+def test_token_expired_in_a_running_source_is_retried_not_fatal_nor_a_md_refusal(capsys):
+    put_store("ACC-1", "MD-1", left_s=-60)
+    events, _ = market_script(start="09:30:00", stop="09:30:30", step_s=2)
+
+    async def revive():
+        await asyncio.sleep(0.4)
+        put_store("ACC-2", "MD-2", left_s=4800)                                 # fresh tokens appear mid-run
+
+    async def go():
+        async with FakeMd([events], accept=["MD-2"]) as md:
+            src = tv.TradovateSource("NQZ6", ns("09:30:20"), flush_s=0.02, config=token_cfg(), auth=token_auth(),
+                                     md_urls=[md.url], backoff_s=0.05, backoff_max_s=0.2)
+            _, _ = await asyncio.gather(drain(src), revive())
+            return src, md
+    src, md = asyncio.run(go())
+    assert src.dom_updates > 0 and src._refusals == 0 and src.reconnects >= 1
+    assert md.auths[0][1] == "MD-2"
+    out = capsys.readouterr().out
+    assert "auth problem: tradovate token expired" in out and not any(s in out for s in SECRETS)
+
+
+def test_subscribe_quote_option_subscribes_before_the_dom_and_counts_quotes():
+    events, _ = market_script(start="09:30:00", stop="09:30:30", step_s=2)
+    events = with_quote(events)
+
+    async def go():
+        async with FakeMd([events]) as md:
+            src = make_source(md.url, stop="09:30:20", subscribe_quote=True)
+            await drain(src)
+            return src, md
+    src, md = asyncio.run(go())
+    names = [e for _, e, _ in md.requests if e.startswith("md/")]
+    assert names[:3] == ["md/subscribeQuote", "md/subscribeDOM", "md/getChart"]
+    assert "md/unsubscribeQuote" in names and src.stats()["quotes"] == 1
+    async def plain():
+        async with FakeMd([events]) as md:
+            await drain(make_source(md.url, stop="09:30:20"))
+            return md
+    assert "md/subscribeQuote" not in [e for _, e, _ in asyncio.run(plain()).requests]
+
+
+# -- tradovate_check.py in token mode
+
+TOKEN_ENV = {"TRADOVATE_ACCESS_TOKEN": "ACC-1", "TRADOVATE_MD_ACCESS_TOKEN": "MD-1", "TRADOVATE_ENV": "demo"}
+
+
+def test_check_script_token_mode_renews_once_and_reports_quotes(monkeypatch, capsys):
+    events, _ = market_script(start="09:30:00", stop="09:30:40", step_s=2)
+    events = with_quote(events)
+    http = FakeHttp(renew=[(200, login_ok("ACC-1", "MD-1")[1])])
+
+    async def go():
+        async with FakeMd([events]) as md:
+            monkeypatch.setattr(tv, "default_http", http)
+            code = await load_check().run(["--seconds", "1.5", "--symbol", "NQZ6"],
+                                          env={**TOKEN_ENV, "TRADOVATE_MD_URL": md.url})
+            return code, md
+    code, md = asyncio.run(go())
+    out = capsys.readouterr().out
+    assert code == 0 and out.rstrip().endswith("OK")
+    assert len(calls_to(http, "/auth/renewaccesstoken")) == 1 and calls_to(http, "/auth/accesstokenrequest") == []
+    assert "renew ok; token expires" in out and "user status Active" in out and "md token present" in out
+    assert "quotes: 1" in out and "DOM:" in out and "ticks:" in out and "live.tradovateapi.com" in out
+    assert "subscribeQuote" in [e.split("/")[1] for _, e, _ in md.requests if e.startswith("md/")]
+    assert not any(s in out for s in SECRETS)
+    assert tt.read_store(token_store()).access == "ACC-1"                       # the renewal was written to the store
+
+
+def test_check_script_token_expired_exits_3(capsys):
+    put_store("ACC-1", "MD-1", left_s=-60)
+    code = asyncio.run(load_check().run(["--seconds", "1", "--symbol", "NQZ6"], env={"TRADOVATE_ENV": "demo"}))
+    out = capsys.readouterr().out
+    assert code == 3 and "FAIL: tradovate token expired" in out and not any(s in out for s in SECRETS)
+
+
+def test_check_script_token_renewal_refused_exits_3(monkeypatch, capsys):
+    monkeypatch.setattr(tv, "default_http", FakeHttp(renew=[(401, {"errorText": "bad token ACC-1"})]))
+    code = asyncio.run(load_check().run(["--seconds", "1", "--symbol", "NQZ6"], env=TOKEN_ENV))
+    out = capsys.readouterr().out
+    assert code == 3 and "FAIL: renew failed: bad token ***" in out and "ACC-1" not in out
+
+
+# -- skip gate in token mode
+
+def test_skip_reason_token_matrix(isolated_tradovate_token_files):
+    d = isolated_tradovate_token_files
+    assert live.skip_reason("tradovate", {}) .startswith("tradovate credentials missing")   # no tokens: password mode
+    assert live.skip_reason("tradovate", {"TRADOVATE_ACCESS_TOKEN": "ACC-1"}) is None       # tokens count as configured
+    put_store("ACC-1", "MD-1", left_s=4000)
+    assert live.skip_reason("tradovate", {}) is None                                         # a valid store, no .env at all
+    put_store("ACC-1", "MD-1", left_s=-60)
+    assert live.skip_reason("tradovate", {}) == "tradovate token expired"                    # dead store, no fresh tokens
+    (d / "tradovate.env").write_text("TRADOVATE_ACCESS_TOKEN=ACC-9\nTRADOVATE_MD_ACCESS_TOKEN=MD-9\n")
+    assert live.skip_reason("tradovate", {}) is None                                         # fresh tokens pasted into .env
+    old = time.time() - 3 * 3600
+    os.utime(d / "tradovate.env", (old, old))
+    assert live.skip_reason("tradovate", {}) == "tradovate token expired"                    # pasted hours ago: dead too
+    assert live.skip_reason("databento", {}) is None
+    assert live.skip_reason("tradovate", {"TRADE_JEV_SOURCE": "off"}) == "TRADE_JEV_SOURCE=off"
+
+
+def test_token_mode_skipped_day_has_the_expired_reason_and_no_feed(sandbox, db, no_feed, monkeypatch, capsys):  # noqa: F811
+    put_store("ACC-1", "MD-1", left_s=-60)
+    monkeypatch.setenv("TRADE_JEV_SOURCE", "tradovate")
+    monkeypatch.setattr(live, "now_et", lambda: datetime(2026, 11, 2, 9, 15, tzinfo=live.ET))
+    assert asyncio.run(live.amain(["--exit-at-close", "--no-open"])) == 0
+    [s] = rows(db, "SELECT * FROM paper_sessions")
+    assert (s["session_id"], s["status"], s["error"], s["source"]) == \
+        ("live-2026-11-02", "skipped", "tradovate token expired", "tradovate")
+    out = capsys.readouterr().out
+    assert "tradovate token expired" in out and "ACC-1" not in out
+
+
+def test_token_mode_with_a_valid_store_is_not_skipped(sandbox, db, no_feed, monkeypatch):  # noqa: F811
+    put_store("ACC-1", "MD-1", left_s=4000)
+    monkeypatch.setenv("TRADE_JEV_SOURCE", "tradovate")
+    monkeypatch.setattr(live, "now_et", lambda: datetime(2026, 11, 2, 9, 15, tzinfo=live.ET))
+    with pytest.raises(AssertionError, match="a feed was started"):               # it got as far as starting the feed
+        asyncio.run(live.amain(["--exit-at-close", "--no-open"]))
+    assert not db.exists() or rows(db, "SELECT * FROM paper_sessions WHERE status='skipped'") == []

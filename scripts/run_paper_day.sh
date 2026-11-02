@@ -12,6 +12,9 @@
 # .env itself (the same way it reads DATABENTO_API_KEY), so nothing is passed here:
 #   off, or tradovate with any TRADOVATE_* credential missing → a `skipped` row with the reason, exit 0,
 #     no feed started (the extension's watch treats that as healthy)
+#   tradovate in token mode (TRADOVATE_ACCESS_TOKEN set, or data/tradovate_token.json exists) counts as
+#     configured credentials; if the token store is dead and .env holds no fresh tokens the day is skipped
+#     with the reason "tradovate token expired" (the keep-alive, com.tradejev.tvtoken, normally prevents it)
 #   tradovate late start (after 09:28 ET) → no catch-up replay exists: 60s of warm-up on live data,
 #     every decision HOLD until then
 # A lock keeps a second copy (a missed job fired on wake, a manual run) from starting a duplicate.

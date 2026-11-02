@@ -12,7 +12,7 @@ from pathlib import Path
 
 import cli
 import pytest
-from conftest import EXT_DIR, PaperDB, et
+from conftest import EXT_DIR, PaperDB, et, utc_iso, write_token_status
 
 MON = "2026-11-02"  # a Monday
 TUE = "2026-11-03"
@@ -623,7 +623,9 @@ def test_unknown_policy_echo_is_clipped(db: PaperDB) -> None:
 
 
 def test_watch_schedule_catches_missing_at_0935() -> None:
-    assert '"5,20,35,50 9-15 * * 1-5"' in (EXT_DIR / "resonant.yaml").read_text()
+    text = (EXT_DIR / "resonant.yaml").read_text()
+    # every 15 min all day, every day: the token check has no hours; the session check is script-guarded
+    assert '"5,20,35,50 * * * *"' in text and "9-15" not in text.split("id: watch")[1].split("report:")[0]
 
 
 def test_stop_marker_write_failure_still_reports_success(data_dir: Path, launchd, monkeypatch) -> None:
@@ -632,3 +634,174 @@ def test_stop_marker_write_failure_still_reports_success(data_dir: Path, launchd
 
     monkeypatch.setattr(Path, "write_text", boom)
     assert cli.run(["stop"], now=et(MON, "12:00"))["stopped"] is True
+
+
+# --- Tradovate token: status block and watch alerts ------------------------------------------
+
+SAT = "2026-11-07"  # a Saturday
+
+
+def tok(path: Path, now, left_min: float | None, fails: int = 0, **extra) -> None:
+    """A keep-alive status file whose token expires ``left_min`` minutes after ``now``."""
+    f = {"last_ok_at": utc_iso(now), "consecutive_failures": fails, "last_error": None,
+         "checked_at": utc_iso(now), **extra}
+    if left_min is not None:
+        f["expires_at"] = utc_iso(now + timedelta(minutes=left_min))
+    write_token_status(path, **f)
+
+
+def test_token_alert_fires_at_any_hour_and_clears(data_dir: Path, token_status: Path, reports) -> None:
+    now = et(SAT, "03:05")  # Saturday 03:05 ET: outside market hours, the token check still runs
+    tok(token_status, now, 5)
+    out = cli.run(["watch"], now=now)
+    assert out["checked"] is False and out["token"] == {"problem": "expiring"}
+    [r] = reports
+    assert r["key"] == "trade-jev/token" and r["urgency"] == "urgent" and not r.get("clear")
+    assert r["title"] == (
+        "Tradovate token expired — log into trader.tradovate.com and paste a fresh access token "
+        "+ md token into ~/trade-jev/.env")
+    later = et(SAT, "03:20")
+    tok(token_status, later, 70)  # the owner pasted fresh tokens; the keep-alive renewed
+    out = cli.run(["watch"], now=later)
+    assert out["token"] == {"problem": None, "cleared": True}
+    assert reports[-1]["key"] == "trade-jev/token" and reports[-1]["clear"] is True
+    n = len(reports)
+    cli.run(["watch"], now=et(SAT, "03:35"))
+    assert len(reports) == n  # healthy and already cleared: silent
+
+
+@pytest.mark.parametrize("hm", ["00:05", "06:50", "12:20", "23:50"])
+def test_token_expired_alerts_at_every_hour(data_dir: Path, token_status: Path, reports, hm: str) -> None:
+    now = et(MON, hm)
+    tok(token_status, now, -30)
+    assert cli.run(["watch"], now=now)["token"]["problem"] == "expired"
+    assert [r["key"] for r in reports if r["key"] == cli.TOKEN_KEY] == [cli.TOKEN_KEY]
+
+
+def test_token_failing_needs_two_failures(data_dir: Path, token_status: Path, reports) -> None:
+    now = et(TUE, "02:05")
+    tok(token_status, now, 40, fails=1, last_error="renew failed: HTTP 500")
+    assert cli.run(["watch"], now=now)["token"] == {"problem": None} and reports == []
+    tok(token_status, now, 40, fails=2, last_error="renew failed: HTTP 500")
+    assert cli.run(["watch"], now=now)["token"] == {"problem": "renewal failing"}
+    assert reports[0]["key"] == cli.TOKEN_KEY and reports[0]["urgency"] == "urgent"
+
+
+def test_token_absent_or_healthy_is_silent(data_dir: Path, token_status: Path, reports) -> None:
+    now = et(TUE, "02:05")
+    assert not token_status.exists()
+    assert cli.run(["watch"], now=now)["token"] == {"problem": None} and reports == []
+    tok(token_status, now, 60)
+    assert cli.run(["watch"], now=now)["token"] == {"problem": None} and reports == []
+
+
+def test_token_status_unreadable_is_a_problem(data_dir: Path, token_status: Path, reports) -> None:
+    token_status.write_text("{not json")
+    assert cli.run(["watch"], now=et(TUE, "02:05"))["token"] == {"problem": "unreadable"}
+
+
+def test_down_and_token_state_are_independent(db: PaperDB, data_dir: Path, token_status: Path, reports) -> None:
+    db.session("s1", MON, "crashed", error="boom")
+    now = et(MON, "11:00")
+    tok(token_status, now, 3)
+    out = cli.run(["watch"], now=now)
+    assert out["down"] is True and out["token"]["problem"] == "expiring"
+    state = json.loads((data_dir / "watch_state.json").read_text())
+    assert set(state) >= {"down", "token"} and state["down"] and state["token"]
+    # the token recovers while the session is still down: only the token clears
+    later = et(MON, "11:15")
+    tok(token_status, later, 70)
+    out = cli.run(["watch"], now=later)
+    assert out["down"] is True and out["token"]["cleared"] is True
+    state = json.loads((data_dir / "watch_state.json").read_text())
+    assert state["token"] is None and state["down"]
+    clears = [r["key"] for r in reports if r.get("clear")]
+    assert clears == [cli.TOKEN_KEY]
+    # and the session recovering leaves the (already clear) token state alone
+    db.conn.execute("UPDATE paper_sessions SET status='running', heartbeat_at=?",
+                    (utc_iso(et(MON, "11:29")),))
+    db.conn.commit()
+    out = cli.run(["watch"], now=et(MON, "11:30"))
+    assert out["down"] is False and out["cleared"] is True
+    assert [r["key"] for r in reports if r.get("clear")] == [cli.TOKEN_KEY, cli.DOWN_KEY]
+
+
+def test_status_has_a_token_block_in_every_branch(db: PaperDB, token_status: Path, data_dir: Path) -> None:
+    now = et(MON, "10:00")
+    tok(token_status, now, 62)
+    out = cli.run(["status"], now=now)  # a DB with no session today
+    assert out["token"]["ok"] is True and out["token"]["expires_in_min"] == 62 and "Tradovate token" not in out["summary"]
+    db.session("s1", MON, "running", heartbeat=now)
+    out = cli.run(["status"], now=now)
+    assert out["token"]["expires_in_min"] == 62 and out["token"]["problem"] is None
+    tok(token_status, now, 4, last_error="renew failed")
+    out = cli.run(["status"], now=now)
+    assert out["token"]["problem"] == "expiring" and out["summary"].endswith("| Tradovate token: expiring")
+    assert "accessToken" not in json.dumps(out)
+
+
+def test_status_token_block_without_a_db_or_a_status_file(data_dir: Path, token_status: Path) -> None:
+    now = et(MON, "10:00")
+    out = cli.run(["status"], now=now)
+    assert out["token"]["known"] is False and out["summary"] == "no paper sessions yet"
+    tok(token_status, now, -5)
+    out = cli.run(["status"], now=now)
+    assert out["token"]["problem"] == "expired" and "Tradovate token: expired" in out["summary"]
+
+
+def test_token_status_path_config_key(data_dir: Path, tmp_path: Path) -> None:
+    (data_dir / "config.json").write_text(json.dumps({"token_status_path": str(tmp_path / "x.json")}))
+    assert cli.load_config().token_status_path == tmp_path / "x.json"
+    (data_dir / "config.json").write_text(json.dumps({"token_status_path": ""}))
+    with pytest.raises(cli.Fail):
+        cli.load_config()
+    (data_dir / "config.json").unlink()
+    assert cli.load_config().token_status_path == Path(cli.DEFAULT_TOKEN_STATUS)
+
+
+def test_real_default_token_status_path_is_the_deploy_checkout() -> None:
+    # conftest patches cli.DEFAULT_TOKEN_STATUS; the source line is the real default
+    text = (EXT_DIR / "cli.py").read_text()
+    assert 'DEFAULT_TOKEN_STATUS = "/Users/justinhe/trade-jev/data/tradovate_token_status.json"' in text
+
+
+def test_a_crashing_down_check_does_not_suppress_the_token_alert_and_vice_versa(
+    data_dir: Path, token_status: Path, reports, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = et(MON, "11:00")
+    tok(token_status, now, 3)
+
+    def boom(*a, **k):
+        raise RuntimeError("db exploded")
+    monkeypatch.setattr(cli, "_watch_down", boom)
+    out = cli.run(["watch"], now=now)
+    assert out["token"] == {"problem": "expiring"} and out["error"] == "RuntimeError"
+    assert [r["key"] for r in reports] == [cli.TOKEN_KEY]
+    monkeypatch.undo()
+    monkeypatch.setattr(cli, "_watch_token", boom)
+    out = cli.run(["watch"], now=now)
+    assert out["token"] == {"error": "RuntimeError"} and out["down"] is not None
+
+
+def test_a_vanished_status_file_sends_no_clear(data_dir: Path, token_status: Path, reports) -> None:
+    now = et(SAT, "03:05")
+    tok(token_status, now, 3)
+    cli.run(["watch"], now=now)
+    token_status.unlink()
+    n = len(reports)
+    cli.run(["watch"], now=et(SAT, "03:20"))
+    assert len(reports) == n
+    assert json.loads((data_dir / "watch_state.json").read_text())["token"]    # still remembered
+
+
+def test_a_stopped_renewer_alerts_at_an_off_hour_then_clears(data_dir: Path, token_status: Path, reports) -> None:
+    last = et(SAT, "02:00")
+    tok(token_status, last, 60)                                                 # healthy token, but checked_at stops
+    assert cli.run(["watch"], now=et(SAT, "02:15"))["token"] == {"problem": None}   # 15 min old: fine
+    out = cli.run(["watch"], now=et(SAT, "02:35"))                              # 35 min old
+    assert out["token"] == {"problem": "renewer stopped"}
+    assert reports[-1]["key"] == cli.TOKEN_KEY and reports[-1]["title"] == cli.TOKEN_TITLE
+    assert reports[-1]["state"] == {"reason": "renewer stopped"} and reports[-1]["urgency"] == "urgent"
+    tok(token_status, et(SAT, "02:40"), 60)                                     # the renewer is back
+    assert cli.run(["watch"], now=et(SAT, "02:50"))["token"]["cleared"] is True
+    assert reports[-1]["clear"] is True

@@ -3,11 +3,16 @@
   uv run python scripts/tradovate_check.py --seconds 30
   uv run python scripts/tradovate_check.py --env demo --symbol NQZ6
 
-Logs in, resolves the contract, subscribes the DOM and the tick chart for N seconds and prints what came
+Logs in (token mode: renews the web-session token once, see README "Token mode"), resolves the contract, subscribes the DOM and the tick chart for N seconds and prints what came
 back: token expiry (time only), user status, which md host and token kind authorized, DOM update rate,
 book depth seen, trade ticks and the buy / sell / unknown aggressor split. Exit 0 only if DOM updates
 arrived. It calls auth endpoints, GET contract/find and the md/* market-data endpoints only: never an
 order, position or account endpoint. It never prints a secret.
+
+Token mode (TRADOVATE_ACCESS_TOKEN in .env, or data/tradovate_token.json): no password login. It renews the
+token once (the store and the status file are updated, exactly like the keep-alive), authorizes the md
+socket, subscribes quote + DOM + ticks and reports levels, update rate, ticks and quotes. Exit 3 when the
+token is expired or the renewal is refused (paste fresh tokens into .env).
 
 Note: Tradovate allows 2 concurrent sessions per user. Running this while the daily job is live may kick
 one of them; run it outside 09:15-16:00 ET.
@@ -36,7 +41,7 @@ async def run(argv: list[str] | None = None, env=os.environ) -> int:
     env = dict(env)
     if args.env:
         env["TRADOVATE_ENV"] = args.env
-    missing = tv.missing_credentials(env)
+    missing = tv.missing_credentials(env)  # [] in token mode
     if missing:
         print("FAIL: tradovate credentials missing: " + ", ".join(missing))
         return 2
@@ -49,9 +54,16 @@ async def run(argv: list[str] | None = None, env=os.environ) -> int:
     print(f"env {cfg.env}: REST {cfg.base}; md hosts {', '.join(u.split('/')[2] for u in cfg.md_candidates())}; "
           f"symbol {symbol}")
 
+    token_mode = cfg.mode == "token"
     auth = tv.TradovateAuth(cfg)
     try:
-        await auth.login()
+        if token_mode:
+            await auth.renew_now()  # picks the store / fresh .env tokens itself, one HTTP renewal
+        else:
+            await auth.login()
+    except tv.TokenExpired as e:
+        print(f"FAIL: {auth.redact(e)}")
+        return 3
     except tv.ApiKeyRejected as e:
         print(f"FAIL: {e}")
         print(f"      {e.hint}")
@@ -63,10 +75,14 @@ async def run(argv: list[str] | None = None, env=os.environ) -> int:
         print(f"FAIL: {auth.redact(e)}")
         return 3
     exp = datetime.fromtimestamp(auth.expires_at).strftime("%H:%M:%S")
-    print(f"login ok; token expires {exp} (local); user status {auth.user_status}; "
-          f"hasMarketData {auth.has_market_data}")
+    if token_mode:
+        print(f"renew ok; token expires {exp} (local); user status {auth.user_status}; "
+              f"md token {'present' if auth.md_token else 'absent'}")
+    else:
+        print(f"login ok; token expires {exp} (local); user status {auth.user_status}; "
+              f"hasMarketData {auth.has_market_data}")
 
-    src = tv.TradovateSource(symbol, 0, config=cfg, auth=auth)
+    src = tv.TradovateSource(symbol, 0, config=cfg, auth=auth, subscribe_quote=token_mode)
     rows, t0 = 0, time.monotonic()
     gen = src.batches()
     try:
@@ -86,6 +102,8 @@ async def run(argv: list[str] | None = None, env=os.environ) -> int:
     print(f"DOM: {st['dom_updates']} updates ({st['dom_updates'] / secs:.1f}/s); levels per side: "
           f"max {st['max_bid_levels']}/{st['max_ask_levels']} (bid/ask), median "
           f"{st['median_bid_levels']:g}/{st['median_ask_levels']:g}")
+    if token_mode:
+        print(f"quotes: {st['quotes']}")
     print(f"ticks: {st['ticks']} (buy {src.buys} / {src.buy_volume} lots, sell {src.sells} / {src.sell_volume}, "
           f"unknown {src.unknown} / {src.unknown_volume}); rows {rows}; reconnects {st['reconnects']}")
     if not st["dom_updates"]:

@@ -334,7 +334,12 @@ class TradovateAuth:
                 self._apply(d, full=False)
                 if not d.get("mdAccessToken") and not self.md_token and sel.md:
                     self.md_token = sel.md
-                tt.write_store(store_file, self.access_token, self.md_token or "", self.expires_at)
+                if not tt.write_store(store_file, self.access_token, self.md_token or "", self.expires_at):
+                    cur = tt.read_store(store_file)  # a newer store is on disk: it wins
+                    _log("store write refused: the store on disk expires later; adopting it")
+                    if cur is not None and not cur.dead(now):
+                        self._apply({"accessToken": cur.access, "mdAccessToken": cur.md or None,
+                                     "expirationTime": tt.iso_utc(cur.expires_at)}, full=False)
                 tt.record_ok(status_file, now, self.expires_at, source=sel.source, writer="session",
                              host=cfg.auth_host)
                 _log(f"token renewed ({sel.source}); expires {time.strftime('%H:%M:%S', time.localtime(self.expires_at))}")

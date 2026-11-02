@@ -22,6 +22,13 @@ the owner pastes new tokens into a running machine. A fresh .env token means: di
 and either the store is missing / dead or .env was modified after the store was last written, and .env was
 modified within the last 90 minutes (a token pasted earlier than that is dead anyway).
 
+Assumption: renewaccesstoken does NOT invalidate the previous access token (it stays usable until its own
+expiry). So a session may keep using a token it adopted until its own margin, and a renewer that loses a
+race costs nothing. If that ever proved false the lock + adopt-from-store rule still keeps renewers apart.
+
+Token mode is sticky: once data/tradovate_token.json exists the mode stays "token" even if the .env tokens
+are removed. To go back to password mode delete the store.
+
 Race rule (who renews). Two processes renew: the keep-alive (`python -m trade_jev.tradovate_keepalive`,
 launchd, 24/7) and the live session (in-process, during the session). Renewal may invalidate the token it
 renewed, so two uncoordinated renewers could each use a token the other just replaced. So every
@@ -82,6 +89,11 @@ def status_path(store: Path) -> Path:
 
 def lock_path(store: Path) -> Path:
     return Path(store).with_name(".tradovate_token.lock")
+
+
+def status_lock_path(status: Path) -> Path:
+    """A separate, short-lived lock for the status file's read-modify-write (never nested in StoreLock's file)."""
+    return Path(status).with_name(".tradovate_token_status.lock")
 
 
 def dotenv_path(env=os.environ) -> Path:
@@ -323,12 +335,23 @@ def _redact(text, secrets) -> str:
     return text
 
 
-def update_status(path, updates: dict, secrets=()) -> dict:
-    """Merge `updates` into the status file (atomic). `last_error` is redacted and clipped; the file never
-    holds a token. Returns the new content."""
+def update_status(path, updates: dict, secrets=(), increment: str | None = None) -> dict:
+    """Merge `updates` into the status file (atomic); `increment` names a counter to add 1 to. The
+    read-modify-write runs under a short lock on a separate lock file (best effort: if it stays busy the
+    write goes ahead unlocked). `last_error` is redacted and clipped; no token ever goes in."""
     path = Path(path)
+    try:
+        with StoreLock(status_lock_path(path), timeout=5.0):
+            return _update_status(path, updates, secrets, increment)
+    except LockTimeout:
+        return _update_status(path, updates, secrets, increment)
+
+
+def _update_status(path: Path, updates: dict, secrets, increment) -> dict:
     cur = read_status(path)
     cur.update(updates)
+    if increment:
+        cur[increment] = int(cur.get(increment) or 0) + 1
     if cur.get("last_error"):
         cur["last_error"] = " ".join(_redact(cur["last_error"], secrets).split())[:ERROR_CLIP]
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -357,9 +380,8 @@ def record_ok(path, now: float, expires_at: float, *, source: str, writer: str, 
 
 def record_failure(path, now: float, error, *, writer: str, host: str | None = None, secrets=(),
                    source: str | None = None) -> None:
-    n = int(read_status(path).get("consecutive_failures") or 0) + 1
-    upd = {"last_error": str(error), "last_error_at": iso_utc(now), "consecutive_failures": n,
+    upd = {"last_error": str(error), "last_error_at": iso_utc(now),
            "checked_at": iso_utc(now), "writer": writer, "host": host}
     if source:
         upd["source"] = source
-    update_status(path, upd, secrets)
+    update_status(path, upd, secrets, increment="consecutive_failures")

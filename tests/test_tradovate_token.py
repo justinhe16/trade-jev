@@ -335,13 +335,49 @@ def test_renewal_success_writes_store_and_status(store, dotenv):
     assert_no_secrets(tt.status_path(store))
 
 
-def test_not_due_means_no_http_but_the_status_is_kept_fresh(store, dotenv):
+def test_not_due_means_no_http_and_never_clears_failures(store, dotenv):
     put_store(store, left_s=4000)                                              # > 30 min left
-    tt.record_failure(tt.status_path(store), time.time(), "old trouble", writer="keepalive")
     http = RenewHttp()
     assert tick(keepalive(store, dotenv, http)) == "ok" and http.bearers == []
+    assert status(store)["checked_at"] and status(store)["expires_at"]
+    tt.record_failure(tt.status_path(store), time.time(), "old trouble", writer="keepalive")
+    http = RenewHttp((401, {"errorText": "revoked"}))
+    assert tick(keepalive(store, dotenv, http)) == "failed"                    # failing: retried although not due
+    assert http.bearers == ["ACC-OLD"] and status(store)["consecutive_failures"] == 2
+
+
+def test_revoked_token_with_a_future_expiry_accumulates_failures_to_the_alert(store, dotenv):
+    put_store(store, left_s=4000)                                              # not due, but the server rejects it
+    k = keepalive(store, dotenv, RenewHttp((401, {"errorText": "revoked"}), (401, {"errorText": "revoked"})))
+    tt.record_failure(tt.status_path(store), time.time(), "renew failed", writer="keepalive")   # 1st failure
+    assert tick(k) == "failed" and status(store)["consecutive_failures"] == 2
     st = status(store)
-    assert st["consecutive_failures"] == 0 and st["last_error"] is None and st["checked_at"]
+    assert st["last_error"] and st["consecutive_failures"] >= 2                # what the extension alerts on
+
+
+def test_a_transient_error_does_not_blacklist_fresh_env_tokens(store, dotenv):
+    put_store(store, left_s=-100, age_s=3000)
+    put_env(dotenv, "ACC-ENV", "MD-ENV", age_s=5)
+    http = RenewHttp(tv.TradovateError("OSError: unreachable"), (503, {}), renewed())
+    k = keepalive(store, dotenv, http)
+    assert tick(k) == "failed" and tick(k) == "failed"                         # network error, then a 5xx: retried
+    assert tick(k) == "adopted-env" and http.bearers == ["ACC-ENV"] * 3
+
+
+def test_a_refused_store_write_keeps_the_store_on_disk(store, dotenv, monkeypatch):
+    put_store(store, "ACC-OLD", "MD-OLD", left_s=1000)
+    later = time.time() + 6000
+    orig = tt.write_store
+
+    class Race(RenewHttp):
+        async def __call__(self, *a):
+            tt.write_store(store, "ACC-NEW", "MD-NEW", later)                  # another renewer wrote a newer store
+            return await super().__call__(*a)
+    http = Race(renewed("ACC-3", "MD-3", left_s=4800))
+    assert tick(keepalive(store, dotenv, http)) == "renewed"
+    assert tt.read_store(store).access == "ACC-NEW"
+    assert status(store)["expires_at"] == tt.iso_utc(later)
+    assert orig is tt.write_store
 
 
 def test_a_forced_tick_renews_even_when_not_due(store, dotenv):
@@ -416,7 +452,7 @@ def test_bad_env_tokens_are_ignored_while_the_store_is_valid_and_tried_once(stor
     http = RenewHttp((401, {"errorText": "bad ACC-BAD"}))
     k = keepalive(store, dotenv, http)
     assert tick(k) == "ok" and http.bearers == ["ACC-BAD"]
-    assert status(store)["consecutive_failures"] == 0                          # not a failure: the store is fine
+    assert not status(store).get("consecutive_failures")                  # not a failure: the store is fine
     assert tick(k) == "ok" and len(http.bearers) == 1                          # not retried every minute
     assert tt.read_store(store).access == "ACC-OLD"
 

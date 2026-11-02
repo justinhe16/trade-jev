@@ -56,6 +56,7 @@ TOKEN_TITLE = (
     "+ md token into ~/trade-jev/.env"
 )
 TOKEN_WARN_S = 600  # a token that expires within this long is an alert (the renewer should have run)
+TOKEN_STALE_S = 1200  # the keep-alive writes checked_at every 60 s; older than this = the renewer stopped
 TOKEN_FAILS = 2  # consecutive failed renewals before "renewal failing" is an alert
 STOPPED = "stopped_day"  # written by `stop`: watch stays quiet for that ET day
 
@@ -438,6 +439,9 @@ def token_problem(st: dict[str, Any] | None, now: datetime) -> str | None:
     fails = st.get("consecutive_failures")
     if isinstance(fails, int) and fails >= TOKEN_FAILS:
         return "renewal failing"
+    checked = parse_ts(st.get("checked_at")) if isinstance(st.get("checked_at"), str) else None
+    if checked is not None and (now - checked).total_seconds() > TOKEN_STALE_S:
+        return "renewer stopped"
     return None
 
 
@@ -829,20 +833,30 @@ def cmd_watch(cfg: Config, now: datetime) -> dict[str, Any]:
     10 min, cleared once healthy. The paper-session check keeps its market-hours gate: an urgent
     ``trade-jev/down`` while today's session is crashed or stale, or missing by 09:35. Their remembered
     states are independent (both live in ``watch_state.json``)."""
-    out = _watch_down(cfg, now)
-    out["token"] = _watch_token(cfg, now)
+    out: dict[str, Any] = {}
+    # Token first, and each check isolated: a crash in one must never suppress the other's alert.
+    try:
+        token = _watch_token(cfg, now)
+    except Exception as e:  # noqa: BLE001
+        token = {"error": type(e).__name__}
+    try:
+        out = _watch_down(cfg, now)
+    except Exception as e:  # noqa: BLE001
+        out = {"checked": False, "error": type(e).__name__}
+    out["token"] = token
     return out
 
 
 def _watch_token(cfg: Config, now: datetime) -> dict[str, Any]:
     state_path = data_dir() / WATCH_STATE
-    problem = token_problem(read_token_status(cfg), now)
+    status = read_token_status(cfg)
+    problem = token_problem(status, now)
     was = _read_state(state_path).get("token")
     if problem:
         report(TOKEN_KEY, TOKEN_TITLE, urgency="urgent", state={"reason": problem}, ttl="2h")
         _write_state(state_path, {"token": {"reason": problem}})
         return {"problem": problem}
-    if was:
+    if was and status is not None:  # a vanished status file is not "healthy": no clear
         report(TOKEN_KEY, "Tradovate token healthy again", urgency="urgent", clear=True,
                state={"reason": "ok"})  # fmt: skip
         _write_state(state_path, {"token": None})

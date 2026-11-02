@@ -763,3 +763,45 @@ def test_real_default_token_status_path_is_the_deploy_checkout() -> None:
     # conftest patches cli.DEFAULT_TOKEN_STATUS; the source line is the real default
     text = (EXT_DIR / "cli.py").read_text()
     assert 'DEFAULT_TOKEN_STATUS = "/Users/justinhe/trade-jev/data/tradovate_token_status.json"' in text
+
+
+def test_a_crashing_down_check_does_not_suppress_the_token_alert_and_vice_versa(
+    data_dir: Path, token_status: Path, reports, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = et(MON, "11:00")
+    tok(token_status, now, 3)
+
+    def boom(*a, **k):
+        raise RuntimeError("db exploded")
+    monkeypatch.setattr(cli, "_watch_down", boom)
+    out = cli.run(["watch"], now=now)
+    assert out["token"] == {"problem": "expiring"} and out["error"] == "RuntimeError"
+    assert [r["key"] for r in reports] == [cli.TOKEN_KEY]
+    monkeypatch.undo()
+    monkeypatch.setattr(cli, "_watch_token", boom)
+    out = cli.run(["watch"], now=now)
+    assert out["token"] == {"error": "RuntimeError"} and out["down"] is not None
+
+
+def test_a_vanished_status_file_sends_no_clear(data_dir: Path, token_status: Path, reports) -> None:
+    now = et(SAT, "03:05")
+    tok(token_status, now, 3)
+    cli.run(["watch"], now=now)
+    token_status.unlink()
+    n = len(reports)
+    cli.run(["watch"], now=et(SAT, "03:20"))
+    assert len(reports) == n
+    assert json.loads((data_dir / "watch_state.json").read_text())["token"]    # still remembered
+
+
+def test_a_stopped_renewer_alerts_at_an_off_hour_then_clears(data_dir: Path, token_status: Path, reports) -> None:
+    last = et(SAT, "02:00")
+    tok(token_status, last, 60)                                                 # healthy token, but checked_at stops
+    assert cli.run(["watch"], now=et(SAT, "02:15"))["token"] == {"problem": None}   # 15 min old: fine
+    out = cli.run(["watch"], now=et(SAT, "02:35"))                              # 35 min old
+    assert out["token"] == {"problem": "renewer stopped"}
+    assert reports[-1]["key"] == cli.TOKEN_KEY and reports[-1]["title"] == cli.TOKEN_TITLE
+    assert reports[-1]["state"] == {"reason": "renewer stopped"} and reports[-1]["urgency"] == "urgent"
+    tok(token_status, et(SAT, "02:40"), 60)                                     # the renewer is back
+    assert cli.run(["watch"], now=et(SAT, "02:50"))["token"]["cleared"] is True
+    assert reports[-1]["clear"] is True

@@ -47,6 +47,10 @@ def _log(msg: str) -> None:
     print(f"[tvtoken] {time.strftime('%F %T')} {msg}", flush=True)
 
 
+class Rejected(RuntimeError):
+    """A definitive answer: HTTP 4xx or errorText. Transport errors and 5xx are plain RuntimeError (retried)."""
+
+
 class Keepalive:
     def __init__(self, store, dotenv, host: str | None = None, http=None, clock=time.time,
                  sleep=asyncio.sleep):
@@ -75,9 +79,19 @@ class Keepalive:
         except TradovateError as e:
             raise RuntimeError(f"renew failed: {redact(e, secrets)}") from None
         if status >= 400 or d.get("errorText") or not d.get("accessToken"):
-            raise RuntimeError(redact(f"renew failed: {d.get('errorText') or 'HTTP ' + str(status)}", secrets))
+            text = redact(f"renew failed: {d.get('errorText') or 'HTTP ' + str(status)}", secrets)
+            raise (Rejected if status < 500 else RuntimeError)(text)
         exp = tt.parse_expiration(d.get("expirationTime")) or self.clock() + DEFAULT_LIFETIME_S
         return exp, d.get("mdAccessToken") or md, d["accessToken"]
+
+    def _persist(self, access: str, md: str, exp: float) -> float:
+        """Write the store; on refusal (the store on disk expires later) keep what is on disk. Returns the
+        expiry of the store as it is on disk."""
+        if tt.write_store(self.store, access, md, exp):
+            return exp
+        cur = tt.read_store(self.store)
+        _log("store write refused: the store on disk expires later; keeping it")
+        return cur.expires_at if cur and cur.expires_at else exp
 
     # -- one tick
 
@@ -98,10 +112,11 @@ class Keepalive:
         secrets = [t for ts in (store, seed) if ts for t in (ts.access, ts.md)]
 
         if seed is not None and tt.seed_is_fresh(seed, store, now) and self._seed_key(seed) not in self._tried:
-            self._tried.add(self._seed_key(seed))
             try:
                 exp, md, access = await self._renew(host, seed.access, seed.md, secrets)
             except RuntimeError as e:
+                if isinstance(e, Rejected):  # only a definitive rejection blacklists the seed
+                    self._tried.add(self._seed_key(seed))
                 if store is not None and not store.dead(now):
                     _log("tokens in .env were rejected; ignored (the store is still valid)")
                 else:
@@ -110,7 +125,7 @@ class Keepalive:
                     _log("tokens in .env rejected and the store is dead")
                     return "failed"
             else:
-                tt.write_store(self.store, access, md, exp)
+                exp = self._persist(access, md, exp)
                 tt.record_ok(status_file, now, exp, source="env", writer="keepalive", host=host)
                 _log(f"renewed from .env tokens; expires {tt.iso_utc(exp)}")
                 return "adopted-env"
@@ -125,21 +140,23 @@ class Keepalive:
             _log("store token expired; waiting for fresh tokens in .env")
             return "expired"
 
-        if force or store.dead(now, RENEW_BEFORE_S):
+        failing = int(tt.read_status(status_file).get("consecutive_failures") or 0) > 0
+        if force or failing or store.dead(now, RENEW_BEFORE_S):  # failing: retry even if not due
             try:
                 exp, md, access = await self._renew(host, store.access, store.md, secrets)
             except RuntimeError as e:
                 tt.record_failure(status_file, now, str(e), writer="keepalive", host=host, secrets=secrets)
                 _log(f"renewal failed: {e}")
                 return "failed"
-            tt.write_store(self.store, access, md, exp)
+            exp = self._persist(access, md, exp)
             tt.record_ok(status_file, now, exp, source="store", writer="keepalive", host=host)
             _log(f"renewed; expires {tt.iso_utc(exp)}")
             return "renewed"
 
-        # healthy and not due: keep the status fresh (another renewer may have written the store)
+        # healthy and not due: only checked_at / expires_at / host move. Failures and last_error are cleared
+        # by a successful renewal or adoption only (a revoked token with a future expiry must still alert).
         tt.update_status(status_file, {"checked_at": tt.iso_utc(now), "expires_at": tt.iso_utc(store.expires_at),
-                                       "last_error": None, "consecutive_failures": 0, "host": host})
+                                       "host": host})
         return "ok"
 
     # -- loop

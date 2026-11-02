@@ -650,7 +650,8 @@ def test_reconnect_reauthorizes_resubscribes_and_ignores_replayed_history():
     assert len(gc) == 2
 
 
-def test_md_refusal_fails_fast_with_a_clear_redacted_error(capsys):
+def test_md_refusal_fails_fast_with_a_clear_redacted_error(capsys, monkeypatch):
+    monkeypatch.setattr(tv, "REFUSAL_WINDOW_S", 0.0)
     async def go(**kw):
         async with FakeMd([[]], **kw) as md:
             src = make_source(md.url)
@@ -664,6 +665,20 @@ def test_md_refusal_fails_fast_with_a_clear_redacted_error(capsys):
     err, md = asyncio.run(go(accept=[]))                    # authorize refused on every token
     assert "refused" in str(err) and md.n == tv.MAX_REFUSALS * 2   # md token, then access token, per attempt
     assert not any(s in capsys.readouterr().out for s in SECRETS)
+
+
+def test_brief_md_refusal_at_the_open_keeps_retrying(monkeypatch):
+    """A few quick refusals (well inside REFUSAL_WINDOW_S) must not crash an unattended day."""
+    monkeypatch.setattr(tv, "REFUSAL_WINDOW_S", 1000.0)
+
+    async def go():
+        async with FakeMd([[]], refuse={"md/subscribeDOM"}) as md:
+            src = make_source(md.url)
+            with pytest.raises(TimeoutError):
+                await drain(src, limit_s=2)
+            return md
+    md = asyncio.run(go())
+    assert md.n > tv.MAX_REFUSALS
 
 
 @pytest.mark.parametrize("healthy_s, expect", [(0.0, [0.05, 0.05, 0.05]), (1000.0, [0.05, 0.1, 0.2])])

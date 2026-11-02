@@ -50,7 +50,9 @@ HEARTBEAT_S = 2.5        # the client must send "[]" this often
 IDLE_S = 15.0            # no frame (the server heartbeats too) for this long -> the connection is dead
 MAX_PENALTY_S = 120     # a login penalty longer than this is reported, not slept through
 HEALTHY_S = 60.0        # a connection must deliver data this long before the reconnect backoff resets
-MAX_REFUSALS = 5        # consecutive md refusals with no book data ever received -> give up (crashed)
+MAX_REFUSALS = 5        # md refusals with no book data ever received -> give up (crashed) ...
+REFUSAL_WINDOW_S = 300.0  # ... but only once they have lasted this long, so a brief refusal at the open can't
+                          # end an unattended day (launchd does not restart the job)
 RENEW_MARGIN_S = 15 * 60  # renew the access token this long before it expires (tokens live 90 min)
 HINT_NO_API = ("API Access requires a Tradovate API subscription; prop-firm evaluation accounts may not "
                "allow it: ask the firm / Tradovate.")
@@ -686,6 +688,7 @@ class TradovateSource:
         self.buy_volume = self.sell_volume = self.unknown_volume = 0
         self.dropped_trades = self.dom_empty = self.unknown_events = 0  # dom_empty: empty side or crossed book
         self._refusals = 0
+        self._first_refusal_t: float | None = None
         self._first_data_t: float | None = None
         self.max_bid_levels = self.max_ask_levels = 0
         self.bid_levels: list[int] = []
@@ -906,8 +909,11 @@ class TradovateSource:
                     raise
                 except MdRefused as e:
                     self._refusals += 1
+                    if self._first_refusal_t is None:
+                        self._first_refusal_t = time.monotonic()
                     _log(f"md refused ({self._refusals}): {self.auth.redact(e)}")
-                    if self.dom_updates == 0 and self._refusals >= MAX_REFUSALS:
+                    if (self.dom_updates == 0 and self._refusals >= MAX_REFUSALS
+                            and time.monotonic() - self._first_refusal_t >= REFUSAL_WINDOW_S):
                         raise MdRefused(f"Tradovate market data refused: {self.auth.redact(e)} - likely no CME "
                                         "market-data entitlement for API access") from None
                 except Exception as e:  # noqa: BLE001
@@ -916,6 +922,7 @@ class TradovateSource:
                     break
                 if self._first_data_t is not None and time.monotonic() - self._first_data_t >= HEALTHY_S:
                     delay, self._refusals = self.backoff_s, 0  # healthy long enough: a fresh backoff
+                    self._first_refusal_t = None
                 self.reconnects += 1
                 _log(f"reconnecting in {delay:g}s")
                 try:

@@ -121,7 +121,7 @@ scripts/install_launchd.sh      # copies deploy/launchd/*.plist to ~/Library/Lau
 **Behaviour of `trade_jev.live` (also when run by hand):**
 - On a weekend or holiday it exits 0 and writes a `holiday` row.
 - A live session closes 2 minutes after its end even if the feed has gone quiet.
-- Ctrl-C exits 130 and marks the session `aborted`.
+- SIGTERM (`launchctl kill SIGTERM`) closes the session like Ctrl-C does. It writes the summary, marks the session `aborted` and exits 0; Ctrl-C exits 130.
 - Jev errors (bad key, outage) count as HOLD and show in the decision log's error column.
 
 **View:** `http://127.0.0.1:8765/paper` shows a per-day table (status, Jev P&L against the baselines, trades, wins, drawdown, Jev cost) and a drill-down with each session's trades and Jev decisions. It updates every 5s while a session runs. `uv run python -m trade_jev.view` serves it standalone, with no run or live session needed.

@@ -309,3 +309,15 @@ def test_writer_survives_a_bad_statement(db):
     rec.close()
     assert rec.errors == 1
     assert len(rows(db, "SELECT * FROM paper_trades")) == 1
+
+
+def test_sigterm_aborts_with_a_summary_and_exits_0(sandbox, db):
+    import os
+    import signal
+    threading.Timer(1.0, os.kill, (os.getpid(), signal.SIGTERM)).start()
+    code = asyncio.run(live.amain(["--from-file", DAY, "--speed", "1", "--no-jev", "--exit-at-close",
+                                   "--no-open", "--port", "0", "--paper-db"]))
+    assert code == 0
+    s = rows(db, "SELECT * FROM paper_sessions")[0]
+    assert s["status"] == "aborted" and s["ended_at"]
+    assert {r["policy"] for r in rows(db, "SELECT policy FROM paper_summary")} == {"hold", "random", "imbalance"}

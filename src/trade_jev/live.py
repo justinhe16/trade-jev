@@ -1142,9 +1142,9 @@ async def amain(argv: list[str] | None = None) -> int:
         print("session closed; outputs written. The view stays up — Ctrl-C to quit.", flush=True)
         while True:
             await asyncio.sleep(3600)
-    except asyncio.CancelledError:
+    except asyncio.CancelledError:  # SIGTERM (launchctl kill, the extension's stop) exits 0; Ctrl-C 130
         end_paper("aborted", "stopped before the session end (Ctrl-C or SIGTERM)")
-        return 130
+        return 0
     except Exception as e:
         end_paper("crashed", error_text(e))
         raise

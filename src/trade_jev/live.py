@@ -1110,8 +1110,14 @@ async def amain(argv: list[str] | None = None) -> int:
                                   "policies": list(session.engine.policies)},
                     model, session.snapshot["run_dir"])
         hb = asyncio.create_task(heartbeat(paper))
-    try:  # launchd stops jobs with SIGTERM: close the session like Ctrl-C does
-        asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, asyncio.current_task().cancel)
+    sigterm = []  # launchd / the extension stop jobs with SIGTERM: close the session like Ctrl-C, exit 0
+    main_task = asyncio.current_task()
+
+    def on_sigterm() -> None:
+        sigterm.append(True)
+        main_task.cancel()
+    try:
+        asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, on_sigterm)
     except (NotImplementedError, RuntimeError):
         pass
     serve(session, args.port, not args.no_open)
@@ -1143,8 +1149,8 @@ async def amain(argv: list[str] | None = None) -> int:
         while True:
             await asyncio.sleep(3600)
     except asyncio.CancelledError:  # SIGTERM (launchctl kill, the extension's stop) exits 0; Ctrl-C 130
-        end_paper("aborted", "stopped before the session end (Ctrl-C or SIGTERM)")
-        return 0
+        end_paper("aborted", "stopped before the session end (" + ("SIGTERM)" if sigterm else "Ctrl-C)"))
+        return 0 if sigterm else 130
     except Exception as e:
         end_paper("crashed", error_text(e))
         raise

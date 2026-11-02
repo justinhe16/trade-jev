@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Daily live paper session. Installed by scripts/install_launchd.sh (fills in __UV__).
+     StartCalendarInterval is LOCAL time: 06:15 Pacific = 09:15 ET (both shift for DST together).
+     The script computes ET itself and waits or no-ops, so another time zone is safe too. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.tradejev.paper</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/justinhe/trade-jev/scripts/run_paper_day.sh</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/justinhe/trade-jev</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>UV</key>
+        <string>__UV__</string>
+        <key>PATH</key>
+        <string>__UV_DIR__:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>15</integer></dict>
+        <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>15</integer></dict>
+        <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>15</integer></dict>
+        <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>15</integer></dict>
+        <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>15</integer></dict>
+    </array>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>/Users/justinhe/trade-jev/logs/launchd-paper.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/justinhe/trade-jev/logs/launchd-paper.log</string>
+</dict>
+</plist>

@@ -20,3 +20,7 @@ runs/executor/
 
 # private broker backends, selectors and mapping tools (local only, moved between machines by hand)
 private/
+
+# live paper trading: the paper DB (and its WAL files) and launchd logs
+data/paper.db*
+logs/

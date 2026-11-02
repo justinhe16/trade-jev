@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script>
+  try { if (localStorage.getItem("jev-viewer-theme") === "dark") document.documentElement.dataset.theme = "dark"; } catch (e) {}
+</script>
+<title>Jev Paper</title>
+<link rel="icon" type="image/svg+xml" href="favicon.svg">
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+  --grid: #e1e0d9; --axis: #c3c2b7; --ring: rgba(11,11,11,0.10); --wash: rgba(11,11,11,0.04);
+  --long: #2a78d6; --short: #eb6834; --neutral: #898781; --good: #006300; --bad: #d03b3b;
+  --p1: #1baf7a; --p2: #4a3aa7; --p3: #e87ba4; --p4: #eda100;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19; --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,0.10); --wash: rgba(255,255,255,0.05);
+    --long: #3987e5; --short: #d95926; --good: #0ca30c; --bad: #e66767;
+    --p1: #199e70; --p2: #9085e9; --p3: #d55181; --p4: #c98500;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d; --surface: #1a1a19; --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+  --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,0.10); --wash: rgba(255,255,255,0.05);
+  --long: #3987e5; --short: #d95926; --good: #0ca30c; --bad: #e66767;
+  --p1: #199e70; --p2: #9085e9; --p3: #d55181; --p4: #c98500;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--page); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 1280px; margin: 0 auto; padding: 20px 16px 48px; }
+header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; margin-bottom: 16px; }
+h1 { font-size: 20px; margin: 0; font-weight: 600; }
+h3 { font-size: 13px; margin: 0 0 10px; font-weight: 600; }
+.sub { color: var(--ink-2); font-weight: 400; }
+.muted { color: var(--muted); }
+.card { background: var(--surface); border: 1px solid var(--ring); border-radius: 12px; padding: 16px; }
+.stack > * + * { margin-top: 12px; }
+button { font: inherit; }
+.btn { border: 1px solid var(--ring); background: var(--surface); color: var(--ink-2); border-radius: 8px; padding: 4px 10px; cursor: pointer; }
+.btn:hover { background: var(--wash); }
+.btn[aria-pressed="true"] { color: var(--ink); border-color: var(--ink-2); font-weight: 600; }
+.row { display: flex; flex-wrap: wrap; gap: 6px 8px; align-items: center; }
+.pos { color: var(--good); } .neg { color: var(--bad); }
+.nav { display: flex; gap: 4px; }
+.nav a { color: var(--ink-2); text-decoration: none; border: 1px solid transparent; border-radius: 8px; padding: 3px 10px; font-size: 13px; }
+.nav a:hover { background: var(--wash); }
+.nav a[aria-current="page"] { color: var(--ink); border-color: var(--ring); background: var(--surface); font-weight: 600; }
+.grow { margin-left: auto; }
+.pill { font-size: 12px; font-weight: 600; border-radius: 999px; padding: 2px 10px; border: 1px solid var(--ring); color: var(--ink-2); }
+.pill.ok { color: var(--good); border-color: currentColor; }
+.pill.warn { color: var(--bad); border-color: currentColor; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px 16px; font-variant-numeric: tabular-nums; }
+.tiles .k { color: var(--muted); font-size: 12px; } .tiles .v { font-size: 20px; font-weight: 600; }
+.tiles .s { color: var(--ink-2); font-size: 12px; }
+.scroll { max-height: 420px; overflow: auto; }
+.tablewrap { overflow-x: auto; }
+table.data { width: 100%; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
+table.data th { position: sticky; top: 0; background: var(--surface); text-align: right; color: var(--ink-2); font-weight: 600; padding: 4px 6px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+table.data td { text-align: right; padding: 4px 6px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+table.data th:first-child, table.data td:first-child { text-align: left; }
+table.data tbody tr.click { cursor: pointer; }
+table.data tbody tr.click:hover { background: var(--wash); }
+tr.sel td { background: var(--wash); font-weight: 600; }
+.cols { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; }
+@media (max-width: 900px) { .cols { grid-template-columns: minmax(0, 1fr); } }
+.sw { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+.st { font-weight: 600; }
+.st.running { color: var(--good); } .st.crashed, .st.dead { color: var(--bad); } .st.aborted { color: var(--p4); }
+.st.holiday, .st.done { color: var(--ink-2); font-weight: 400; }
+.empty { color: var(--muted); padding: 16px 0; text-align: center; }
+.note { color: var(--muted); font-size: 12px; }
+.warnline { color: var(--bad); font-weight: 600; white-space: pre-wrap; font-size: 12px; }
+pre { margin: 0; white-space: pre-wrap; word-break: break-word; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--ink-2); }
+code { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--wash); border-radius: 4px; padding: 1px 4px; }
+</style>
+</head>
+<body>
+<main class="stack">
+  <header>
+    <h1>Jev Paper</h1>
+    <nav class="nav"><a href="/">Replay</a><a href="/live">Live</a><a href="/paper" aria-current="page">Paper</a><a href="/docs">Docs</a></nav>
+    <span class="pill" id="status">loading…</span>
+    <span class="muted grow" id="meta"></span>
+    <button class="btn" id="theme" aria-label="Toggle dark mode"></button>
+  </header>
+
+  <section class="card" id="idle" hidden>
+    <h3>No paper sessions yet</h3>
+    <p class="note">Each live session is recorded in the paper DB (<code id="dbpath"></code>). Run one, or install the daily schedule (README, "Live paper trading"):</p>
+    <pre>uv run python -m trade_jev.live --exit-at-close --no-open</pre>
+  </section>
+
+  <div id="app" class="stack" hidden>
+    <section class="card"><div class="tiles" id="tiles"></div></section>
+    <section class="card">
+      <h3>Sessions <span class="sub">· one per trading day, 1 contract per policy; click a day for its trades and Jev decisions</span></h3>
+      <div class="tablewrap"><table class="data" id="sessions"></table></div>
+    </section>
+
+    <div id="detail" class="stack" hidden>
+      <section class="card">
+        <div class="row" style="justify-content:space-between; margin-bottom:8px">
+          <h3 style="margin:0" id="dtitle"></h3>
+          <span class="note" id="dmeta"></span>
+        </div>
+        <div class="warnline" id="derror" hidden></div>
+        <div class="tablewrap"><table class="data" id="dpolicies"></table></div>
+        <p class="note" id="dsettings"></p>
+      </section>
+      <div class="cols">
+        <section class="card">
+          <div class="row" style="justify-content:space-between; margin-bottom:6px">
+            <h3 style="margin:0">Trades</h3>
+            <div class="row" id="tpols"></div>
+          </div>
+          <div class="scroll"><table class="data" id="dtrades"></table></div>
+        </section>
+        <section class="card">
+          <h3>Jev decisions <span class="sub" id="dcount"></span></h3>
+          <div class="row" style="margin-bottom:6px" id="dfilter"></div>
+          <div class="scroll"><table class="data" id="ddecs"></table></div>
+        </section>
+      </div>
+    </div>
+  </div>
+</main>
+<script src="/paper.js"></script>
+</body>
+</html>

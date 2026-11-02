@@ -24,3 +24,7 @@ private/
 # live paper trading: the paper DB (and its WAL files) and launchd logs
 data/paper.db*
 logs/
+
+# Tradovate token mode: the token store, its status file, lock and temp files (secrets)
+data/tradovate_token*
+data/.tradovate_token*

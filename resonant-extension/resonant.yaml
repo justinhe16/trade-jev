@@ -15,7 +15,8 @@ tools:
   trade_jev_status:
     description: >-
       Today's paper session (ET): running, done, crashed, or stale (likely dead), Jev's
-      position, P&L and trade count so far, and whether the launchd job is loaded.
+      position, P&L and trade count so far, whether the launchd job is loaded, and the health of
+      the Tradovate token (a `token` block: expires in N min, renewal failures; no secrets).
     run: ./cli.py status
     effect: read
   trade_jev_pnl:
@@ -59,13 +60,15 @@ jobs:
     timeout_s: 60
     catchup: 6h        # if the daemon was down at 16:10, report that day once it's back
   - id: watch
-    schedule: "5,20,35,50 9-15 * * 1-5"   # checks 09:35..15:50 ET on trading days (script-guarded)
+    # every 15 min, ALL day and every day: the Tradovate token check has no hours (tokens die over a
+    # weekend). The paper-session check inside it stays script-guarded to 09:35..15:50 ET trading days.
+    schedule: "5,20,35,50 * * * *"
     tz: America/New_York
     run: ./cli.py watch
     effect: read
     level: L0
     timeout_s: 60
 
-# watch's "trade-jev/down" texts at once; close-summary's daily P&L rides the hourly pulse.
+# watch's "trade-jev/down" and "trade-jev/token" text at once; close-summary's daily P&L rides the hourly pulse.
 report: {max_urgency: urgent}
 health: {check: ./cli.py health, every: 5m}

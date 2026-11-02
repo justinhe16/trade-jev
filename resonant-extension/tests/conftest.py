@@ -115,6 +115,18 @@ class PaperDB:
         self.conn.commit()
 
 
+@pytest.fixture(autouse=True)
+def token_status(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """The keep-alive's status file: a temp path (absent until a test writes it), never the real one."""
+    path = tmp_path / "tradovate_token_status.json"
+    monkeypatch.setattr(cli, "DEFAULT_TOKEN_STATUS", str(path))
+    return path
+
+
+def write_token_status(path: Path, **fields: Any) -> None:
+    path.write_text(json.dumps(fields))
+
+
 @pytest.fixture
 def data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     d = tmp_path / "ext-data"

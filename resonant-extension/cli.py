@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from emit import report  # noqa: E402
 
 DEFAULT_DB = "/Users/justinhe/trade-jev/data/paper.db"
+DEFAULT_TOKEN_STATUS = "/Users/justinhe/trade-jev/data/tradovate_token_status.json"
 DEFAULT_LABEL = "com.tradejev.paper"
 LAUNCHCTL = "/bin/launchctl"
 LAUNCHCTL_TIMEOUT_S = 10
@@ -49,6 +50,13 @@ RESULT_BUDGET = 3800  # bytes of JSON; the model sees at most 4 KB of a result
 PNL_BUCKET = 50  # close summary state: P&L rounded to this, so tiny revisions aren't news
 DOWN_KEY = "trade-jev/down"
 WATCH_STATE = "watch_state.json"
+TOKEN_KEY = "trade-jev/token"
+TOKEN_TITLE = (
+    "Tradovate token expired — log into trader.tradovate.com and paste a fresh access token "
+    "+ md token into ~/trade-jev/.env"
+)
+TOKEN_WARN_S = 600  # a token that expires within this long is an alert (the renewer should have run)
+TOKEN_FAILS = 2  # consecutive failed renewals before "renewal failing" is an alert
 STOPPED = "stopped_day"  # written by `stop`: watch stays quiet for that ET day
 
 # NYSE full-day closures. A weekday listed here never raises "no session"; the runner's own
@@ -75,6 +83,8 @@ class Config:
     db_path: Path = Path(DEFAULT_DB)
     label: str = DEFAULT_LABEL
     holidays: frozenset[str] = field(default_factory=frozenset)
+    # looked up at call time (tests point the default at a temp file)
+    token_status_path: Path = field(default_factory=lambda: Path(DEFAULT_TOKEN_STATUS))
 
 
 def data_dir() -> Path:
@@ -82,7 +92,7 @@ def data_dir() -> Path:
 
 
 def load_config() -> Config:
-    """``config.json`` in the data dir: ``{"db_path", "launchd_label", "holidays"}``, all
+    """``config.json`` in the data dir: ``{"db_path", "launchd_label", "holidays", "token_status_path"}``, all
     optional. A malformed file is an error rather than a silent fallback to the default."""
     path = data_dir() / "config.json"
     if not path.exists():
@@ -96,13 +106,16 @@ def load_config() -> Config:
     db = raw.get("db_path", DEFAULT_DB)
     label = raw.get("launchd_label", DEFAULT_LABEL)
     holidays = raw.get("holidays", [])
+    tok = raw.get("token_status_path", DEFAULT_TOKEN_STATUS)
+    if not isinstance(tok, str) or not tok:
+        raise Fail("config.json: token_status_path must be a non-empty string")
     if not isinstance(db, str) or not db:
         raise Fail("config.json: db_path must be a non-empty string")
     if not isinstance(label, str) or not label.replace(".", "").replace("-", "").isalnum():
         raise Fail("config.json: launchd_label must look like com.tradejev.paper")
     if not isinstance(holidays, list) or not all(isinstance(h, str) for h in holidays):
         raise Fail("config.json: holidays must be a list of YYYY-MM-DD strings")
-    return Config(Path(db).expanduser(), label, frozenset(holidays))
+    return Config(Path(db).expanduser(), label, frozenset(holidays), Path(tok).expanduser())
 
 
 def connect(cfg: Config) -> sqlite3.Connection | None:
@@ -389,6 +402,64 @@ def launchd_state(cfg: Config) -> dict[str, Any]:
     return out
 
 
+# --- Tradovate token (written by trade_jev.tradovate_keepalive; never holds a token) ----------
+
+
+def read_token_status(cfg: Config) -> dict[str, Any] | None:
+    """The keep-alive's status file: None when it doesn't exist (token mode isn't in use, or the
+    keep-alive has never run), ``{"unreadable": True}`` when it exists but isn't a JSON object."""
+    path = cfg.token_status_path
+    if not path.exists():
+        return None
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {"unreadable": True}
+    return raw if isinstance(raw, dict) else {"unreadable": True}
+
+
+def _token_expiry_s(st: dict[str, Any], now: datetime) -> float | None:
+    exp = parse_ts(st.get("expires_at")) if isinstance(st.get("expires_at"), str) else None
+    return None if exp is None else (exp - now).total_seconds()
+
+
+def token_problem(st: dict[str, Any] | None, now: datetime) -> str | None:
+    """Why the Tradovate token needs the owner (``unreadable``, ``expired``, ``expiring`` or
+    ``renewal failing``), or None when it is healthy or there is no status yet."""
+    if st is None:
+        return None
+    if st.get("unreadable"):
+        return "unreadable"
+    left = _token_expiry_s(st, now)
+    if left is not None and left <= 0:
+        return "expired"
+    if left is not None and left <= TOKEN_WARN_S:
+        return "expiring"
+    fails = st.get("consecutive_failures")
+    if isinstance(fails, int) and fails >= TOKEN_FAILS:
+        return "renewal failing"
+    return None
+
+
+def token_summary(st: dict[str, Any] | None, now: datetime) -> dict[str, Any]:
+    """The ``token`` block of trade_jev_status (no secrets: the status file has none)."""
+    if st is None:
+        return {"known": False, "note": "no token status file (token mode not in use yet)"}
+    problem = token_problem(st, now)
+    left = None if st.get("unreadable") else _token_expiry_s(st, now)
+    return {
+        "known": not st.get("unreadable", False),
+        "ok": problem is None,
+        "problem": problem,
+        "expires_in_min": None if left is None else round(left / 60),
+        "expires_at": st.get("expires_at"),
+        "last_ok_at": st.get("last_ok_at"),
+        "last_error": clip(st.get("last_error"), 120),
+        "consecutive_failures": st.get("consecutive_failures"),
+        "checked_at": st.get("checked_at"),
+    }
+
+
 # --- tools ------------------------------------------------------------------------------------
 
 
@@ -399,9 +470,14 @@ def no_sessions(**extra: Any) -> dict[str, Any]:
 def cmd_status(cfg: Config, now: datetime) -> dict[str, Any]:
     today = now.astimezone(ET).date().isoformat()
     launchd = launchd_state(cfg)
+    tstatus = read_token_status(cfg)
+    token = token_summary(tstatus, now)
+    problem = token_problem(tstatus, now)
+    note = f" | Tradovate token: {problem}" if problem else ""
     conn = connect(cfg)
     if conn is None:
-        return no_sessions(day=today, running=False, launchd=launchd)
+        return no_sessions(day=today, running=False, launchd=launchd, token=token) | (
+            {"summary": NO_SESSIONS + note} if note else {})
     with closing(conn):
         s = latest_session(conn, today)
         if s is None:
@@ -412,7 +488,8 @@ def cmd_status(cfg: Config, now: datetime) -> dict[str, Any]:
                 "session": None,
                 "last_session_day": last,
                 "launchd": launchd,
-                "summary": f"no session today ({today}); last session {last or 'never'}",
+                "token": token,
+                "summary": f"no session today ({today}); last session {last or 'never'}{note}",
             }
         health, age = health_of(s, now)
         stats = policy_stats(conn, [s["session_id"]])
@@ -441,16 +518,17 @@ def cmd_status(cfg: Config, now: datetime) -> dict[str, Any]:
             "wins": j.get("wins", 0),
         },
         "launchd": launchd,
+        "token": token,
     }
     label = "stale/likely dead" if health == "stale" else health
     if health == "skipped":
         out["summary"] = f"skipped: {clip(s['error'], 160) or 'no reason recorded'}" + (
-            f" (source {source_of(s)})" if source_of(s) else "")
+            f" (source {source_of(s)})" if source_of(s) else "") + note
         return out
     src = f" [{source_of(s)}]" if source_of(s) else ""
     out["summary"] = (
         f"{s['symbol']}{src} paper session {label}; Jev {money(out['jev']['pnl'])} "
-        f"({out['jev']['trades']} trades), position {position if position is not None else '?'}"
+        f"({out['jev']['trades']} trades), position {position if position is not None else '?'}{note}"
     )
     return out
 
@@ -746,6 +824,33 @@ def down_reason(conn: sqlite3.Connection | None, now: datetime) -> str | None:
 
 
 def cmd_watch(cfg: Config, now: datetime) -> dict[str, Any]:
+    """Two checks. The Tradovate token runs on every call, any hour of any day (tokens die over a
+    weekend too): an urgent ``trade-jev/token`` while renewal is failing or the token expires within
+    10 min, cleared once healthy. The paper-session check keeps its market-hours gate: an urgent
+    ``trade-jev/down`` while today's session is crashed or stale, or missing by 09:35. Their remembered
+    states are independent (both live in ``watch_state.json``)."""
+    out = _watch_down(cfg, now)
+    out["token"] = _watch_token(cfg, now)
+    return out
+
+
+def _watch_token(cfg: Config, now: datetime) -> dict[str, Any]:
+    state_path = data_dir() / WATCH_STATE
+    problem = token_problem(read_token_status(cfg), now)
+    was = _read_state(state_path).get("token")
+    if problem:
+        report(TOKEN_KEY, TOKEN_TITLE, urgency="urgent", state={"reason": problem}, ttl="2h")
+        _write_state(state_path, {"token": {"reason": problem}})
+        return {"problem": problem}
+    if was:
+        report(TOKEN_KEY, "Tradovate token healthy again", urgency="urgent", clear=True,
+               state={"reason": "ok"})  # fmt: skip
+        _write_state(state_path, {"token": None})
+        return {"problem": None, "cleared": True}
+    return {"problem": None}
+
+
+def _watch_down(cfg: Config, now: datetime) -> dict[str, Any]:
     """Every 15 min in market hours: an urgent ``trade-jev/down`` while today's session is
     crashed or stale, or missing by 09:35; a clear once it's healthy again. A clear is sent
     only after a down report (remembered in the data dir), so a healthy day says nothing."""
@@ -784,7 +889,10 @@ def _read_state(path: Path) -> dict[str, Any]:
     return raw if isinstance(raw, dict) else {}
 
 
-def _write_state(path: Path, state: dict[str, Any]) -> None:
+def _write_state(path: Path, updates: dict[str, Any]) -> None:
+    """Merge ``updates`` into the remembered state (read-modify-write), so the down and token
+    states coexist."""
+    state = {**_read_state(path), **updates}
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(state))

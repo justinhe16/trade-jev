@@ -19,6 +19,13 @@ Aggressor rule, per trade tick:
   4. else the tick rule vs the previous trade price: up -> buy, down -> sell, unchanged -> the previous
      trade's side; the very first trade with no information -> unknown (delta 0)
 
+Token mode (the owner's MFF simulated account, see README "Token mode"): when TRADOVATE_ACCESS_TOKEN is set
+or data/tradovate_token.json exists there is no username / password login at all. The session adopts the
+token store (tradovate_token.py) that the keep-alive renewer maintains, or renews itself under the store's
+file lock when it is the one that has to; see the race rule in tradovate_token.py. REST then goes to
+TRADOVATE_AUTH_HOST (default live.tradovateapi.com). Before subscribing, the md socket waits for the
+authorize answer (200): a request sent earlier is silently dropped by Tradovate.
+
 Tokens and hosts (some facts are undocumented and are tried in order, see README "Tradovate source"):
 the md socket wants either `mdAccessToken` or `accessToken`: mdAccessToken is tried first, then
 accessToken. The only documented md host is md.tradovateapi.com (both environments); for TRADOVATE_ENV=demo
@@ -39,6 +46,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from statistics import median
 
+from pathlib import Path
+
+from trade_jev import tradovate_token as tt
 from trade_jev.data import LEVELS, TICK
 
 REQUIRED_ENV = ("TRADOVATE_USERNAME", "TRADOVATE_PASSWORD", "TRADOVATE_CID", "TRADOVATE_SEC",
@@ -54,6 +64,7 @@ MAX_REFUSALS = 5        # md refusals with no book data ever received -> give up
 REFUSAL_WINDOW_S = 300.0  # ... but only once they have lasted this long, so a brief refusal at the open can't
                           # end an unattended day (launchd does not restart the job)
 RENEW_MARGIN_S = 15 * 60  # renew the access token this long before it expires (tokens live 90 min)
+DEFAULT_LIFETIME_S = 80 * 60  # assumed token life when a response carries no expirationTime
 HINT_NO_API = ("API Access requires a Tradovate API subscription; prop-firm evaluation accounts may not "
                "allow it: ask the firm / Tradovate.")
 
@@ -85,6 +96,11 @@ class CaptchaRequired(AuthError):
     pass
 
 
+class TokenExpired(AuthError):
+    """Token mode: every token we have is dead and .env holds no fresh ones. Not fatal for a session: it
+    retries with backoff and re-reads the store and .env each time, so pasting new tokens recovers it."""
+
+
 class RequestFailed(TradovateError):
     pass
 
@@ -104,24 +120,34 @@ def redact(text: str, secrets) -> str:
 # ---------------------------------------------------------------- config
 
 def missing_credentials(env=os.environ) -> list[str]:
-    """Names (never values) of the required TRADOVATE_* credentials that are unset or blank."""
+    """Names (never values) of the required TRADOVATE_* credentials that are unset or blank.
+    Token mode needs none of them (its readiness is tradovate_token.token_skip_reason)."""
+    if tt.auth_mode(env) == "token":
+        return []
     return [n for n in REQUIRED_ENV if not (env.get(n) or "").strip()]
 
 
 @dataclass(frozen=True)
 class TradovateConfig:
-    username: str = field(repr=False)
-    password: str = field(repr=False)
-    cid: str = field(repr=False)
-    sec: str = field(repr=False)
-    device_id: str = field(repr=False)
+    username: str = field(default="", repr=False)
+    password: str = field(default="", repr=False)
+    cid: str = field(default="", repr=False)
+    sec: str = field(default="", repr=False)
+    device_id: str = field(default="", repr=False)
     env: str = "live"
     app_id: str = "trade-jev"
     app_version: str = "1.0"
     md_url: str | None = None
+    mode: str = "password"            # "password" | "token"
+    auth_host: str | None = None      # token mode: TRADOVATE_AUTH_HOST, default live.tradovateapi.com
+    store_path: str | None = None     # token mode: default data/tradovate_token.json
+    dotenv: str | None = None         # token mode: the .env file re-read for fresh pasted tokens
+    seed_access: str = field(default="", repr=False)  # the env-mapping seed (when there is no .env file)
+    seed_md: str = field(default="", repr=False)
 
     @classmethod
     def from_env(cls, env=os.environ) -> "TradovateConfig":
+        mode = tt.auth_mode(env)
         missing = missing_credentials(env)
         if missing:
             raise TradovateError("tradovate credentials missing: " + ", ".join(missing))
@@ -129,13 +155,28 @@ class TradovateConfig:
         if which not in REST:
             raise TradovateError(f"TRADOVATE_ENV must be live or demo, not {which!r}")
         g = lambda k, d="": (env.get(k) or d).strip()  # noqa: E731
+        common = dict(env=which, app_id=g("TRADOVATE_APP_ID", "trade-jev"),
+                      app_version=g("TRADOVATE_APP_VERSION", "1.0"), md_url=g("TRADOVATE_MD_URL") or None)
+        if mode == "token":
+            return cls(**common, mode="token", auth_host=g("TRADOVATE_AUTH_HOST", tt.DEFAULT_AUTH_HOST),
+                       store_path=str(tt.token_store_path(env)), dotenv=str(tt.dotenv_path(env)),
+                       seed_access=g("TRADOVATE_ACCESS_TOKEN"), seed_md=g("TRADOVATE_MD_ACCESS_TOKEN"))
         return cls(g("TRADOVATE_USERNAME"), env["TRADOVATE_PASSWORD"], g("TRADOVATE_CID"), env["TRADOVATE_SEC"],
-                   g("TRADOVATE_DEVICE_ID"), which, g("TRADOVATE_APP_ID", "trade-jev"),
-                   g("TRADOVATE_APP_VERSION", "1.0"), g("TRADOVATE_MD_URL") or None)
+                   g("TRADOVATE_DEVICE_ID"), auth_host=g("TRADOVATE_AUTH_HOST") or None, **common)
 
     @property
     def base(self) -> str:
-        return REST[self.env]
+        if self.auth_host:
+            return f"https://{self.auth_host}/v1"
+        return f"https://{tt.DEFAULT_AUTH_HOST}/v1" if self.mode == "token" else REST[self.env]
+
+    def store(self) -> Path:
+        return Path(self.store_path) if self.store_path else tt.token_store_path()
+
+    def seed(self) -> "tt.TokenSet | None":
+        """The tokens pasted into .env, re-read from the file now (os.environ was loaded once at import)."""
+        return tt.read_seed({"TRADOVATE_ACCESS_TOKEN": self.seed_access, "TRADOVATE_MD_ACCESS_TOKEN": self.seed_md},
+                            self.dotenv or tt.dotenv_path())
 
     def md_candidates(self) -> list[str]:
         if self.md_url:
@@ -143,7 +184,12 @@ class TradovateConfig:
         return [MD_URL, MD_DEMO_URL] if self.env == "demo" else [MD_URL]
 
     def secrets(self) -> list[str]:
-        return [self.password, self.sec]
+        out = [self.password, self.sec, self.seed_access, self.seed_md]
+        if self.mode == "token":
+            for ts in (self.seed(), tt.read_store(self.store())):
+                if ts:
+                    out += [ts.access, ts.md]
+        return out
 
 
 # ---------------------------------------------------------------- auth (REST)
@@ -174,11 +220,10 @@ APP_RE = re.compile(r"\b(app|appid|application|cid|sec|secret|api[ _-]?key|clien
 CRED_RE = re.compile(r"password|user\s?name|credential|login", re.I)
 
 
-def _parse_iso(s: str) -> float | None:
-    try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc).timestamp()
-    except (ValueError, AttributeError):
-        return None
+async def renew_request(http, base: str, access_token: str) -> tuple[int, dict]:
+    """GET /auth/renewaccesstoken with the bearer token: (status, JSON). Returns accessToken,
+    mdAccessToken, expirationTime. Network failures raise TradovateError (message may hold nothing secret)."""
+    return await http("GET", base + "/auth/renewaccesstoken", {"Authorization": f"Bearer {access_token}"}, None)
 
 
 class TradovateAuth:
@@ -246,7 +291,68 @@ class TradovateAuth:
                             "retry later")
         return wait
 
+    # -- token mode: adopt the store, or renew under its lock and write it
+
+    def _remember(self, *tokens: str) -> None:
+        self._old_tokens.extend(t for t in tokens if t and t not in (self.access_token, self.md_token))
+
+    async def _token_refresh(self, force_http: bool = False) -> None:
+        """Pick the tokens (store, else fresh .env seed). Under the store lock: re-read the store; a token
+        valid beyond RENEW_MARGIN_S is adopted with no HTTP (the keep-alive renewed it); otherwise renew with
+        the chosen token, write the store and the status file. Only dead tokens -> TokenExpired."""
+        cfg, store_file = self.cfg, self.cfg.store()
+        status_file = tt.status_path(store_file)
+        try:
+            async with tt.StoreLock(tt.lock_path(store_file)):
+                now = self.clock()
+                store, seed = tt.read_store(store_file), cfg.seed()
+                known = [t for ts in (store, seed) if ts for t in (ts.access, ts.md)]
+                self._remember(*known)
+                sel = tt.select_tokens(store, seed, now, RENEW_MARGIN_S)
+                if sel is None or sel.dead(now):
+                    raise TokenExpired("tradovate token expired: log into trader.tradovate.com and paste a fresh "
+                                       "access token + md token into .env")
+                if sel.source == "store" and not force_http and not sel.dead(now, RENEW_MARGIN_S):
+                    self._apply({"accessToken": sel.access, "mdAccessToken": sel.md or None,
+                                 "expirationTime": tt.iso_utc(sel.expires_at)}, full=False)
+                    _log(f"token adopted from the store; expires {time.strftime('%H:%M:%S', time.localtime(self.expires_at))}")
+                    return
+                try:
+                    status, d = await renew_request(self.http, cfg.base, sel.access)
+                except TradovateError as e:
+                    err = f"renew failed: {e}"
+                else:
+                    err = None
+                    if status >= 400 or d.get("errorText") or not d.get("accessToken"):
+                        err = f"renew failed: {d.get('errorText') or ('HTTP ' + str(status))}"
+                if err:
+                    self._remember(sel.access, sel.md)
+                    tt.record_failure(status_file, now, err, writer="session", host=cfg.auth_host,
+                                      secrets=[*known, *self.secrets()])
+                    raise AuthError(self.redact(err))
+                self._remember(sel.access, sel.md)
+                self._apply(d, full=False)
+                if not d.get("mdAccessToken") and not self.md_token and sel.md:
+                    self.md_token = sel.md
+                tt.write_store(store_file, self.access_token, self.md_token or "", self.expires_at)
+                tt.record_ok(status_file, now, self.expires_at, source=sel.source, writer="session",
+                             host=cfg.auth_host)
+                _log(f"token renewed ({sel.source}); expires {time.strftime('%H:%M:%S', time.localtime(self.expires_at))}")
+        except tt.LockTimeout as e:
+            raise AuthError(f"token store busy: {e}") from None
+
+    async def renew_now(self) -> None:
+        """Force one renewal over HTTP now (the smoke test). In password mode: renew the current token."""
+        async with self._lock:
+            if self.cfg.mode == "token":
+                await self._token_refresh(force_http=True)
+            else:
+                await self.renew()
+
     async def _login(self) -> None:
+        if self.cfg.mode == "token":  # no username / password in token mode, ever
+            await self._token_refresh()
+            return
         body = self._login_body()
         d = await self._post_login(body)
         if "p-ticket" in d or "p-time" in d:
@@ -275,16 +381,17 @@ class TradovateAuth:
             self.md_token = d["mdAccessToken"]
         elif full:
             self.md_token = None
-        exp = _parse_iso(d.get("expirationTime")) if d.get("expirationTime") else None
-        self.expires_at = exp if exp else self.clock() + 80 * 60
+        exp = tt.parse_expiration(d.get("expirationTime"))
+        self.expires_at = exp if exp else self.clock() + DEFAULT_LIFETIME_S
+        if d.get("userStatus"):
+            self.user_status = d["userStatus"]
         if full:
             self.user_status, self.user_id = d.get("userStatus"), d.get("userId")
             self.has_market_data = d.get("hasMarketData")
 
     async def renew(self) -> None:
         try:
-            status, d = await self.http("GET", self.cfg.base + "/auth/renewaccesstoken",
-                                        {"Authorization": f"Bearer {self.access_token}"}, None)
+            status, d = await renew_request(self.http, self.cfg.base, self.access_token)
         except TradovateError as e:
             raise AuthError(f"renew failed: {self.redact(e)}") from None
         if status >= 400 or d.get("errorText"):
@@ -292,6 +399,9 @@ class TradovateAuth:
         self._apply(d, full=False)
 
     async def _renew_or_login(self) -> None:
+        if self.cfg.mode == "token":
+            await self._token_refresh()
+            return
         try:
             await self.renew()
             _log("token renewed")
@@ -673,7 +783,8 @@ class TradovateSource:
 
     def __init__(self, symbol: str, stop_ns: int, flush_s: float = 0.1, config: TradovateConfig | None = None,
                  auth: TradovateAuth | None = None, md_urls: list[str] | None = None,
-                 backoff_s: float = 1.0, backoff_max_s: float = 30.0, connect_ws=None):
+                 backoff_s: float = 1.0, backoff_max_s: float = 30.0, connect_ws=None,
+                 subscribe_quote: bool = False):
         self.symbol, self.stop_ns, self.flush_s = symbol, stop_ns, flush_s
         if config is None:
             config = auth.cfg if auth is not None else TradovateConfig.from_env()
@@ -682,6 +793,8 @@ class TradovateSource:
         self.md_urls = md_urls or self.cfg.md_candidates()
         self.backoff_s, self.backoff_max_s = backoff_s, backoff_max_s
         self.connect_ws = connect_ws
+        self.subscribe_quote = subscribe_quote
+        self.quotes = 0
         self.live = True
         # counters (smoke test, logs)
         self.dom_updates = self.ticks = self.buys = self.sells = self.unknown = self.reconnects = 0
@@ -719,6 +832,8 @@ class TradovateSource:
     def _on_event(self, m: dict) -> None:
         e, d = m.get("e"), m.get("d")
         if e == "md":
+            if isinstance(d, dict) and isinstance(d.get("quotes"), list):
+                self.quotes += len(d["quotes"])
             doms = parse_dom(d)
             if doms is None:
                 if not (isinstance(d, dict) and any(k in d for k in ("q", "quotes", "quote"))):
@@ -840,6 +955,8 @@ class TradovateSource:
 
     async def _subscribe(self, sock: MdSocket) -> int | None:
         self._decoder = TickDecoder()  # new chart ids; history replayed after a reconnect is ignored (eoh gate)
+        if self.subscribe_quote:
+            await sock.request("md/subscribeQuote", {"symbol": self.symbol})
         await sock.request("md/subscribeDOM", {"symbol": self.symbol})
         r = await sock.request("md/getChart", {
             "symbol": self.symbol,
@@ -852,7 +969,8 @@ class TradovateSource:
 
     async def _unsubscribe(self, sock: MdSocket, realtime_id) -> None:
         for endpoint, body in (("md/cancelChart", {"subscriptionId": realtime_id} if realtime_id is not None else None),
-                               ("md/unsubscribeDOM", {"symbol": self.symbol})):
+                               ("md/unsubscribeDOM", {"symbol": self.symbol}),
+                               ("md/unsubscribeQuote", {"symbol": self.symbol} if self.subscribe_quote else None)):
             if body is None:
                 continue
             try:
@@ -891,9 +1009,14 @@ class TradovateSource:
         delay = self.backoff_s
         try:
             if not self.auth.access_token:  # tradovate_check.py logs in first to report it
-                await self.auth.login()
+                try:
+                    await self.auth.login()
+                except TokenExpired as e:  # token mode: not fatal, _session retries with backoff
+                    _log(f"auth problem: {self.auth.redact(e)}")
             self.auth.start_renew_loop()
             try:
+                if not self.auth.access_token:
+                    raise TradovateError("no token yet")
                 self.contract_id = await self.auth.contract_id(self.symbol)
                 _log(f"contract {self.symbol} id {self.contract_id}")
             except Exception as e:  # noqa: BLE001
@@ -981,4 +1104,4 @@ class TradovateSource:
                 "max_bid_levels": self.max_bid_levels, "max_ask_levels": self.max_ask_levels,
                 "median_bid_levels": median(self.bid_levels) if self.bid_levels else 0,
                 "median_ask_levels": median(self.ask_levels) if self.ask_levels else 0,
-                "dropped_trades": self.dropped_trades, "dom_unusable": self.dom_empty, "unknown_events": self.unknown_events}
+                "quotes": self.quotes, "dropped_trades": self.dropped_trades, "dom_unusable": self.dom_empty, "unknown_events": self.unknown_events}

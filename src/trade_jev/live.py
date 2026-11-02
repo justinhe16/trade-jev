@@ -21,7 +21,8 @@ also recorded in the paper DB (trade_jev.paperdb: sessions, trades as they close
 summary), which the viewer's /paper tab reads.
 
 Feed: `--source databento|tradovate` (default $TRADE_JEV_SOURCE, else databento). TRADE_JEV_SOURCE=off, or
-`tradovate` with any TRADOVATE_* credential missing, skips the day: a `skipped` row with the reason, exit 0,
+`tradovate` with any TRADOVATE_* credential missing (or, in token mode, with the token expired and no fresh
+tokens in .env: reason "tradovate token expired"), skips the day: a `skipped` row with the reason, exit 0,
 no feed started. Databento replays the session so far after a late start. Tradovate cannot: a start after
 the 09:28 ET open instead warms up for 60s on live data (every decision HOLD, no Jev call) and skips the
 grid points it missed. See src/trade_jev/tradovate.py and README "Tradovate source".
@@ -53,6 +54,7 @@ import pyarrow.parquet as pq
 
 from trade_jev import ROOT, paperdb, tradingdays
 from trade_jev.tradovate import TradovateConfig, TradovateError, TradovateSource, missing_credentials
+from trade_jev.tradovate_token import auth_mode, token_skip_reason
 from trade_jev.data import (ET, LEVELS, LIVE_DIR, TICK, Day, decision_grid, et_to_ns, list_days,
                             ns_to_et, secs)
 from trade_jev.encode import LOOKBACKS, Context
@@ -1038,6 +1040,8 @@ def skip_reason(source: str, env=os.environ, explicit: bool = False) -> str | No
     if source_from_env(env) == "off" and not explicit:
         return "TRADE_JEV_SOURCE=off"
     if source == "tradovate":
+        if auth_mode(env) == "token":  # tokens, not a password: dead store and no fresh .env tokens -> skip
+            return token_skip_reason(env)
         missing = missing_credentials(env)
         if missing:
             return "tradovate credentials missing: " + ", ".join(missing)

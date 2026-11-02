@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Tradovate token keep-alive: renews the web-session tokens about every 50 minutes, 24/7 (they die if
+     nobody renews them for ~80 min). Reads/writes data/tradovate_token.json and data/tradovate_token_status.json.
+     Installed by scripts/install_launchd.sh (fills in __UV__). caffeinate -i: no idle sleep while it runs. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.tradejev.tvtoken</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/caffeinate</string>
+        <string>-i</string>
+        <string>__UV__</string>
+        <string>run</string>
+        <string>--frozen</string>
+        <string>python</string>
+        <string>-m</string>
+        <string>trade_jev.tradovate_keepalive</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/justinhe/trade-jev</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__UV_DIR__:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>StandardOutPath</key>
+    <string>/Users/justinhe/trade-jev/logs/tvtoken.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/justinhe/trade-jev/logs/tvtoken.log</string>
+</dict>
+</plist>

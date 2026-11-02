@@ -13,7 +13,7 @@ resonant ext validate /Users/justinhe/trade-jev/resonant-extension
 resonant ext add path:/Users/justinhe/trade-jev/resonant-extension
 ```
 
-`ext add` shows the review screen. Type `trade-jev` to confirm. After a later change, run `resonant ext update trade-jev`.
+`ext add` shows the review screen. Type `trade-jev` to confirm. After a later change, run `resonant ext update trade-jev` (the token alert needs this update: it changes the `watch` schedule and `trade_jev_status`).
 
 Each job's first run after install is a silent baseline. Run `/ext run trade-jev/watch` once before relying on it.
 
@@ -21,7 +21,7 @@ Each job's first run after install is a silent baseline. Run `/ext run trade-jev
 
 | Tool | Effect / level | What it does |
 |---|---|---|
-| `trade_jev_status` | read, L0 | Today's session (ET date): `running`, `done`, `crashed`, `aborted`, `holiday`, `skipped` (the runner chose not to trade, e.g. `TRADE_JEV_SOURCE=off` or Tradovate credentials missing: the summary reads `skipped: <reason>`) or **`stale`**. The session block also carries `source` (`databento` or `tradovate`, null on a DB from before the column existed). Stale means status is `running` but the heartbeat is more than 3 min old, so the process is likely dead. Also shows Jev's position (its latest decision), realized P&L, trade count and wins so far, and whether the launchd job is loaded (`launchctl print gui/<uid>/com.tradejev.paper`, best effort). |
+| `trade_jev_status` | read, L0 | Today's session (ET date): `running`, `done`, `crashed`, `aborted`, `holiday`, `skipped` (the runner chose not to trade, e.g. `TRADE_JEV_SOURCE=off` or Tradovate credentials missing: the summary reads `skipped: <reason>`) or **`stale`**. The session block also carries `source` (`databento` or `tradovate`, null on a DB from before the column existed). Stale means status is `running` but the heartbeat is more than 3 min old, so the process is likely dead. Also shows Jev's position (its latest decision), realized P&L, trade count and wins so far, and whether the launchd job is loaded (`launchctl print gui/<uid>/com.tradejev.paper`, best effort). Every answer also has a **`token`** block with the Tradovate token's health (expires in N min, last OK, consecutive renewal failures, last error; never a token), read from the keep-alive's status file, and the summary gets ` \| Tradovate token: <problem>` when it needs the owner. |
 | `trade_jev_pnl {date}` | read, L0 | Jev vs the baselines: pnl, trades, wins, max drawdown, Jev calls and cost, and `jev_minus_baseline`. Ranges add a per-day list. |
 | `trade_jev_trades {date, policy, limit}` | read, L0 | The latest `limit` trades (oldest first, ET times) for one policy, plus the total count. |
 | `trade_jev_start` | write, **L2** | `launchctl kickstart gui/<uid>/com.tradejev.paper`. It does nothing if the job is already running. If the job isn't loaded it refuses and does nothing. |
@@ -59,7 +59,7 @@ If the plist sets `KeepAlive`, launchd restarts the job after SIGTERM. In that c
 | Job | When (America/New_York) | Reports |
 |---|---|---|
 | `close-summary` | 16:10 weekdays (catch-up 6 h) | `trade-jev/pnl/<day>`, urgency **normal** (the hourly pulse). Title example: `Paper NQ: Jev +$420 (6 trades), hold −$110, random +$30`, with ` (crashed)` and similar appended when the day didn't finish `done`. `state` holds the day, the status, Jev's P&L rounded to $50 and Jev's trade count, so a re-run on the same day isn't news. Nothing is reported on a holiday or a day with no session. A caught-up run reports the day it was due for (`RESONANT_JOB_DUE_AT`). |
-| `watch` | at :05, :20, :35 and :50, 09:05–15:50 weekdays. It checks only between 09:30 and 16:00 on NYSE trading days, so the first check is 09:35 and the last is 15:50. | `trade-jev/down`, urgency **urgent** (texted at once), while today's latest session is `crashed` or stale, or when no session exists by 09:35 (caught at the 09:35 run). Once healthy again it sends one `clear` (texted as ✓). `done`, `aborted` (stopped on purpose), `holiday` and `skipped` are healthy (a `skipped` row also counts as the runner having run, so there is no missing-by-09:35 alert). After `trade_jev_stop`, watch stays quiet for the rest of that ET day even if the runner never wrote `aborted`. The marker is `$RESONANT_EXT_DATA/stopped_day`, and `trade_jev_start` removes it. The clear is sent only after a down report, which is remembered in `$RESONANT_EXT_DATA/watch_state.json`, so a healthy day sends nothing. |
+| `watch` | at :05, :20, :35 and :50 of every hour, every day (`5,20,35,50 * * * *`). The token check runs on every run; the paper-session check inside it only runs between 09:30 and 16:00 on NYSE trading days, so its first check is 09:35 and its last is 15:50. | Two keys, both urgency **urgent** (texted at once). **`trade-jev/token`**, any hour of any day, titled `Tradovate token expired — log into trader.tradovate.com and paste a fresh access token + md token into ~/trade-jev/.env`, while the keep-alive's status file (`data/tradovate_token_status.json`) shows renewal failing (2 or more consecutive failures), a token that expires within 10 min or already expired, or an unreadable file; one `clear` once healthy again. No status file means token mode isn't in use: silent. **`trade-jev/down`**, while today's latest session is `crashed` or stale, or when no session exists by 09:35 (caught at the 09:35 run). Once healthy again it sends one `clear` (texted as ✓). `done`, `aborted` (stopped on purpose), `holiday` and `skipped` are healthy (a `skipped` row also counts as the runner having run, so there is no missing-by-09:35 alert). After `trade_jev_stop`, watch stays quiet for the rest of that ET day even if the runner never wrote `aborted`. The marker is `$RESONANT_EXT_DATA/stopped_day`, and `trade_jev_start` removes it. The clear is sent only after a down report, which is remembered in `$RESONANT_EXT_DATA/watch_state.json`, so a healthy day sends nothing. The down and token states are remembered independently in the same file (read-modify-write). |
 
 The manifest grants `report: {max_urgency: urgent}` and a 5-minute `health` check (`./cli.py health`). The check is healthy when the config parses and the DB, if present, opens read-only. A missing DB is healthy.
 
@@ -73,6 +73,7 @@ Resonant runs the extension with `HOME` set to its data dir, not your home direc
 
 ```json
 {"db_path": "/Users/justinhe/trade-jev/data/paper.db",
+ "token_status_path": "/Users/justinhe/trade-jev/data/tradovate_token_status.json",
  "launchd_label": "com.tradejev.paper",
  "holidays": ["2026-11-27"]}
 ```

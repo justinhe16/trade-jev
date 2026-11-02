@@ -49,6 +49,7 @@ RESULT_BUDGET = 3800  # bytes of JSON; the model sees at most 4 KB of a result
 PNL_BUCKET = 50  # close summary state: P&L rounded to this, so tiny revisions aren't news
 DOWN_KEY = "trade-jev/down"
 WATCH_STATE = "watch_state.json"
+STOPPED = "stopped_day"  # written by `stop`: watch stays quiet for that ET day
 
 # NYSE full-day closures. A weekday listed here never raises "no session"; the runner's own
 # `holiday` rows cover the rest, and config.json may add days ("holidays": [...]).
@@ -542,8 +543,9 @@ def cmd_trades(
         else:
             policy = next((p for p in known if p.lower() == want.lower()), None)
         if policy is None:
-            return {"range": label, "policy": want or "jev", "trades": [], "policies": known,
-                    "summary": f"no trades for policy {want or 'jev'} in {label}"}  # fmt: skip
+            return {"range": label, "policy": clip(want, 40) or "jev", "trades": [],
+                    "policies": known[:20],
+                    "summary": f"no trades for policy {clip(want, 40) or 'jev'} in {label}"}  # fmt: skip
         total = conn.execute(
             f"SELECT COUNT(*) FROM paper_trades WHERE session_id IN ({marks}) AND policy=?",  # noqa: S608
             [*ids, policy],
@@ -595,10 +597,16 @@ def cmd_start(cfg: Config, now: datetime) -> dict[str, Any]:
                 "summary": f"{cfg.label} is already running"}  # fmt: skip
     try:
         proc = launchctl("kickstart", service(cfg))
+    except subprocess.TimeoutExpired:
+        # It may have gone through: never exit 1 (that promises nothing happened).
+        _clear_stopped()
+        return {"started": "unknown", "reason": "launchctl timed out",
+                "summary": f"kickstart of {cfg.label} timed out; check trade_jev_status"}  # fmt: skip
     except (OSError, subprocess.SubprocessError) as e:
         raise Fail(f"launchctl kickstart failed: {type(e).__name__}") from None
     if proc.returncode != 0:
         raise Fail(f"launchctl kickstart exited {proc.returncode}: {clip(proc.stderr, 120)}")
+    _clear_stopped()
     return {"started": True, "service": service(cfg),
             "summary": f"kickstarted {cfg.label}; status will show the session once it's up"}  # fmt: skip
 
@@ -612,14 +620,39 @@ def cmd_stop(cfg: Config, now: datetime) -> dict[str, Any]:
     if st["loaded"] and st.get("state") not in (None, "running"):
         return {"stopped": False, "reason": f"not running ({st.get('state')})", "launchd": st,
                 "summary": f"{cfg.label} isn't running; nothing to stop"}  # fmt: skip
+    day = now.astimezone(ET).date().isoformat()
     try:
         proc = launchctl("kill", "SIGTERM", service(cfg))
+    except subprocess.TimeoutExpired:
+        # It may have gone through: never exit 1 (that promises nothing happened).
+        _mark_stopped(day)
+        return {"stopped": "unknown", "reason": "launchctl timed out",
+                "summary": f"SIGTERM to {cfg.label} timed out; check trade_jev_status"}  # fmt: skip
     except (OSError, subprocess.SubprocessError) as e:
         raise Fail(f"launchctl kill failed: {type(e).__name__}") from None
     if proc.returncode != 0:
         raise Fail(f"launchctl kill exited {proc.returncode}: {clip(proc.stderr, 120)}")
+    _mark_stopped(day)
     return {"stopped": True, "service": service(cfg),
             "summary": f"sent SIGTERM to {cfg.label}"}  # fmt: skip
+
+
+def _mark_stopped(day: str) -> None:
+    """Remember that the owner stopped today's session, so watch doesn't call it dead."""
+    path = data_dir() / STOPPED
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(day)
+
+
+def _clear_stopped() -> None:
+    (data_dir() / STOPPED).unlink(missing_ok=True)
+
+
+def _stopped_today(day: str) -> bool:
+    try:
+        return (data_dir() / STOPPED).read_text().strip() == day
+    except OSError:
+        return False
 
 
 def cmd_health(cfg: Config, now: datetime) -> dict[str, Any]:
@@ -693,7 +726,8 @@ def cmd_watch(cfg: Config, now: datetime) -> dict[str, Any]:
         return {"checked": False, "summary": "outside market hours"}
     conn = connect(cfg)
     try:
-        reason = down_reason(conn, now)
+        # Stopped on purpose today (trade_jev_stop): a stale or missing session isn't news.
+        reason = None if _stopped_today(day) else down_reason(conn, now)
     finally:
         if conn is not None:
             conn.close()

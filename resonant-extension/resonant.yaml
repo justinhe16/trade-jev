@@ -59,7 +59,7 @@ jobs:
     timeout_s: 60
     catchup: 6h        # if the daemon was down at 16:10, report that day once it's back
   - id: watch
-    schedule: "*/15 9-16 * * 1-5"   # the script only checks 09:30-16:00 ET on trading days
+    schedule: "5,20,35,50 9-15 * * 1-5"   # checks 09:35..15:50 ET on trading days (script-guarded)
     tz: America/New_York
     run: ./cli.py watch
     effect: read

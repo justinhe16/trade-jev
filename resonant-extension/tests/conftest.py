@@ -146,12 +146,15 @@ class FakeLaunchctl:
         self.state = "running"
         self.fail: dict[str, int] = {}
         self.raise_os = False
+        self.timeout: set[str] = set()  # verbs that time out
 
     def __call__(self, *args: str) -> subprocess.CompletedProcess[str]:
         self.calls.append(args)
         if self.raise_os:
             raise OSError("no launchctl")
         verb = args[0]
+        if verb in self.timeout:
+            raise subprocess.TimeoutExpired([cli.LAUNCHCTL, *args], cli.LAUNCHCTL_TIMEOUT_S)
         if verb == "print":
             if not self.loaded:
                 return subprocess.CompletedProcess(args, 113, "", "Could not find service")

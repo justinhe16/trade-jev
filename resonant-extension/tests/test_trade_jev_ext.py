@@ -502,3 +502,80 @@ def test_no_dependency_files_in_the_extension() -> None:
     banned = {"pyproject.toml", "uv.lock", "package.json", "setup.py", "setup.cfg", "poetry.lock"}
     found = {p.name for p in EXT_DIR.rglob("*")} & banned
     assert not found and not list(EXT_DIR.rglob("requirements*.txt"))
+
+
+# --- review round 1: timeouts, the stop marker, real launchctl output ----------------------
+
+
+def test_start_timeout_is_unknown_not_a_failure(data_dir: Path, launchd) -> None:
+    launchd.state, launchd.timeout = "not running", {"kickstart"}
+    out = cli.run(["start"], now=et(MON, "09:20"))
+    assert out["started"] == "unknown"
+    assert cli.main(["start"]) == 0  # exit 1 would promise nothing happened
+
+
+def test_stop_timeout_is_unknown_and_marks_stopped(data_dir: Path, launchd) -> None:
+    launchd.timeout = {"kill"}
+    out = cli.run(["stop"], now=et(MON, "12:00"))
+    assert out["stopped"] == "unknown"
+    assert (data_dir / "stopped_day").read_text() == MON
+
+
+def test_stop_then_watch_stays_quiet_until_start(db: PaperDB, reports, launchd) -> None:
+    db.session("s1", MON, "running", heartbeat=et(MON, "12:00"))
+    cli.run(["stop"], now=et(MON, "12:00"))
+    # the runner never wrote `aborted`: the row is stale, but the owner stopped it
+    assert cli.run(["watch"], now=et(MON, "12:35"))["down"] is False and reports == []
+    # the next trading day the marker no longer applies
+    assert cli.run(["watch"], now=et(TUE, "09:50"))["down"] is True
+    launchd.state = "not running"
+    cli.run(["start"], now=et(MON, "12:40"))
+    assert not (db.path.parent / "ext-data" / "stopped_day").exists()
+
+
+def test_failed_stop_leaves_no_marker(data_dir: Path, launchd) -> None:
+    launchd.fail = {"kill": 3}
+    assert cli.main(["stop"]) == 1
+    assert not (data_dir / "stopped_day").exists()
+
+
+def test_launchd_state_parses_real_print_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The real wrapper and parser, with subprocess.run faked: nested blocks repeat `state`
+    and `pid`-like keys, and only the service's own (first) values count."""
+    real = (
+        "gui/501/com.tradejev.paper = {\n"
+        "\tactive count = 1\n"
+        "\tpath = /Users/justinhe/Library/LaunchAgents/com.tradejev.paper.plist\n"
+        "\ttype = LaunchAgent\n"
+        "\tstate = running\n\n"
+        "\tprogram = /usr/bin/python3\n"
+        "\tpid = 812\n"
+        "\tendpoints = {\n\t}\n"
+        "\tjob state = running\n"
+        "\tlast exit code = (never exited)\n"
+        "\tspawn type = daemon (3)\n"
+        "\tsockets = {\n\t\tstate = active\n\t}\n"
+        "}\n"
+    )
+    seen: list[list[str]] = []
+
+    def fake_run(argv, **kw):
+        seen.append(argv)
+        assert kw["timeout"] == cli.LAUNCHCTL_TIMEOUT_S and kw["stdin"] is subprocess.DEVNULL
+        return subprocess.CompletedProcess(argv, 0, real, "")
+
+    monkeypatch.undo()  # drop the autouse fake launchctl: exercise the real wrapper
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    st = cli.launchd_state(cli.Config())
+    assert st == {"loaded": True, "label": "com.tradejev.paper", "state": "running", "pid": 812}
+    assert seen == [["/bin/launchctl", "print", f"gui/{os.getuid()}/com.tradejev.paper"]]
+
+
+def test_unknown_policy_echo_is_clipped(db: PaperDB) -> None:
+    seed_day(db, "s1", MON)
+    out = cli.run(["trades", "--date", MON, "--policy", "x" * 10000, "--limit", "0"], now=et(MON, "17:00"))
+    assert len(json.dumps(out)) <= 4096 and out["trades"] == []
+
+
+def test_watch_schedule_catches_missing_at_0935() -> None:
+    assert '"5,20,35,50 9-15 * * 1-5"' in (EXT_DIR / "resonant.yaml").read_text()

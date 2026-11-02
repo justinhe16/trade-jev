@@ -50,6 +50,8 @@ L3 would act on a model's guess without asking. A misread "stop" would then end 
 
 The spec does not forbid running `launchctl` from `cli.py`. A tool's argv[0] must be a `.py` file in the extension, which `./cli.py` is, and `cli.py` runs `/bin/launchctl` by absolute path. The deferred extension sandbox design in Resonant's docs would deny `launchctl`. If that sandbox ships, start and stop would need an allowance or would have to move.
 
+If `launchctl` times out (10 s), start and stop return `"unknown"` with exit 0 and don't fail, because the action may have gone through. Resonant takes exit 1 to mean nothing happened.
+
 If the plist sets `KeepAlive`, launchd restarts the job after SIGTERM. In that case the runner should treat SIGTERM as "aborted for today" and exit cleanly.
 
 ## Jobs
@@ -57,7 +59,7 @@ If the plist sets `KeepAlive`, launchd restarts the job after SIGTERM. In that c
 | Job | When (America/New_York) | Reports |
 |---|---|---|
 | `close-summary` | 16:10 weekdays (catch-up 6 h) | `trade-jev/pnl/<day>`, urgency **normal** (the hourly pulse). Title example: `Paper NQ: Jev +$420 (6 trades), hold −$110, random +$30`, with ` (crashed)` and similar appended when the day didn't finish `done`. `state` holds the day, the status, Jev's P&L rounded to $50 and Jev's trade count, so a re-run on the same day isn't news. Nothing is reported on a holiday or a day with no session. A caught-up run reports the day it was due for (`RESONANT_JOB_DUE_AT`). |
-| `watch` | every 15 min, 09:00–16:45 weekdays. It checks only between 09:30 and 16:00 on NYSE trading days. | `trade-jev/down`, urgency **urgent** (texted at once), while today's latest session is `crashed` or stale, or when no session exists by 09:35 (first caught at the 09:45 run). Once healthy again it sends one `clear` (texted as ✓). `done`, `aborted` (stopped on purpose) and `holiday` are healthy. The clear is sent only after a down report, which is remembered in `$RESONANT_EXT_DATA/watch_state.json`, so a healthy day sends nothing. |
+| `watch` | at :05, :20, :35 and :50, 09:05–15:50 weekdays. It checks only between 09:30 and 16:00 on NYSE trading days, so the first check is 09:35 and the last is 15:50. | `trade-jev/down`, urgency **urgent** (texted at once), while today's latest session is `crashed` or stale, or when no session exists by 09:35 (caught at the 09:35 run). Once healthy again it sends one `clear` (texted as ✓). `done`, `aborted` (stopped on purpose) and `holiday` are healthy. After `trade_jev_stop`, watch stays quiet for the rest of that ET day even if the runner never wrote `aborted`. The marker is `$RESONANT_EXT_DATA/stopped_day`, and `trade_jev_start` removes it. The clear is sent only after a down report, which is remembered in `$RESONANT_EXT_DATA/watch_state.json`, so a healthy day sends nothing. |
 
 The manifest grants `report: {max_urgency: urgent}` and a 5-minute `health` check (`./cli.py health`). The check is healthy when the config parses and the DB, if present, opens read-only. A missing DB is healthy.
 

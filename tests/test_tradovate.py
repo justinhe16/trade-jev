@@ -66,6 +66,7 @@ def test_book_row_sorts_pads_and_caps():
     many = tv.book_row([(1000 - i, 1) for i in range(30)], [(1001 + i, 2) for i in range(30)])
     assert many[0] == list(range(1000, 990, -1)) and many[2] == list(range(1001, 1011))
     assert tv.book_row([], asks) is None and tv.book_row(bids, []) is None
+    assert tv.book_row([(100, 1)], [(100, 1)]) is None and tv.book_row([(101, 1)], [(100, 1)]) is None  # locked / crossed
 
 
 def test_parse_dom_documented_form_with_float_sizes():
@@ -258,7 +259,8 @@ def test_login_errors_are_classified_and_redacted(capsys):
         ((200, {"errorText": "Incorrect app credentials sec-SECRET: cid not registered"}), tv.ApiKeyRejected,
          "this account has no API key: cid/sec rejected"),
         ((200, {"errorText": "Application is not registered"}), tv.ApiKeyRejected, "no API key"),
-        ((403, {}), tv.ApiKeyRejected, "no API key: cid/sec rejected (HTTP 403"),
+        ((403, {}), tv.AuthError, "login rejected (HTTP 403"),     # a bare 4xx is not "no API key"
+        ((401, {}), tv.AuthError, "login rejected (HTTP 401"),
         ((200, {"errorText": "Account is locked sec-SECRET"}), tv.AuthError, "login failed"),
     ]
     for resp, kind, text in cases:
@@ -292,6 +294,38 @@ def test_second_penalty_and_captcha_fail_clearly():
     assert a.slept == []
 
 
+def test_long_penalty_is_reported_not_slept():
+    a = auth_with(FakeHttp(login=[(200, {"p-ticket": "T", "p-time": 3600, "p-captcha": False})]))
+    with pytest.raises(tv.AuthError, match="more than 120s"):
+        asyncio.run(a.login())
+    assert a.slept == []
+    b = auth_with(FakeHttp(login=[(200, {"p-ticket": "T", "p-time": 120, "p-captcha": False}), login_ok()]))
+    asyncio.run(b.login())
+    assert b.slept == [120.0]
+
+
+def test_login_and_renew_never_run_concurrently():
+    active, peak = [0], [0]
+
+    class Slow(FakeHttp):
+        async def __call__(self, method, url, headers, body):
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+            await asyncio.sleep(0.01)
+            active[0] -= 1
+            self.login_q = [login_ok()]
+            self.renew_q = [(200, {"accessToken": "ACC-2"})]
+            return await super().__call__(method, url, headers, body)
+
+    async def go():
+        a = auth_with(Slow())
+        a.expires_at = 0
+        a.access_token = "ACC-1"
+        await asyncio.gather(a.login(), a.ensure_fresh(), a.renew_or_login(), a.login())
+    asyncio.run(go())
+    assert peak[0] == 1
+
+
 def test_renew_keeps_the_old_md_token_and_failure_falls_back_to_login(capsys):
     exp = login_ok(minutes=90)[1]["expirationTime"]
     http = FakeHttp(login=[login_ok(), login_ok("ACC-2", "MD-1")],
@@ -305,6 +339,7 @@ def test_renew_keeps_the_old_md_token_and_failure_falls_back_to_login(capsys):
     assert http.calls[1][:2] == ("GET", "https://demo.tradovateapi.com/v1/auth/renewaccesstoken")
     assert http.calls[1][2]["Authorization"] == "Bearer ACC-1"
     assert (a.access_token, a.md_token) == ("ACC-2", "MD-1")   # mdAccessToken absent: kept
+    assert a.redact("x ACC-1 y ACC-2") == "x *** y ***"        # the replaced token stays redacted
     now[0] = a.expires_at - 60
     asyncio.run(a.ensure_fresh())                              # renew fails -> a full login
     assert [c[1].rsplit("/", 1)[1] for c in http.calls[2:]] == ["renewaccesstoken", "accesstokenrequest"]
@@ -411,8 +446,8 @@ def market_script(start="09:29:20", stop="09:37:10", step_s=2, history=True):
 class FakeMd:
     """Local md websocket: o / authorize / [] / subscribeDOM / getChart / cancelChart, then a script."""
 
-    def __init__(self, scripts, accept=("MD-1", "ACC-1")):
-        self.scripts, self.accept = scripts, set(accept)
+    def __init__(self, scripts, accept=("MD-1", "ACC-1"), refuse=()):
+        self.scripts, self.accept, self.refuse = scripts, set(accept), set(refuse)
         self.n = 0
         self.requests: list[tuple[int, str, str]] = []
         self.auths: list[tuple[int, str]] = []
@@ -460,6 +495,8 @@ class FakeMd:
                     self.auths.append((idx, body))
                     if body not in self.accept:
                         reply = {"s": 401, "i": int(id_), "d": "bad token"}
+                elif endpoint in self.refuse:
+                    reply = {"s": 403, "i": int(id_), "d": "not entitled ACC-1"}
                 elif endpoint == "md/getChart":
                     reply["d"] = {"historicalId": 11 + idx * 10, "realtimeId": 12 + idx * 10}
                     subs.add("chart")
@@ -613,6 +650,37 @@ def test_reconnect_reauthorizes_resubscribes_and_ignores_replayed_history():
     assert len(gc) == 2
 
 
+def test_md_refusal_fails_fast_with_a_clear_redacted_error(capsys):
+    async def go(**kw):
+        async with FakeMd([[]], **kw) as md:
+            src = make_source(md.url)
+            with pytest.raises(tv.MdRefused) as e:
+                await drain(src, limit_s=15)
+            return e.value, md
+    err, md = asyncio.run(go(refuse={"md/subscribeDOM"}))
+    assert str(err).startswith("Tradovate market data refused:") and "no CME market-data entitlement" in str(err)
+    assert "not entitled ***" in str(err) and "ACC-1" not in str(err)
+    assert md.n == tv.MAX_REFUSALS
+    err, md = asyncio.run(go(accept=[]))                    # authorize refused on every token
+    assert "refused" in str(err) and md.n == tv.MAX_REFUSALS * 2   # md token, then access token, per attempt
+    assert not any(s in capsys.readouterr().out for s in SECRETS)
+
+
+@pytest.mark.parametrize("healthy_s, expect", [(0.0, [0.05, 0.05, 0.05]), (1000.0, [0.05, 0.1, 0.2])])
+def test_backoff_resets_only_after_a_healthy_connection(monkeypatch, capsys, healthy_s, expect):
+    monkeypatch.setattr(tv, "HEALTHY_S", healthy_s)
+    drop = lambda idx: [*market_script(start="09:30:00", stop="09:30:06", step_s=2)[0](idx), "DROP"]  # noqa: E731
+    final = market_script(start="09:30:10", stop="09:37:10", step_s=20)[0]
+
+    async def go():
+        async with FakeMd([drop, drop, drop, final]) as md:
+            await drain(make_source(md.url))
+    asyncio.run(go())
+    import re
+    delays = [float(x) for x in re.findall(r"reconnecting in ([\d.]+)s", capsys.readouterr().out)]
+    assert delays[:3] == expect
+
+
 def test_server_shutdown_event_triggers_a_reconnect():
     sd = [{"e": "shutdown", "d": {"reasonCode": "X", "reason": "restart"}}]
     ok = market_script(start="09:30:00", stop="09:37:10", step_s=20)[0]
@@ -737,8 +805,9 @@ def no_feed(monkeypatch):
 
 
 @pytest.mark.parametrize("env, argv, reason, source", [
-    ({"TRADE_JEV_SOURCE": "off"}, [], "TRADE_JEV_SOURCE=off", "databento"),
-    ({"TRADE_JEV_SOURCE": "off", **{k: v for k, v in ENV.items()}}, ["--source", "tradovate"], "TRADE_JEV_SOURCE=off", "tradovate"),
+    ({"TRADE_JEV_SOURCE": "off"}, [], "TRADE_JEV_SOURCE=off", "off"),
+    ({"TRADE_JEV_SOURCE": "off", "TRADOVATE_USERNAME": "u"}, ["--source", "tradovate"],     # explicit --source beats off
+     "tradovate credentials missing: TRADOVATE_PASSWORD, TRADOVATE_CID, TRADOVATE_SEC, TRADOVATE_DEVICE_ID", "tradovate"),
     ({"TRADE_JEV_SOURCE": "tradovate", "TRADOVATE_USERNAME": "u", "TRADOVATE_PASSWORD": "pw-SECRET"}, [],
      "tradovate credentials missing: TRADOVATE_CID, TRADOVATE_SEC, TRADOVATE_DEVICE_ID", "tradovate"),
 ])
@@ -752,6 +821,16 @@ def test_skipped_day_exits_0_with_a_skipped_row_and_no_feed(sandbox, db, no_feed
     out = capsys.readouterr().out
     assert reason in out and "pw-SECRET" not in out and "pw-SECRET" not in json.dumps(s)
     assert not (sandbox / "runs").exists()
+
+
+def test_explicit_source_on_the_command_line_wins_over_env_off(sandbox, db, no_feed, monkeypatch):  # noqa: F811
+    monkeypatch.setenv("TRADE_JEV_SOURCE", "off")
+    monkeypatch.setattr(live, "now_et", lambda: datetime(2026, 11, 2, 9, 15, tzinfo=live.ET))
+    with pytest.raises(SystemExit):  # not skipped: it goes on to the databento path and wants its key
+        asyncio.run(live.amain(["--exit-at-close", "--no-open", "--source", "databento"]))
+    assert not db.exists()  # no skipped row
+    assert live.skip_reason("databento", {"TRADE_JEV_SOURCE": "off"}, explicit=True) is None
+    assert live.skip_reason("databento", {"TRADE_JEV_SOURCE": "off"}) == "TRADE_JEV_SOURCE=off"
 
 
 def test_skipped_never_overwrites_a_real_session_but_replaces_a_skip(db):  # noqa: F811
@@ -893,7 +972,8 @@ def test_late_start_warms_up_with_hold_decisions(tradovate_env, db, monkeypatch,
     assert settings["late_start_warmup_s"] == 60 and settings["warmup_until_et"] == until
     decs = rows(db, "SELECT * FROM paper_decisions ORDER BY t_ns")
     assert len(decs) == n_decisions
-    warm = [d for d in decs if d["error"] == "warmup"]
+    warm = [d for d in decs if d["raw_action"] == "WARMUP"]
+    assert all(d["error"] is None for d in decs)         # warm-up is not an error (the viewer's error count)
     assert [d["time_et"] for d in decs][:2] == (["09:30:00", "09:30:15"] if n_decisions == 8 else ["09:31:15", "09:31:30"])
     assert len(warm) == (2 if n_decisions == 8 else 3)
     assert all(d["action"] == "HOLD" and json.loads(d["probs_json"]) == {} and d["jev_ms"] == 0 for d in warm)

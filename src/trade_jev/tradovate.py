@@ -48,6 +48,9 @@ MD_URL = "wss://md.tradovateapi.com/v1/websocket"
 MD_DEMO_URL = "wss://md-demo.tradovateapi.com/v1/websocket"  # third-party sources only: fallback for demo
 HEARTBEAT_S = 2.5        # the client must send "[]" this often
 IDLE_S = 15.0            # no frame (the server heartbeats too) for this long -> the connection is dead
+MAX_PENALTY_S = 120     # a login penalty longer than this is reported, not slept through
+HEALTHY_S = 60.0        # a connection must deliver data this long before the reconnect backoff resets
+MAX_REFUSALS = 5        # consecutive md refusals with no book data ever received -> give up (crashed)
 RENEW_MARGIN_S = 15 * 60  # renew the access token this long before it expires (tokens live 90 min)
 HINT_NO_API = ("API Access requires a Tradovate API subscription; prop-firm evaluation accounts may not "
                "allow it: ask the firm / Tradovate.")
@@ -82,6 +85,10 @@ class CaptchaRequired(AuthError):
 
 class RequestFailed(TradovateError):
     pass
+
+
+class MdRefused(TradovateError):
+    """The md socket authorized or subscribed with a non-200 answer (not a network drop)."""
 
 
 def redact(text: str, secrets) -> str:
@@ -185,12 +192,14 @@ class TradovateAuth:
         self.has_market_data: bool | None = None
         self.user_id = None
         self._renew_task: asyncio.Task | None = None
+        self._lock = asyncio.Lock()  # login / renew never run concurrently
+        self._old_tokens: deque = deque(maxlen=4)  # kept in the redaction set after a renew
 
     def __repr__(self) -> str:
         return f"TradovateAuth(env={self.cfg.env!r}, logged_in={bool(self.access_token)})"
 
     def secrets(self) -> list[str]:
-        return [*self.cfg.secrets(), self.access_token or "", self.md_token or ""]
+        return [*self.cfg.secrets(), self.access_token or "", self.md_token or "", *self._old_tokens]
 
     def redact(self, text) -> str:
         return redact(text, self.secrets())
@@ -220,18 +229,29 @@ class TradovateAuth:
             raise ApiKeyRejected(f"this account has no API key: cid/sec rejected ({text})")
         if err and CRED_RE.search(text):
             raise BadCredentials(f"bad credentials: Tradovate rejected the username/password ({text})")
-        if not err and 400 <= status < 500:
-            raise ApiKeyRejected(f"this account has no API key: cid/sec rejected (HTTP {status}, no error text)")
-        raise AuthError(f"login failed: {text or 'HTTP ' + str(status)}")
+        if not err:
+            raise AuthError(f"login rejected (HTTP {status}, no error text)")
+        raise AuthError(f"login failed: {text}")
 
     async def login(self) -> None:
+        async with self._lock:
+            await self._login()
+
+    def _penalty_wait(self, d: dict) -> float:
+        wait = float(d.get("p-time") or 0)
+        if wait > MAX_PENALTY_S:
+            raise AuthError(f"Tradovate asks to wait {wait:g}s before another login (more than {MAX_PENALTY_S}s): "
+                            "retry later")
+        return wait
+
+    async def _login(self) -> None:
         body = self._login_body()
         d = await self._post_login(body)
         if "p-ticket" in d or "p-time" in d:
             if d.get("p-captcha"):
                 raise CaptchaRequired("Tradovate wants a captcha: log in once by hand in the Tradovate web app "
                                       "(same device), wait ~1h, then retry")
-            wait = float(d.get("p-time") or 0)
+            wait = self._penalty_wait(d)
             _log(f"login rate-limited: waiting {wait:g}s, then retrying once")
             await self.sleep(wait)
             d = await self._post_login({**body, "p-ticket": d.get("p-ticket")})
@@ -247,6 +267,7 @@ class TradovateAuth:
         tok = d.get("accessToken")
         if not tok:
             raise AuthError("response had no accessToken")
+        self._old_tokens.extend(t for t in (self.access_token, self.md_token) if t and t not in (tok, d.get("mdAccessToken")))
         self.access_token = tok
         if d.get("mdAccessToken"):
             self.md_token = d["mdAccessToken"]
@@ -268,19 +289,24 @@ class TradovateAuth:
             raise AuthError(f"renew failed: {self.redact(d.get('errorText') or 'HTTP ' + str(status))}")
         self._apply(d, full=False)
 
-    async def renew_or_login(self) -> None:
+    async def _renew_or_login(self) -> None:
         try:
             await self.renew()
             _log("token renewed")
         except Exception as e:  # noqa: BLE001 — any renewal failure -> a full login
             _log(f"renew failed ({self.redact(e)}); logging in again")
-            await self.login()
+            await self._login()
+
+    async def renew_or_login(self) -> None:
+        async with self._lock:
+            await self._renew_or_login()
 
     async def ensure_fresh(self) -> None:
-        if not self.access_token:
-            await self.login()
-        elif self.clock() >= self.expires_at - RENEW_MARGIN_S:
-            await self.renew_or_login()
+        async with self._lock:
+            if not self.access_token:
+                await self._login()
+            elif self.clock() >= self.expires_at - RENEW_MARGIN_S:
+                await self._renew_or_login()
 
     def start_renew_loop(self) -> None:
         if self._renew_task is None:
@@ -391,7 +417,7 @@ def book_row(bids: list, asks: list) -> tuple[list, list, list, list] | None:
         return best, d
     bp, bd = side(bids, -1)
     ap, ad = side(asks, 1)
-    if not bp or not ap:
+    if not bp or not ap or bp[0] >= ap[0]:  # an empty side, or a crossed / locked book: unusable
         return None
     bs = [bd[p] for p in bp]
     as_ = [ad[p] for p in ap]
@@ -658,7 +684,9 @@ class TradovateSource:
         # counters (smoke test, logs)
         self.dom_updates = self.ticks = self.buys = self.sells = self.unknown = self.reconnects = 0
         self.buy_volume = self.sell_volume = self.unknown_volume = 0
-        self.dropped_trades = self.dom_empty = self.unknown_events = 0
+        self.dropped_trades = self.dom_empty = self.unknown_events = 0  # dom_empty: empty side or crossed book
+        self._refusals = 0
+        self._first_data_t: float | None = None
         self.max_bid_levels = self.max_ask_levels = 0
         self.bid_levels: list[int] = []
         self.ask_levels: list[int] = []
@@ -709,6 +737,8 @@ class TradovateSource:
             return
         self.dom_updates += 1
         self._healthy = True
+        if self._first_data_t is None:
+            self._first_data_t = time.monotonic()
         if book is None:
             self.dom_empty += 1
             return
@@ -772,6 +802,7 @@ class TradovateSource:
         if self._good:
             attempts.sort(key=lambda a: (a[0], a[1]) != self._good)
         last = "no tokens"
+        refused_only = bool(attempts)  # every failure so far was a non-200 authorize answer
         dead_urls: set[str] = set()
         for url, kind, token in attempts:
             if url in dead_urls:
@@ -781,6 +812,7 @@ class TradovateSource:
             except Exception as e:  # noqa: BLE001
                 last = f"{self._host(url)}: connect failed ({type(e).__name__})"
                 _log(last)
+                refused_only = False
                 dead_urls.add(url)
                 continue
             sock = MdSocket(ws, self._on_event)
@@ -792,6 +824,7 @@ class TradovateSource:
                 if not isinstance(e, Exception):
                     await sock.close()
                     raise
+                refused_only = refused_only and isinstance(e, RequestFailed)
                 last = f"{self._host(url)}: authorize with {kind} failed ({self.auth.redact(f'{type(e).__name__}: {e}')})"
                 _log(last)
                 await sock.close()
@@ -800,7 +833,7 @@ class TradovateSource:
                 _log(f"md socket authorized: host {self._host(url)}, token {kind}")
             self._good, self.md_host, self.md_token_kind = (url, kind), self._host(url), kind
             return sock
-        raise TradovateError(f"md connect failed: {last}")
+        raise (MdRefused if refused_only else TradovateError)(f"md connect failed: {last}")
 
     async def _subscribe(self, sock: MdSocket) -> int | None:
         self._decoder = TickDecoder()  # new chart ids; history replayed after a reconnect is ignored (eoh gate)
@@ -830,9 +863,13 @@ class TradovateSource:
         sock = await self._connect()
         realtime_id = None
         self._healthy = False
+        self._first_data_t = None
         t0 = time.monotonic()
         try:
-            realtime_id = await self._subscribe(sock)
+            try:
+                realtime_id = await self._subscribe(sock)
+            except RequestFailed as e:
+                raise MdRefused(self.auth.redact(e)) from None
             waiter = asyncio.create_task(sock.dropped.wait())
             stopper = asyncio.create_task(self._stop.wait())
             try:
@@ -867,12 +904,18 @@ class TradovateSource:
                     _log(f"auth problem: {self.auth.redact(e)}")
                 except asyncio.CancelledError:
                     raise
+                except MdRefused as e:
+                    self._refusals += 1
+                    _log(f"md refused ({self._refusals}): {self.auth.redact(e)}")
+                    if self.dom_updates == 0 and self._refusals >= MAX_REFUSALS:
+                        raise MdRefused(f"Tradovate market data refused: {self.auth.redact(e)} - likely no CME "
+                                        "market-data entitlement for API access") from None
                 except Exception as e:  # noqa: BLE001
                     _log(f"connection failed: {self.auth.redact(f'{type(e).__name__}: {e}')}")
                 if self._stop.is_set():
                     break
-                if self._healthy:
-                    delay = self.backoff_s
+                if self._first_data_t is not None and time.monotonic() - self._first_data_t >= HEALTHY_S:
+                    delay, self._refusals = self.backoff_s, 0  # healthy long enough: a fresh backoff
                 self.reconnects += 1
                 _log(f"reconnecting in {delay:g}s")
                 try:
@@ -931,4 +974,4 @@ class TradovateSource:
                 "max_bid_levels": self.max_bid_levels, "max_ask_levels": self.max_ask_levels,
                 "median_bid_levels": median(self.bid_levels) if self.bid_levels else 0,
                 "median_ask_levels": median(self.ask_levels) if self.ask_levels else 0,
-                "dropped_trades": self.dropped_trades, "unknown_events": self.unknown_events}
+                "dropped_trades": self.dropped_trades, "dom_unusable": self.dom_empty, "unknown_events": self.unknown_events}

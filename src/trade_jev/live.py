@@ -467,7 +467,7 @@ class Engine:
             bk = self.books[name]
             before = bk.pos.side
             ctx = Context(self.day, t, row, prev, bk.pos)
-            d = Decision("HOLD", {}, None) if warm else await p(ctx)
+            d = Decision("HOLD", {}, None, raw_action="WARMUP") if warm else await p(ctx)
             rec = {"day": self.day.day, "t_ns": t, "time_et": ns_to_et(t), "mid": ctx.mid,
                    "position": before, "action": d.action, "raw_action": d.raw_action, "probs": d.probs,
                    "tokens": d.tokens, "cached": d.cached, "state": d.state}
@@ -480,7 +480,7 @@ class Engine:
                     self.jev_ms.append(ms)
                 if self.answer_latency:
                     send_ns = t + int(ms * 1e6)
-                rec.update(jev_ms=round(ms, 1), send_ns=send_ns, error="warmup" if warm else self.guard.last_error,
+                rec.update(jev_ms=round(ms, 1), send_ns=send_ns, error=None if warm else self.guard.last_error,
                            streak=self.streak())
             self.results[name].decisions.append(rec)
             side = {"BUY": 1, "SELL": -1}.get(d.action, 0)
@@ -1032,9 +1032,10 @@ def source_from_env(env=os.environ) -> str:
     return (env.get("TRADE_JEV_SOURCE") or "databento").strip().lower()
 
 
-def skip_reason(source: str, env=os.environ) -> str | None:
-    """Why today's live run must not start a feed (names only, never secret values), or None."""
-    if source_from_env(env) == "off":
+def skip_reason(source: str, env=os.environ, explicit: bool = False) -> str | None:
+    """Why today's live run must not start a feed (names only, never secret values), or None.
+    TRADE_JEV_SOURCE=off is only a default: an explicit --source (`explicit`) wins over it."""
+    if source_from_env(env) == "off" and not explicit:
         return "TRADE_JEV_SOURCE=off"
     if source == "tradovate":
         missing = missing_credentials(env)
@@ -1075,6 +1076,7 @@ async def amain(argv: list[str] | None = None) -> int:
     ap.add_argument("--paper-db", action=argparse.BooleanOptionalAction, default=None,
                     help="record the session in the paper DB (default: on for live sessions that save)")
     args = ap.parse_args(argv)
+    explicit_source = args.source is not None
     env_source = source_from_env()
     if env_source not in (*SOURCES, "off"):
         ap.error(f"TRADE_JEV_SOURCE={env_source!r}: use databento, tradovate or off")
@@ -1113,10 +1115,11 @@ async def amain(argv: list[str] | None = None) -> int:
             if use_paper:
                 paperdb.record_holiday(f"live-{day}", day, symbol, closed)
             return 0
-        if (why := skip_reason(args.source)) is not None:
+        if (why := skip_reason(args.source, explicit=explicit_source)) is not None:
             print(f"{day}: skipped ({why}); no feed started", flush=True)
             if use_paper:
-                paperdb.record_skip(f"live-{day}", day, symbol, "skipped", why, source=args.source)
+                paperdb.record_skip(f"live-{day}", day, symbol, "skipped", why,
+                                    source="off" if why == "TRADE_JEV_SOURCE=off" else args.source)
             return 0
         open_ns = et_to_ns(day, cfg.start_et) - secs(max(LOOKBACKS) + 60)
         start_ns = None

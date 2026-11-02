@@ -125,13 +125,14 @@ function renderDecs(d) {
   const all = d.decisions;
   const pick = { all: () => true, acted: (x) => x.action !== "HOLD", errors: (x) => !!x.error }[S.dfilter] || (() => true);
   const rows = all.filter(pick).reverse();
-  $("dcount").textContent = `· ${all.length.toLocaleString()} answers${all.length ? `, ${all.filter((x) => x.action !== "HOLD").length} acted on, ${all.filter((x) => x.error).length} errors` : ""}`;
+  $("dcount").textContent = `· ${all.length.toLocaleString()} answers${all.length ? `, ${all.filter((x) => x.action !== "HOLD").length} acted on, ${all.filter((x) => x.error).length} errors${all.some((x) => x.raw_action === "WARMUP") ? `, ${all.filter((x) => x.raw_action === "WARMUP").length} warm-up` : ""}` : ""}`;
   $("dfilter").innerHTML = [["all", "All"], ["acted", "Acted on"], ["errors", "Errors"]]
     .map(([k, l]) => `<button class="btn" data-f="${k}" aria-pressed="${S.dfilter === k}">${l}</button>`).join("");
   $("ddecs").innerHTML = rows.length ? `<thead><tr><th>Time ET</th><th>Mid</th><th>Answer</th><th>p</th><th>Acted</th><th>Position</th><th>ms</th><th>Error</th></tr></thead><tbody>` +
     rows.map((x) => {
       const raw = x.raw_action || x.action, p = x.probs?.[raw];
-      return `<tr><td>${esc(x.time_et)}</td><td>${fmtPx(x.mid)}</td><td>${esc(raw)}</td><td>${p != null ? (p * 100).toFixed(0) + "%" : "–"}</td>
+      const warm = raw === "WARMUP";  // Tradovate late start: HOLD without a Jev call, not an error
+      return `<tr><td>${esc(x.time_et)}</td><td>${fmtPx(x.mid)}</td><td${warm ? ' class="muted" title="late-start warm-up: no Jev call"' : ""}>${warm ? "warmup" : esc(raw)}</td><td>${p != null ? (p * 100).toFixed(0) + "%" : "–"}</td>
         <td>${x.action !== "HOLD" ? "<b>" + esc(x.action) + "</b>" : "–"}</td><td>${x.position > 0 ? "long" : x.position < 0 ? "short" : "flat"}</td>
         <td>${x.jev_ms != null ? Math.round(x.jev_ms) : "–"}</td><td style="text-align:left" class="muted">${esc(x.error || "")}</td></tr>`;
     }).join("") + "</tbody>"

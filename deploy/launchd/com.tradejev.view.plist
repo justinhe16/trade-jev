@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- The viewer (Replay / Live / Paper / Docs), always on at http://127.0.0.1:8765 (localhost only).
+     Installed by scripts/install_launchd.sh (fills in __UV__). -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.tradejev.view</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__UV__</string>
+        <string>run</string>
+        <string>python</string>
+        <string>-m</string>
+        <string>trade_jev.view</string>
+        <string>--no-open</string>
+        <string>--port</string>
+        <string>8765</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/justinhe/trade-jev</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__UV_DIR__:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>StandardOutPath</key>
+    <string>/Users/justinhe/trade-jev/logs/view.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/justinhe/trade-jev/logs/view.log</string>
+</dict>
+</plist>

@@ -2,7 +2,9 @@
 
   uv run python -m trade_jev.view            # → http://localhost:8765
 
-Serves viz/index.html (Replay), viz/live.html (Live), viz/docs.html (Docs) plus a small JSON API:
+Serves viz/index.html (Replay), viz/live.html (Live), viz/paper.html (Paper), viz/docs.html (Docs)
+plus a small JSON API. It needs no run and no live session: on its own it serves every tab, and
+/paper reads the paper DB (data/paper.db or $TRADE_JEV_PAPER_DB) read-only.
   GET /api/runs                  runs from runs/index.jsonl that have stored Jev answers
   GET /api/day?run=<id>&day=<d>  one day's price track + stored answers (built once, cached)
   GET /api/live/state            live session snapshot ({"active": false} without trade_jev.live)
@@ -11,6 +13,8 @@ Serves viz/index.html (Replay), viz/live.html (Live), viz/docs.html (Docs) plus 
   POST /api/live/fill            log a fill {action, price, contracts, note} (manual, or from the executor)
   POST /api/live/arm             arm / disarm the executor {armed}
   POST /api/live/executor        executor status report (trade_jev.executor posts this every ~2s)
+  GET /api/paper/sessions        paper sessions, newest day first, with per-policy totals
+  GET /api/paper/session?id=<s>  one paper session: settings, totals, trades, Jev decision log
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ import argparse
 import gzip
 import json
 import queue
+import sqlite3
 import threading
 import webbrowser
 from http import HTTPStatus
@@ -28,6 +33,7 @@ from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 
+from trade_jev import paperdb
 from trade_jev.data import TICK, POINT_VALUE, secs
 from trade_jev.replay import RunDay, load_market, load_runs
 
@@ -204,6 +210,17 @@ class Handler(BaseHTTPRequestHandler):
                 self._send((VIZ / "live.html").read_bytes(), "text/html; charset=utf-8")
             elif url.path in ("/docs", "/docs.html"):
                 self._send((VIZ / "docs.html").read_bytes(), "text/html; charset=utf-8")
+            elif url.path in ("/paper", "/paper.html"):
+                self._send((VIZ / "paper.html").read_bytes(), "text/html; charset=utf-8")
+            elif url.path == "/paper.js":
+                self._send((VIZ / "paper.js").read_bytes(), "text/javascript; charset=utf-8")
+            elif url.path == "/api/paper/sessions":
+                self._json(paperdb.list_sessions())
+            elif url.path == "/api/paper/session":
+                s = paperdb.get_session(q.get("id", ""))
+                if s is None:
+                    return self._error(HTTPStatus.NOT_FOUND, f"no paper session {q.get('id', '')!r}")
+                self._json(s)
             elif url.path == "/api/live/state":
                 self._json(live.state(int(q.get("window", 3600))) if live else {"active": False})
             elif url.path == "/api/live/stream":
@@ -230,6 +247,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._error(HTTPStatus.NOT_FOUND, "not found")
         except KeyError as e:
             self._error(HTTPStatus.NOT_FOUND, f"no stored answers for {e}")
+        except sqlite3.Error as e:
+            self._error(HTTPStatus.SERVICE_UNAVAILABLE, f"paper DB: {e}")
         except BrokenPipeError:
             pass
 
@@ -242,7 +261,7 @@ def main() -> None:
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     srv.daemon_threads = True
     url = f"http://localhost:{args.port}"
-    print(f"viewer → {url}  ({len(list_runs())} runs)  ctrl-c to stop", flush=True)
+    print(f"viewer → {url}  ({len(list_runs())} runs; paper: {url}/paper)  ctrl-c to stop", flush=True)
     if not args.no_open:
         webbrowser.open(url)
     try:

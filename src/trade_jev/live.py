@@ -13,6 +13,12 @@ One live-only difference: the order is sent when Jev answers (t + Jev latency), 
 Both are recorded per decision (`t_ns`, `send_ns`, `jev_ms`).
 
 No orders are placed. A human trades from the screen.
+
+Unattended daily paper trading (deploy/launchd + scripts/run_paper_day.sh):
+  uv run python -m trade_jev.live --exit-at-close --no-open     # exits 0 after the session's outputs
+Weekends and CME full-closure holidays are skipped (exit 0, a `holiday` row). Every live session is
+also recorded in the paper DB (trade_jev.paperdb: sessions, trades as they close, Jev decisions,
+summary), which the viewer's /paper tab reads.
 """
 
 from __future__ import annotations
@@ -24,8 +30,11 @@ import heapq
 import json
 import os
 import queue
+import signal
+import sys
 import threading
 import time
+import traceback
 import webbrowser
 from dataclasses import asdict, fields
 from datetime import date, datetime, timedelta
@@ -36,7 +45,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from trade_jev import ROOT
+from trade_jev import ROOT, paperdb, tradingdays
 from trade_jev.data import (ET, LEVELS, LIVE_DIR, TICK, Day, decision_grid, et_to_ns, list_days,
                             ns_to_et, secs)
 from trade_jev.encode import LOOKBACKS, Context
@@ -563,9 +572,12 @@ class IntentLink:
 class Session:
     def __init__(self, args, cfg: Config, gate: Settings, day: str, symbol: str, source, jev,
                  baselines: list[str], run_dir: Path | None, recorder: Recorder | None,
-                 exec_url: str | None = None):
+                 exec_url: str | None = None, paper: paperdb.Recorder | None = None,
+                 deadline_ns: int | None = None):
         self.args, self.cfg, self.gate, self.source = args, cfg, gate, source
         self.run_dir, self.recorder = run_dir, recorder
+        self.paper = paper              # paper DB writer (trades as they close, Jev decisions)
+        self.deadline_ns = deadline_ns  # wall clock: stop reading the feed after this (early halts)
         self.bus = Bus()
         self.engine = Engine(day, symbol, cfg, gate, jev, baselines,
                              answer_latency=source.live, on_change=self._changed)
@@ -597,6 +609,7 @@ class Session:
             p = run_dir / self.engine.jev_name / "decisions.jsonl"
             p.parent.mkdir(parents=True, exist_ok=True)
             self.dec_fh = p.open("w")
+        self.paper_sent = {n: 0 for n in self.engine.policies}  # trades already written, per policy
         self._rebuild()
 
     # -- feed side
@@ -645,15 +658,21 @@ class Session:
     async def run(self) -> None:
         watchdog = asyncio.create_task(self._watchdog()) if self.source.live else None
         flusher = asyncio.create_task(self._flusher())
+        timeout = max(0.0, (self.deadline_ns - time.time_ns()) / 1e9) if self.deadline_ns else None
+        batches = self.source.batches()
         try:
-            async for b in self.source.batches():
-                self.on_batch(b)
-                await self.engine.feed(b)
-                if self.engine.closed and not self.source.live:
-                    break
-                if self.status == "WAITING" and self.engine.decided:
-                    self.status = "REPLAY" if not self.source.live else "LIVE"
+            async with asyncio.timeout(timeout):  # a feed that goes quiet (13:00 ET halt) can't hang us
+                async for b in batches:
+                    self.on_batch(b)
+                    await self.engine.feed(b)
+                    if self.engine.closed and not self.source.live:
+                        break
+                    if self.status == "WAITING" and self.engine.decided:
+                        self.status = "REPLAY" if not self.source.live else "LIVE"
+        except TimeoutError:
+            print("feed past the session end with no more data; closing the session", flush=True)
         finally:
+            await batches.aclose()
             if watchdog:
                 watchdog.cancel()
             flusher.cancel()
@@ -684,14 +703,40 @@ class Session:
     def _changed(self, kind: str, **kw) -> None:
         e = self.engine
         jn = e.jev_name or "imbalance"
-        if kind == "decision" and self.dec_fh and e.results.get(e.jev_name) and e.results[e.jev_name].decisions:
-            self.dec_fh.write(json.dumps(e.results[e.jev_name].decisions[-1]) + "\n")
-            self.dec_fh.flush()
+        if kind == "decision" and e.results.get(e.jev_name) and e.results[e.jev_name].decisions:
+            last = e.results[e.jev_name].decisions[-1]
+            if self.dec_fh:
+                self.dec_fh.write(json.dumps(last) + "\n")
+                self.dec_fh.flush()
+            if self.paper:
+                self.paper.decision(e.jev_name, last)
+        if self.paper:
+            self._paper_trades()
         if kind in ("fill", "exit", "closed") and (kw.get("policy") in (None, jn)):
             self._update_signal(kind, kw)
         if e.jev_name and kw.get("policy") in (None, e.jev_name):
             self._intent(kind, kw)
         self.dirty = True
+
+    def _paper_trades(self) -> None:
+        """Queue every newly closed trade (stop, target, reversal, session end) of every policy."""
+        for name, r in self.engine.results.items():
+            for t in r.trades[self.paper_sent[name]:]:
+                self.paper.trade(name, t)
+            self.paper_sent[name] = len(r.trades)
+
+    def paper_summary(self) -> list[dict]:
+        """paper_summary rows: one per policy, from the closed trades so far."""
+        e = self.engine
+        out = []
+        for name, r in e.results.items():
+            pnls = [t.pnl for t in r.trades]
+            jev = name == e.jev_name and e.real_jev
+            out.append({"policy": name, "trades": len(pnls), "wins": sum(1 for p in pnls if p > 0),
+                        "pnl": round(sum(pnls), 2), "max_drawdown": paperdb.max_drawdown(pnls),
+                        "jev_calls": e.jev_calls if jev else 0,
+                        "jev_cost_usd": round(e.jev_tokens * JEV_USD_PER_TOKEN, 4) if jev else 0.0})
+        return out
 
     # -- executor link
 
@@ -888,9 +933,14 @@ class Session:
 
 # ---------------------------------------------------------------- server
 
-def serve(session: Session | None, port: int, open_browser: bool) -> ThreadingHTTPServer:
+def serve(session: Session | None, port: int, open_browser: bool) -> ThreadingHTTPServer | None:
+    """The live view in this process. A taken port is a warning, not a crash: the session matters more."""
     from trade_jev.view import Handler
-    srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    try:
+        srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    except OSError as e:
+        print(f"WARNING: no live view (port {port}: {e}); the session runs without it", flush=True)
+        return None
     srv.daemon_threads = True
     srv.live = session
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -920,7 +970,22 @@ def new_run_dir(prefix: str, day: str) -> Path:
     return base if not base.exists() else base.with_name(f"{base.name}-{datetime.now():%H%M%S}")
 
 
-async def amain() -> None:
+def now_et() -> datetime:
+    return datetime.now(ET)
+
+
+async def heartbeat(paper: paperdb.Recorder, every_s: float = 30.0) -> None:
+    """Runs on the event loop, so a hung loop stops the heartbeat and the session shows as dead."""
+    while True:
+        await asyncio.sleep(every_s)
+        paper.heartbeat()
+
+
+def error_text(e: BaseException) -> str:
+    return (f"{type(e).__name__}: {e}\n" + traceback.format_exc(limit=8))[-4000:]
+
+
+async def amain(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Live (or rehearsed) Jev signals on NQ with a local view.")
     ap.add_argument("--symbol", default=None, help="raw Databento symbol, default: NQ front month")
     ap.add_argument("--from-file", metavar="DAY", default=None, help="rehearse on a recorded day (no subscription)")
@@ -943,7 +1008,11 @@ async def amain() -> None:
     ap.add_argument("--no-save", action="store_true", help="don't write runs/ or data/live/")
     ap.add_argument("--exec-url", default=None,
                     help="send order intents to an executor, e.g. http://127.0.0.1:8766 (arm it on the Live page)")
-    args = ap.parse_args()
+    ap.add_argument("--exit-at-close", action="store_true",
+                    help="exit 0 once the session's outputs are written (and when there is no session today)")
+    ap.add_argument("--paper-db", action=argparse.BooleanOptionalAction, default=None,
+                    help="record the session in the paper DB (default: on for live sessions that save)")
+    args = ap.parse_args(argv)
 
     cfg = Config(**{f.name: getattr(args, f.name) for f in fields(Config)})
     gate = Settings(args.min_conf, args.agree, args.min_hold, cfg.stop_ticks, cfg.target_ticks)
@@ -952,8 +1021,9 @@ async def amain() -> None:
             (backtest.cadence_s, backtest.start_et, backtest.end_et, backtest.latency_ms):
         print("WARNING: the timing differs from the backtest (15s grid from 09:30:00 ET, 250ms latency); "
               "the registered settings were chosen on that clock.", flush=True)
+    use_paper = args.paper_db if args.paper_db is not None else (not args.from_file and not args.no_save)
 
-    recorder = None
+    recorder, deadline_ns = None, None
     if args.from_file:
         day = args.from_file
         days = list_days()
@@ -963,19 +1033,32 @@ async def amain() -> None:
         source = ParquetSource(path, args.speed)
         run_dir = None if args.no_save else new_run_dir("rehearsal", day)
     else:
-        now = datetime.now(ET)
+        now = now_et()
+        now_ns = int(now.timestamp() * 1e9)
         day = now.date().isoformat()
         symbol = args.symbol or front_month(now)
+        if not tradingdays.covered(day):
+            print(f"WARNING: no CME holiday list for {now.year} (trade_jev/tradingdays.py); "
+                  "only weekends are skipped", flush=True)
+        if (closed := tradingdays.closed_reason(day)) is not None:
+            print(f"{day}: no NQ session ({closed}); nothing to do", flush=True)
+            if use_paper:
+                paperdb.record_holiday(f"live-{day}", day, symbol, closed)
+            return 0
         open_ns = et_to_ns(day, cfg.start_et) - secs(max(LOOKBACKS) + 60)
         start_ns = None
-        if time.time_ns() > open_ns:  # late start: intraday replay so the 60s look-back and streaks exist
-            start_ns = time.time_ns() - secs(max(LOOKBACKS) + 60) if args.no_catch_up else open_ns
+        if now_ns > open_ns:  # late start: intraday replay so the 60s look-back and streaks exist
+            start_ns = now_ns - secs(max(LOOKBACKS) + 60) if args.no_catch_up else open_ns
         stop_ns = et_to_ns(day, cfg.end_et) + secs(300)
-        if time.time_ns() > stop_ns:
+        if now_ns > stop_ns:
+            if args.exit_at_close:
+                print(f"the {day} session is over (ends {cfg.end_et} ET); nothing to do", flush=True)
+                return 0
             ap.error(f"the {day} session is over (ends {cfg.end_et} ET); use --from-file to rehearse")
         if not os.environ.get("DATABENTO_API_KEY"):
             ap.error("set DATABENTO_API_KEY in .env (or use --from-file)")
         source = DatabentoSource(symbol, start_ns, stop_ns)
+        deadline_ns = stop_ns + secs(120)
         run_dir = None if args.no_save else new_run_dir("live", day)
         if not args.no_save:
             recorder = Recorder(day, symbol)
@@ -997,34 +1080,81 @@ async def amain() -> None:
     if jev is not None:
         jev.timeout_s = args.jev_timeout
 
+    paper = None
+    if use_paper:
+        session_id = run_dir.name if run_dir else f"{'live' if source.live else 'rehearsal'}-{day}"
+        paper = paperdb.Recorder(session_id)
+        print(f"paper record → {paper.path} (session {session_id})", flush=True)
+
     baselines = [b for b in args.baselines.split(",") if b]
-    session = Session(args, cfg, gate, day, symbol, source, jev, baselines, run_dir, recorder, args.exec_url)
+    session = Session(args, cfg, gate, day, symbol, source, jev, baselines, run_dir, recorder, args.exec_url,
+                      paper=paper, deadline_ns=deadline_ns)
     if run_dir:
         write_config(run_dir, cfg, [day], list(session.engine.policies), args.encoder, args.model,
                      {"min_conf": gate.min_conf, "agree": gate.agree, "min_hold_s": gate.min_hold_s},
                      live=source.live, symbol=symbol)
+    hb = None
+    if paper:
+        model = None if jev is None else f"stored:{args.stored_answers}" if args.stored_answers else args.model
+        paper.start(day, symbol, {**session.snapshot["settings"], "encoder": args.encoder,
+                                  "policies": list(session.engine.policies)},
+                    model, session.snapshot["run_dir"])
+        hb = asyncio.create_task(heartbeat(paper))
+    try:  # launchd stops jobs with SIGTERM: close the session like Ctrl-C does
+        asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, asyncio.current_task().cancel)
+    except (NotImplementedError, RuntimeError):
+        pass
     serve(session, args.port, not args.no_open)
     print(f"settings: {gate.label()} · Ctrl-C to stop", flush=True)
+
+    def end_paper(status: str, error: str | None = None) -> None:
+        nonlocal paper
+        if paper is None:
+            return
+        if hb:
+            hb.cancel()
+        try:
+            session._paper_trades()
+            summary = session.paper_summary()
+        except Exception as e:  # noqa: BLE001 — best effort on the way down
+            summary, error = [], (error or "") + f"\nsummary failed: {e}"
+        paper.finish(status, summary, error)
+        paper.close()
+        paper = None
+
     try:
         await session.run()
         session.write_outputs()
+        end_paper("done")
+        if args.exit_at_close:
+            print("session closed; outputs written. Exiting (--exit-at-close).", flush=True)
+            return 0
         print("session closed; outputs written. The view stays up — Ctrl-C to quit.", flush=True)
         while True:
             await asyncio.sleep(3600)
     except asyncio.CancelledError:
-        pass
+        end_paper("aborted", "stopped before the session end (Ctrl-C or SIGTERM)")
+        return 130
+    except Exception as e:
+        end_paper("crashed", error_text(e))
+        raise
     finally:
-        await session.engine.finish()
-        session.write_outputs()
-        if client is not None:
-            await client.aclose()
+        try:
+            await session.engine.finish()
+            session.write_outputs()
+        finally:
+            end_paper("crashed", "exited without a final status")
+            if client is not None:
+                await client.aclose()
 
 
 def main() -> None:
     try:
-        asyncio.run(amain())
+        code = asyncio.run(amain())
     except KeyboardInterrupt:
         print("\nstopped.")
+        code = 130
+    sys.exit(code)
 
 
 if __name__ == "__main__":

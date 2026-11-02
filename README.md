@@ -22,7 +22,7 @@ echo "TRADE_JEV_DATA=/path/to/databento/files" >> .env        # optional; defaul
 TRADE_JEV_DATA=data/sample uv run python -m trade_jev.run --days 2026-06-23 --policies hold,random,imbalance   # smoke test
 ```
 
-**In git:** code, docs, `data/sample/` (synthetic), `results/` (published runs), `runs/index.jsonl`. **Local only:** Databento data (incl. `data/live/` recordings), `runs/<id>/` (includes the order books Jev saw), `cache/`, `.env`.
+**In git:** code, docs, `data/sample/` (synthetic), `results/` (published runs), `runs/index.jsonl`. **Local only:** Databento data (incl. `data/live/` recordings), `runs/<id>/` (includes the order books Jev saw), `cache/`, `data/paper.db`, `logs/`, `.env`.
 
 ## 1) Run
 
@@ -98,7 +98,35 @@ uv run python -m trade_jev.executor --broker fake --allow-replay
 uv run python -m trade_jev.live --from-file 2026-06-23 --speed 60 --stored-answers runs/<id> --exec-url http://127.0.0.1:8766
 ```
 
-## 7) Test
+## 7) Live paper trading
+
+Every weekday the Mini runs one live session with no orders: Jev with the registered filters (`settings.DEFAULT`: cutoff 0.7, 4 agreeing, 30s min hold, 200-tick stop / 100-tick target) next to the hold / random / imbalance baselines, on the live Databento NQ feed. Each session is recorded in a local SQLite file, and the viewer's **Paper** tab shows it.
+
+**Keys** in `.env` (never committed): `DATABENTO_API_KEY` (live mbp-10 feed) and `TYPESAFE_API_KEY` (Jev).
+
+**Install** on the Mini, from the deploy checkout (`/Users/justinhe/trade-jev`):
+
+```bash
+uv sync
+scripts/install_launchd.sh      # copies deploy/launchd/*.plist to ~/Library/LaunchAgents and loads them
+```
+
+- `com.tradejev.paper` runs `scripts/run_paper_day.sh` on weekdays at 06:15 local time (09:15 ET on a Pacific-time Mac). The script works out ET itself: it waits until 09:15 ET if started early and does nothing after 15:55 ET. It then runs `python -m trade_jev.live --exit-at-close --no-open --port 8767`, which exits 0 once the session's outputs are written. Weekends and CME full-closure holidays (`src/trade_jev/tradingdays.py`, 2026–2027; add the next year before it starts) exit 0 and record a `holiday` row. On the shortened holiday sessions (13:00 ET halt) the session closes when the feed goes quiet.
+- `com.tradejev.view` keeps the viewer up on `http://127.0.0.1:8765`.
+- Logs: `logs/paper-<day>.log` (one per ET day), `logs/view.log`. While a session runs, its own Live page is at `http://localhost:8767/live`.
+- The Mac must stay awake through the session (System Settings → Energy: prevent automatic sleeping). The script holds `caffeinate -i` while it runs.
+
+**The record:** `data/paper.db` (override with `TRADE_JEV_PAPER_DB`), SQLite in WAL mode, created on first use. It has four tables: `paper_sessions` (one row per day: `running | done | crashed | holiday | aborted`, with a heartbeat at least every 60s while running), `paper_trades` (every policy's trades, written as they close), `paper_decisions` (the Jev decision log) and `paper_summary` (per-policy totals, written at the end). A `running` row with a stale heartbeat means the process died. The schema is in `src/trade_jev/paperdb.py`. The usual `runs/live-<day>/` files are still written.
+
+**View:** `http://127.0.0.1:8765/paper` shows a per-day table (status, Jev P&L against the baselines, trades, wins, drawdown, Jev cost) and a drill-down with each session's trades and Jev decisions. It updates every 5s while a session runs. `uv run python -m trade_jev.view` serves it standalone, with no run or live session needed.
+
+```bash
+uv run python -m trade_jev.live --exit-at-close --no-open             # one session by hand, as the schedule runs it
+uv run python -m trade_jev.live --from-file 2026-06-23 --speed 0 --paper-db --exit-at-close   # rehearsal into the DB
+sqlite3 data/paper.db "select day, status, heartbeat_at from paper_sessions order by day desc limit 5"
+```
+
+## 8) Test
 
 Unit tests, plus a check that the page's replays match the Python replays.
 

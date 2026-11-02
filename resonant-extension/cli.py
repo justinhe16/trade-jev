@@ -205,6 +205,14 @@ def is_trading_day(d: date, cfg: Config) -> bool:
 # --- sessions and P&L -----------------------------------------------------------------------
 
 
+NO_TRADE = ("holiday", "skipped")  # the runner ran and chose not to trade: no P&L, not a "last trading day"
+
+
+def source_of(session: sqlite3.Row) -> str | None:
+    """The feed of a session; None on a DB written before the `source` column existed."""
+    return session["source"] if "source" in session.keys() else None  # noqa: SIM118 — sqlite3.Row
+
+
 def sessions_on(conn: sqlite3.Connection, days: list[str]) -> list[sqlite3.Row]:
     marks = ",".join("?" * len(days))
     return conn.execute(
@@ -222,7 +230,8 @@ def latest_session(conn: sqlite3.Connection, day: str) -> sqlite3.Row | None:
 
 def latest_trading_day(conn: sqlite3.Connection) -> str | None:
     row = conn.execute(
-        "SELECT day FROM paper_sessions WHERE status != 'holiday' ORDER BY day DESC LIMIT 1"
+        "SELECT day FROM paper_sessions WHERE status NOT IN ('holiday', 'skipped') "
+        "ORDER BY day DESC LIMIT 1"
     ).fetchone()
     return row["day"] if row else None
 
@@ -417,6 +426,7 @@ def cmd_status(cfg: Config, now: datetime) -> dict[str, Any]:
             "id": s["session_id"],
             "symbol": s["symbol"],
             "status": s["status"],
+            "source": source_of(s),
             "health": health,
             "started_at": s["started_at"],
             "ended_at": s["ended_at"],
@@ -433,8 +443,13 @@ def cmd_status(cfg: Config, now: datetime) -> dict[str, Any]:
         "launchd": launchd,
     }
     label = "stale/likely dead" if health == "stale" else health
+    if health == "skipped":
+        out["summary"] = f"skipped: {clip(s['error'], 160) or 'no reason recorded'}" + (
+            f" (source {source_of(s)})" if source_of(s) else "")
+        return out
+    src = f" [{source_of(s)}]" if source_of(s) else ""
     out["summary"] = (
-        f"{s['symbol']} paper session {label}; Jev {money(out['jev']['pnl'])} "
+        f"{s['symbol']}{src} paper session {label}; Jev {money(out['jev']['pnl'])} "
         f"({out['jev']['trades']} trades), position {position if position is not None else '?'}"
     )
     return out
@@ -455,8 +470,15 @@ def cmd_pnl(cfg: Config, now: datetime, date_arg: str) -> dict[str, Any]:
         return no_sessions()
     with closing(conn):
         label, days = resolve_days(date_arg, conn, now.astimezone(ET).date())
-        sessions = [s for s in sessions_on(conn, days) if s["status"] != "holiday"] if days else []
+        found = sessions_on(conn, days) if days else []
+        sessions = [s for s in found if s["status"] not in NO_TRADE]
         if not sessions:
+            skipped = [s for s in found if s["status"] == "skipped"]
+            if skipped:
+                why = clip(skipped[-1]["error"], 160) or "no reason recorded"
+                return {"range": label, "days": days[:1] + days[-1:], "sessions": 0,
+                        "skipped": [{"day": s["day"], "reason": clip(s["error"], 160)} for s in skipped],
+                        "summary": f"skipped: {why}"}  # fmt: skip
             return {"range": label, "days": days[:1] + days[-1:], "sessions": 0,
                     "summary": f"no paper sessions for {label}"}  # fmt: skip
         stats = policy_stats(conn, [s["session_id"] for s in sessions])
@@ -525,7 +547,7 @@ def cmd_trades(
     limit = DEFAULT_TRADES if limit <= 0 else min(limit, MAX_TRADES)
     with closing(conn):
         label, days = resolve_days(date_arg, conn, now.astimezone(ET).date())
-        sessions = [s for s in sessions_on(conn, days) if s["status"] != "holiday"] if days else []
+        sessions = [s for s in sessions_on(conn, days) if s["status"] not in NO_TRADE] if days else []
         if not sessions or not has_table(conn, "paper_trades"):
             return {"range": label, "trades": [], "summary": f"no paper sessions for {label}"}
         ids = [s["session_id"] for s in sessions]
@@ -684,7 +706,7 @@ def cmd_close_summary(cfg: Config, now: datetime) -> dict[str, Any]:
     if conn is None:
         return {"reported": False, "day": day, "summary": NO_SESSIONS}
     with closing(conn):
-        sessions = [s for s in sessions_on(conn, [day]) if s["status"] != "holiday"]
+        sessions = [s for s in sessions_on(conn, [day]) if s["status"] not in NO_TRADE]
         if not sessions:
             return {"reported": False, "day": day, "summary": f"no paper session on {day}"}
         stats = policy_stats(conn, [s["session_id"] for s in sessions])
@@ -713,7 +735,7 @@ def down_reason(conn: sqlite3.Connection | None, now: datetime) -> str | None:
         if et.time() >= MISSING_AFTER:
             return "no session started"
         return None
-    health, age = health_of(s, now)  # holiday, done and aborted (stopped on purpose) are fine
+    health, age = health_of(s, now)  # holiday, skipped, done and aborted (stopped on purpose) are fine
     if health == "crashed":
         err = clip(s["error"], 100)
         return "session crashed" + (f": {err}" if err else "")

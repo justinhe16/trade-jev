@@ -21,7 +21,7 @@ from tests.test_live import DAY, MemSource, Script, synthetic
 
 SPEC = {
     "paper_sessions": ["session_id", "day", "symbol", "status", "started_at", "ended_at", "heartbeat_at",
-                       "settings_json", "jev_model", "run_dir", "error"],
+                       "settings_json", "jev_model", "run_dir", "error", "source"],
     "paper_trades": ["id", "session_id", "policy", "side", "entry_ns", "entry_px", "exit_ns", "exit_px",
                      "reason", "points", "pnl"],
     "paper_decisions": ["session_id", "policy", "t_ns", "time_et", "mid", "position", "action", "raw_action",

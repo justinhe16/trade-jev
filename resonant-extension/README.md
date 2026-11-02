@@ -21,7 +21,7 @@ Each job's first run after install is a silent baseline. Run `/ext run trade-jev
 
 | Tool | Effect / level | What it does |
 |---|---|---|
-| `trade_jev_status` | read, L0 | Today's session (ET date): `running`, `done`, `crashed`, `aborted`, `holiday` or **`stale`**. Stale means status is `running` but the heartbeat is more than 3 min old, so the process is likely dead. Also shows Jev's position (its latest decision), realized P&L, trade count and wins so far, and whether the launchd job is loaded (`launchctl print gui/<uid>/com.tradejev.paper`, best effort). |
+| `trade_jev_status` | read, L0 | Today's session (ET date): `running`, `done`, `crashed`, `aborted`, `holiday`, `skipped` (the runner chose not to trade, e.g. `TRADE_JEV_SOURCE=off` or Tradovate credentials missing: the summary reads `skipped: <reason>`) or **`stale`**. The session block also carries `source` (`databento` or `tradovate`, null on a DB from before the column existed). Stale means status is `running` but the heartbeat is more than 3 min old, so the process is likely dead. Also shows Jev's position (its latest decision), realized P&L, trade count and wins so far, and whether the launchd job is loaded (`launchctl print gui/<uid>/com.tradejev.paper`, best effort). |
 | `trade_jev_pnl {date}` | read, L0 | Jev vs the baselines: pnl, trades, wins, max drawdown, Jev calls and cost, and `jev_minus_baseline`. Ranges add a per-day list. |
 | `trade_jev_trades {date, policy, limit}` | read, L0 | The latest `limit` trades (oldest first, ET times) for one policy, plus the total count. |
 | `trade_jev_start` | write, **L2** | `launchctl kickstart gui/<uid>/com.tradejev.paper`. It does nothing if the job is already running. If the job isn't loaded it refuses and does nothing. |
@@ -29,7 +29,7 @@ Each job's first run after install is a silent baseline. Run `/ext run trade-jev
 
 Every manifest arg is required, because the Resonant SDK marks each declared arg `required`. "Not given" therefore has explicit values:
 
-- **`date`**: `""` or `latest` (the latest non-holiday session day), `today`, `yesterday`, `YYYY-MM-DD`, `week` (Monday through today, ET), `month` (the 1st through today), or `YYYY-MM-DD..YYYY-MM-DD` (inclusive, at most 366 days).
+- **`date`**: `""` or `latest` (the latest session day that was not a holiday or skipped), `today`, `yesterday`, `YYYY-MM-DD`, `week` (Monday through today, ET), `month` (the 1st through today), or `YYYY-MM-DD..YYYY-MM-DD` (inclusive, at most 366 days).
 - **`policy`**: `""` or `jev` means the Jev policy. Anything else matches a policy name, case-insensitive (`hold`, `random`, `imbalance`).
 - **`limit`**: `0` means 20. The maximum is 50.
 
@@ -37,7 +37,7 @@ Results stay under 4 KB: long lists drop their oldest entries and report `omitte
 
 **Which policy is Jev?** Any policy whose name contains `jev`, in any case (`is_jev()` in `cli.py`, the only place that rule lives). Every other policy is a baseline. If several match, the first by name is the headline one.
 
-**Where the P&L comes from.** pnl, trades and wins come from `paper_trades` closed trades (`exit_ns` set), so they are current even mid-session. Drawdown, Jev calls and Jev cost come from `paper_summary` when it has a row. A policy with summary rows but no trade rows uses the summary's numbers. A day with several sessions (a restart after a crash) is summed. `holiday` sessions are ignored.
+**Where the P&L comes from.** pnl, trades and wins come from `paper_trades` closed trades (`exit_ns` set), so they are current even mid-session. Drawdown, Jev calls and Jev cost come from `paper_summary` when it has a row. A policy with summary rows but no trade rows uses the summary's numbers. A day with several sessions (a restart after a crash) is summed. `holiday` and `skipped` sessions are ignored; `pnl` for a day that was only skipped answers `skipped: <reason>`.
 
 ### Why start and stop are L2
 
@@ -59,7 +59,7 @@ If the plist sets `KeepAlive`, launchd restarts the job after SIGTERM. In that c
 | Job | When (America/New_York) | Reports |
 |---|---|---|
 | `close-summary` | 16:10 weekdays (catch-up 6 h) | `trade-jev/pnl/<day>`, urgency **normal** (the hourly pulse). Title example: `Paper NQ: Jev +$420 (6 trades), hold −$110, random +$30`, with ` (crashed)` and similar appended when the day didn't finish `done`. `state` holds the day, the status, Jev's P&L rounded to $50 and Jev's trade count, so a re-run on the same day isn't news. Nothing is reported on a holiday or a day with no session. A caught-up run reports the day it was due for (`RESONANT_JOB_DUE_AT`). |
-| `watch` | at :05, :20, :35 and :50, 09:05–15:50 weekdays. It checks only between 09:30 and 16:00 on NYSE trading days, so the first check is 09:35 and the last is 15:50. | `trade-jev/down`, urgency **urgent** (texted at once), while today's latest session is `crashed` or stale, or when no session exists by 09:35 (caught at the 09:35 run). Once healthy again it sends one `clear` (texted as ✓). `done`, `aborted` (stopped on purpose) and `holiday` are healthy. After `trade_jev_stop`, watch stays quiet for the rest of that ET day even if the runner never wrote `aborted`. The marker is `$RESONANT_EXT_DATA/stopped_day`, and `trade_jev_start` removes it. The clear is sent only after a down report, which is remembered in `$RESONANT_EXT_DATA/watch_state.json`, so a healthy day sends nothing. |
+| `watch` | at :05, :20, :35 and :50, 09:05–15:50 weekdays. It checks only between 09:30 and 16:00 on NYSE trading days, so the first check is 09:35 and the last is 15:50. | `trade-jev/down`, urgency **urgent** (texted at once), while today's latest session is `crashed` or stale, or when no session exists by 09:35 (caught at the 09:35 run). Once healthy again it sends one `clear` (texted as ✓). `done`, `aborted` (stopped on purpose), `holiday` and `skipped` are healthy (a `skipped` row also counts as the runner having run, so there is no missing-by-09:35 alert). After `trade_jev_stop`, watch stays quiet for the rest of that ET day even if the runner never wrote `aborted`. The marker is `$RESONANT_EXT_DATA/stopped_day`, and `trade_jev_start` removes it. The clear is sent only after a down report, which is remembered in `$RESONANT_EXT_DATA/watch_state.json`, so a healthy day sends nothing. |
 
 The manifest grants `report: {max_urgency: urgent}` and a 5-minute `health` check (`./cli.py health`). The check is healthy when the config parses and the DB, if present, opens read-only. A missing DB is healthy.
 
@@ -79,7 +79,7 @@ Resonant runs the extension with `HOME` set to its data dir, not your home direc
 
 Schema expected (written by the paper runner):
 
-- `paper_sessions(session_id PK, day (ET date), symbol, status running|done|crashed|holiday|aborted, started_at, ended_at, heartbeat_at (ISO UTC, at least every 60 s while running), settings_json, jev_model, run_dir, error)`
+- `paper_sessions(session_id PK, day (ET date), symbol, status running|done|crashed|holiday|aborted|skipped, source (nullable; the feed), started_at, ended_at, heartbeat_at (ISO UTC, at least every 60 s while running), settings_json, jev_model, run_dir, error)`
 - `paper_trades(id, session_id, policy, side, entry_ns, entry_px, exit_ns, exit_px, reason jev|stop|target|eod, points, pnl)`
 - `paper_decisions(session_id, policy, t_ns, time_et, mid, position, action, raw_action, probs_json, jev_ms, error)`
 - `paper_summary(session_id, policy, trades, wins, pnl, max_drawdown, jev_calls, jev_cost_usd)`, PK `(session_id, policy)`

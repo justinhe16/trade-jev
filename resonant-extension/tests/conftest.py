@@ -78,6 +78,13 @@ class PaperDB:
         )  # fmt: skip
         self.conn.commit()
 
+    def set_source(self, sid: str, source: str) -> None:
+        """The runner's `source` column (absent in the base schema: an older DB)."""
+        if "source" not in {r[1] for r in self.conn.execute("PRAGMA table_info(paper_sessions)")}:
+            self.conn.execute("ALTER TABLE paper_sessions ADD COLUMN source TEXT")
+        self.conn.execute("UPDATE paper_sessions SET source=? WHERE session_id=?", (source, sid))
+        self.conn.commit()
+
     def trade(
         self, sid: str, policy: str, day: str, t_in: str, t_out: str | None, pnl: float,
         side: str = "long", reason: str = "jev",

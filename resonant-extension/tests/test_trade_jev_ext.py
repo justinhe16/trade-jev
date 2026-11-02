@@ -443,6 +443,51 @@ def test_watch_config_holiday(db: PaperDB, reports, data_dir: Path) -> None:
     assert cli.run(["watch"], now=et(MON, "12:00"))["checked"] is False
 
 
+# --- skipped days (feed off / credentials missing) and the source column ------------------------
+
+
+def test_watch_skipped_is_healthy_and_counts_as_the_runner_having_run(db: PaperDB, reports) -> None:
+    db.session("s1", MON, "skipped", error="TRADE_JEV_SOURCE=off")
+    out = cli.run(["watch"], now=et(MON, "12:00"))
+    assert out["down"] is False and reports == []
+    # skipped before 09:35 also means "no session started" cannot fire: the runner wrote a row
+    assert cli.run(["watch"], now=et(MON, "09:35"))["down"] is False and reports == []
+
+
+def test_status_shows_skipped_reason_and_the_source(db: PaperDB) -> None:
+    db.session("s1", MON, "skipped", error="tradovate credentials missing: TRADOVATE_SEC")
+    db.set_source("s1", "tradovate")
+    out = cli.run(["status"], now=et(MON, "11:00"))
+    assert out["running"] is False and out["session"]["source"] == "tradovate"
+    assert out["summary"].startswith("skipped: tradovate credentials missing: TRADOVATE_SEC")
+    assert "tradovate" in out["summary"]
+
+
+def test_status_shows_the_source_of_a_real_session_and_tolerates_old_dbs(db: PaperDB) -> None:
+    db.session("s1", MON, "done")
+    assert cli.run(["status"], now=et(MON, "17:00"))["session"]["source"] is None  # no column yet
+    db.set_source("s1", "databento")
+    out = cli.run(["status"], now=et(MON, "17:00"))
+    assert out["session"]["source"] == "databento" and "[databento]" in out["summary"]
+
+
+def test_pnl_for_a_skipped_day_says_so_and_excludes_it(db: PaperDB) -> None:
+    seed_day(db, "s1", MON)
+    db.session("s2", TUE, "skipped", error="TRADE_JEV_SOURCE=off")
+    out = cli.run(["pnl", "--date", TUE], now=et(TUE, "17:00"))
+    assert out["sessions"] == 0 and out["summary"] == "skipped: TRADE_JEV_SOURCE=off"
+    week = cli.run(["pnl", "--date", f"{MON}..{TUE}"], now=et(TUE, "17:00"))
+    assert week["sessions"] == 1 and week["trading_days"] == 1
+    assert cli.run(["status"], now=et(WED, "09:00"))["last_session_day"] == MON  # skipped is not a trading day
+    assert cli.run(["pnl"], now=et(WED, "09:00"))["to"] == MON
+
+
+def test_close_summary_and_trades_ignore_skipped(db: PaperDB, reports) -> None:
+    db.session("s1", TUE, "skipped", error="TRADE_JEV_SOURCE=off")
+    assert cli.run(["close-summary"], now=et(TUE, "16:10"))["reported"] is False and reports == []
+    assert cli.run(["trades", "--date", TUE], now=et(TUE, "17:00"))["trades"] == []
+
+
 # --- the CLI contract -----------------------------------------------------------------------
 
 

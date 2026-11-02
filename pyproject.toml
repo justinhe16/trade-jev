@@ -14,6 +14,7 @@ dependencies = [
     "pyarrow>=25.0.1",
     "python-dotenv>=1.2.3",
     "typesafe-sdk>=0.6.0",
+    "websockets>=17.4",
 ]
 
 [project.optional-dependencies]

@@ -4,9 +4,16 @@
 # launchd's StartCalendarInterval is in the Mac's local time (06:15 on a Pacific-time Mini = 09:15 ET).
 # This script works out ET itself, so it is right in any time zone:
 #   before 09:15 ET  → sleeps until 09:15 ET (gives up if that is more than 4 hours away)
-#   09:15–15:55 ET   → runs the session (a late start replays the session so far from Databento)
+#   09:15–15:55 ET   → runs the session (a late start on Databento replays the session so far)
 #   after 15:55 ET   → nothing to do
 # Weekends and CME holidays are handled by trade_jev.live (it records a `holiday` row and exits 0).
+#
+# The feed is picked by TRADE_JEV_SOURCE in .env: databento (default) | tradovate | off. trade_jev.live reads
+# .env itself (the same way it reads DATABENTO_API_KEY), so nothing is passed here:
+#   off, or tradovate with any TRADOVATE_* credential missing → a `skipped` row with the reason, exit 0,
+#     no feed started (the extension's watch treats that as healthy)
+#   tradovate late start (after 09:28 ET) → no catch-up replay exists: 60s of warm-up on live data,
+#     every decision HOLD until then
 # A lock keeps a second copy (a missed job fired on wake, a manual run) from starting a duplicate.
 #
 # Logs: logs/paper-<ET date>.log. The session is recorded in data/paper.db; view it at /paper.

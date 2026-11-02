@@ -100,9 +100,9 @@ uv run python -m trade_jev.live --from-file 2026-06-23 --speed 60 --stored-answe
 
 ## 7) Live paper trading
 
-Every weekday the Mini runs one live session with no orders: Jev with the registered filters (`settings.DEFAULT`: cutoff 0.7, 4 agreeing, 30s min hold, 200-tick stop / 100-tick target) next to the hold / random / imbalance baselines, on the live Databento NQ feed. Each session is recorded in a local SQLite file, and the viewer's **Paper** tab shows it.
+Every weekday the Mini runs one live session with no orders: Jev with the registered filters (`settings.DEFAULT`: cutoff 0.7, 4 agreeing, 30s min hold, 200-tick stop / 100-tick target) next to the hold / random / imbalance baselines, on a live NQ L2 feed (Databento by default, or Tradovate: see "Tradovate source" below). Each session is recorded in a local SQLite file, and the viewer's **Paper** tab shows it.
 
-**Keys** in `.env` (never committed): `DATABENTO_API_KEY` (live mbp-10 feed) and `TYPESAFE_API_KEY` (Jev).
+**Keys** in `.env` (never committed; `.env.example` lists every name): `TYPESAFE_API_KEY` (Jev) and, for the feed, `DATABENTO_API_KEY` or the `TRADOVATE_*` set. `TRADE_JEV_SOURCE` = `databento` (default) | `tradovate` | `off` picks the feed.
 
 **Install** on the Mini, from the deploy checkout (`/Users/justinhe/trade-jev`):
 
@@ -116,10 +116,11 @@ scripts/install_launchd.sh      # copies deploy/launchd/*.plist to ~/Library/Lau
 - Logs: `logs/paper-<day>.log` (one per ET day), `logs/view.log`. While a session runs, its own Live page is at `http://localhost:8767/live`.
 - The Mac must stay awake through the session (System Settings → Energy: prevent automatic sleeping). The script holds `caffeinate -i` while it runs.
 
-**The record:** `data/paper.db` (override with `TRADE_JEV_PAPER_DB`), SQLite in WAL mode, created on first use. It has four tables: `paper_sessions` (one row per day: `running | done | crashed | holiday | aborted`, with a heartbeat at least every 60s while running), `paper_trades` (every policy's trades, written as they close), `paper_decisions` (the Jev decision log) and `paper_summary` (per-policy totals, written at the end). A `running` row with a stale heartbeat means the process died. The schema is in `src/trade_jev/paperdb.py`. The usual `runs/live-<day>/` files are still written.
+**The record:** `data/paper.db` (override with `TRADE_JEV_PAPER_DB`), SQLite in WAL mode, created on first use. It has four tables: `paper_sessions` (one row per day: `running | done | crashed | holiday | aborted | skipped`, with a heartbeat at least every 60s while running, and the feed in `source`), `paper_trades` (every policy's trades, written as they close), `paper_decisions` (the Jev decision log) and `paper_summary` (per-policy totals, written at the end). A `running` row with a stale heartbeat means the process died. The schema is in `src/trade_jev/paperdb.py`. The usual `runs/live-<day>/` files are still written.
 
 **Behaviour of `trade_jev.live` (also when run by hand):**
 - On a weekend or holiday it exits 0 and writes a `holiday` row.
+- With `TRADE_JEV_SOURCE=off`, or `tradovate` and any `TRADOVATE_*` credential missing, it exits 0 and writes a `skipped` row with the reason (names only, never values) and starts no feed.
 - A live session closes 2 minutes after its end even if the feed has gone quiet.
 - SIGTERM (`launchctl kill SIGTERM`) closes the session like Ctrl-C does. It writes the summary, marks the session `aborted` and exits 0; Ctrl-C exits 130.
 - Jev errors (bad key, outage) count as HOLD and show in the decision log's error column.
@@ -131,6 +132,31 @@ uv run python -m trade_jev.live --exit-at-close --no-open             # one sess
 uv run python -m trade_jev.live --from-file 2026-06-23 --speed 0 --paper-db --exit-at-close   # rehearsal into the DB
 sqlite3 data/paper.db "select day, status, heartbeat_at from paper_sessions order by day desc limit 5"
 ```
+
+### Tradovate source
+
+`TRADE_JEV_SOURCE=tradovate` (or `--source tradovate`) streams the book from Tradovate instead of Databento: the L2 DOM (top 10 per side, a full snapshot about every 50 ms) plus the tick chart for trades, through the same engine, paper book, DB, viewer and extension. Paper only: the code calls the auth endpoints, `GET contract/find` and the `md/*` market-data endpoints, never an order, position or account endpoint.
+
+**Setup**
+- Tradovate API access needs a LIVE account with more than $1,000 equity and an API Access subscription. Generate an API key in the Tradovate web app (Settings > API Access): it gives the `cid` and `sec`.
+- `.env`: `TRADOVATE_USERNAME`, `TRADOVATE_PASSWORD`, `TRADOVATE_CID`, `TRADOVATE_SEC`, `TRADOVATE_DEVICE_ID` (any stable UUID: `uuidgen`). Optional: `TRADOVATE_ENV` = `live` | `demo` (default `live`), `TRADOVATE_APP_ID` (default `trade-jev`), `TRADOVATE_APP_VERSION` (default `1.0`), `TRADOVATE_MD_URL` (replaces the websocket URL, disables the host fallback).
+- For a simulated or evaluation account (for example a funded-trader evaluation) use `TRADOVATE_ENV=demo`: login, renew and contract lookup then go to `demo.tradovateapi.com`. Prop-firm evaluation accounts may not offer API Access at all: if login says `this account has no API key: cid/sec rejected`, ask the firm or Tradovate. A wrong username or password is reported separately (`bad credentials`).
+- The first login from a new device can demand a captcha: log in once by hand in the Tradovate web app (same device), wait about an hour, then retry. A short rate limit ("penalty") of up to 120 s is waited out and retried once; a longer one is reported as an error.
+- Switch the feed in `.env`: `TRADE_JEV_SOURCE=databento | tradovate | off`. `off`, or `tradovate` with a credential missing, makes the daily job write a `skipped` row (reason in the viewer and extension) and exit 0. An explicit `--source` on the command line wins over `TRADE_JEV_SOURCE` (the env value, including `off`, is only the default).
+
+**Smoke test** (run outside 09:15-16:00 ET): `uv run python scripts/tradovate_check.py --seconds 30` (`--env demo|live`, `--symbol NQZ6`). It logs in, resolves the contract, subscribes the DOM and ticks, and prints the env and hosts used, token expiry (time only), user status, which md host and token kind authorized, DOM update rate, levels per side, tick count and the buy / sell / unknown split. It exits non-zero with a one-line reason: missing credentials (names), captcha, no API key, bad credentials, or `no DOM updates: likely no CME market-data entitlement for API access yet`.
+
+**Caveats**
+- Licence: CME market-data entitlement for API (non-display) use is not confirmed with Tradovate. Until it is, expect login to work but no DOM data. A session that sees no book rows all day ends `crashed` with that reason.
+- Tradovate allows 2 concurrent sessions per user. Running `tradovate_check.py` while the daily job is live may kick a session.
+- Tokens live 90 minutes; they are renewed about 15 minutes before expiry (a failed renewal triggers a full login). The websocket reconnects with backoff (1, 2, 4 ... 30 s), re-authorizes, resubscribes and ignores the history Tradovate replays.
+- Hosts and tokens that are not documented are tried in order and logged (never the token): the md socket authorizes with `mdAccessToken` first, then `accessToken`. Only `md.tradovateapi.com` is documented, for both environments; with `TRADOVATE_ENV=demo` the one fallback is `md-demo.tradovateapi.com`.
+- No catch-up replay. Databento replays the session so far after a late start; Tradovate cannot. If the first row arrives after the 09:28 ET open, the engine skips the grid points it missed and warms up for 60 s on live data: every decision until then is HOLD without a Jev call, recorded as `raw_action = WARMUP`, `action = HOLD` in `paper_decisions` (the viewer shows them as "warmup", not as errors). The log prints `late start: warming up 60s ... decisions until HH:MM:SS ET are HOLD` and the session's settings record `late_start_warmup_s` and `warmup_until_et`.
+- Rows: each DOM snapshot is a row with delta 0 (identical consecutive snapshots are dropped); each trade tick after the end-of-history marker is a row with the latest book and delta = +size or -size. Row times are the event times, forced non-decreasing; trades before the first book are dropped.
+- Aggressor rule per trade: if the tick carries the ask and price >= ask, buy; else if it carries the bid and price <= bid, sell; else the same test against the latest DOM best ask / bid; else the tick rule against the previous trade price (up buy, down sell, unchanged the previous side; the very first trade with nothing to go on counts 0).
+- The recorded feed (`data/live/`) keeps the Databento file layout, so `load_day` reads it. The sidecar JSON key `"source": "trade_jev.live"` was replaced by `"writer": "trade_jev.live"` plus `"feed": "databento" | "tradovate"` (nothing in the repo read the old key; update any outside tool that does).
+- Fail fast: if the md socket refuses (non-200 on authorize for every host / token, or on subscribeDOM / getChart) on at least 5 attempts spanning at least 5 minutes and no book data has ever arrived (so a brief refusal at the 09:15 start does not lose the day: launchd does not restart the job), the session ends `crashed` with `Tradovate market data refused: <server text> - likely no CME market-data entitlement for API access`, so the extension alerts early. The reconnect backoff only resets after a connection has delivered data for 60 s.
+- Update the deploy checkout after merging: `uv sync` (adds `websockets`), then `resonant ext update trade-jev` for the extension.
 
 ## 8) Test
 

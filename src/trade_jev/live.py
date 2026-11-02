@@ -1,4 +1,4 @@
-"""Live: stream NQ L10 from Databento, ask Jev every 15s, apply the filters, paper-trade, serve a live view.
+"""Live: stream NQ L10 (Databento or Tradovate), ask Jev every 15s, apply the filters, paper-trade, serve a live view.
 
   uv run python -m trade_jev.live                                   # live session → http://localhost:8765/live
   uv run python -m trade_jev.live --from-file 2026-06-23 --speed 60 # rehearsal from a recorded day
@@ -19,6 +19,12 @@ Unattended daily paper trading (deploy/launchd + scripts/run_paper_day.sh):
 Weekends and CME full-closure holidays are skipped (exit 0, a `holiday` row). Every live session is
 also recorded in the paper DB (trade_jev.paperdb: sessions, trades as they close, Jev decisions,
 summary), which the viewer's /paper tab reads.
+
+Feed: `--source databento|tradovate` (default $TRADE_JEV_SOURCE, else databento). TRADE_JEV_SOURCE=off, or
+`tradovate` with any TRADOVATE_* credential missing, skips the day: a `skipped` row with the reason, exit 0,
+no feed started. Databento replays the session so far after a late start. Tradovate cannot: a start after
+the 09:28 ET open instead warms up for 60s on live data (every decision HOLD, no Jev call) and skips the
+grid points it missed. See src/trade_jev/tradovate.py and README "Tradovate source".
 """
 
 from __future__ import annotations
@@ -46,6 +52,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from trade_jev import ROOT, paperdb, tradingdays
+from trade_jev.tradovate import TradovateConfig, TradovateError, TradovateSource, missing_credentials
 from trade_jev.data import (ET, LEVELS, LIVE_DIR, TICK, Day, decision_grid, et_to_ns, list_days,
                             ns_to_et, secs)
 from trade_jev.encode import LOOKBACKS, Context
@@ -57,6 +64,8 @@ from trade_jev.settings import DEFAULT, Settings
 
 STALE_S = 5.0          # no feed records for this long during the session → STALE
 CATCH_UP_S = 30.0      # a decision older than this (wall clock) is catch-up: shown, never alerted
+WARMUP_S = 60          # Tradovate late start: no catch-up replay exists, so decide HOLD for this long
+SOURCES = ("databento", "tradovate")
 
 
 # ---------------------------------------------------------------- growing day
@@ -259,7 +268,9 @@ class Recorder:
         ("trade_delta", pa.int64()),
     ])
 
-    def __init__(self, day: str, symbol: str, out_dir: Path = LIVE_DIR, rows_per_group: int = 100_000):
+    def __init__(self, day: str, symbol: str, out_dir: Path = LIVE_DIR, rows_per_group: int = 100_000,
+                 feed: str = "databento"):
+        self.feed = feed
         out_dir.mkdir(parents=True, exist_ok=True)
         self.path = out_dir / f"GLBX.MDP3__{symbol}__mbp-10__rth__{day}__live.parquet"
         self.day, self.symbol, self.rows_per_group = day, symbol, rows_per_group
@@ -299,7 +310,7 @@ class Recorder:
         self.writer.close()
         self.path.with_suffix(".json").write_text(json.dumps({
             "dataset": "GLBX.MDP3", "symbol": self.symbol, "schema": "mbp-10", "day": self.day,
-            "session": "rth", "rows": self.rows, "source": "trade_jev.live"}, indent=2))
+            "session": "rth", "rows": self.rows, "writer": "trade_jev.live", "feed": self.feed}, indent=2))
 
 
 # ---------------------------------------------------------------- policies
@@ -347,8 +358,12 @@ class Engine:
     clock. An event at time t fires once the first row with ts > t arrives, so rows ≤ t are final."""
 
     def __init__(self, day: str, symbol: str, cfg: Config, gate: Settings, jev, baselines: list[str],
-                 answer_latency: bool = False, on_change=None):
+                 answer_latency: bool = False, on_change=None, warmup_s: float = 0):
         self.cfg, self.gate = cfg, gate
+        self.warmup_s = warmup_s  # late first row (after open_ns): HOLD for this long, no policy calls
+        self.open_ns = et_to_ns(day, cfg.start_et) - secs(max(LOOKBACKS) + 60)
+        self.warmup_until_ns = 0
+        self.first_row_seen = False
         self.day = LiveDay(day, symbol)
         self.grid = decision_grid(day, cfg.start_et, cfg.end_et, cfg.cadence_s)
         self.end_ns = int(self.grid[-1]) + secs(cfg.cadence_s)
@@ -388,6 +403,13 @@ class Engine:
 
     async def feed(self, b: Batch) -> None:
         i, n = 0, len(b)
+        if n and not self.first_row_seen:
+            self.first_row_seen = True
+            first = int(b.ts[0])
+            if self.warmup_s and first > self.open_ns:  # late start with no replay: skip the missed grid, warm up
+                self.warmup_until_ns = first + secs(self.warmup_s)
+                self.gi = int(np.searchsorted(self.grid, first, side="left"))
+                self.on_change("warmup", until_ns=self.warmup_until_ns)
         while i < n and not self.closed:
             t = self.next_event()
             k = i + int(np.searchsorted(b.ts[i:], t, side="right"))
@@ -440,24 +462,25 @@ class Engine:
             return
         self.decided.append(t)
         prev = {lb: int(self.day.row_at(t - secs(lb))) for lb in LOOKBACKS}
+        warm = t < self.warmup_until_ns
         for name, p in self.policies.items():
             bk = self.books[name]
             before = bk.pos.side
             ctx = Context(self.day, t, row, prev, bk.pos)
-            d = await p(ctx)
+            d = Decision("HOLD", {}, None, raw_action="WARMUP") if warm else await p(ctx)
             rec = {"day": self.day.day, "t_ns": t, "time_et": ns_to_et(t), "mid": ctx.mid,
                    "position": before, "action": d.action, "raw_action": d.raw_action, "probs": d.probs,
                    "tokens": d.tokens, "cached": d.cached, "state": d.state}
             send_ns = t
             if name == self.jev_name:
-                ms = self.guard.last_ms
+                ms = 0.0 if warm else self.guard.last_ms
                 if self.real_jev and not d.cached and d.tokens:
                     self.jev_calls += 1
                     self.jev_tokens += d.tokens
                     self.jev_ms.append(ms)
                 if self.answer_latency:
                     send_ns = t + int(ms * 1e6)
-                rec.update(jev_ms=round(ms, 1), send_ns=send_ns, error=self.guard.last_error,
+                rec.update(jev_ms=round(ms, 1), send_ns=send_ns, error=None if warm else self.guard.last_error,
                            streak=self.streak())
             self.results[name].decisions.append(rec)
             side = {"BUY": 1, "SELL": -1}.get(d.action, 0)
@@ -573,14 +596,15 @@ class Session:
     def __init__(self, args, cfg: Config, gate: Settings, day: str, symbol: str, source, jev,
                  baselines: list[str], run_dir: Path | None, recorder: Recorder | None,
                  exec_url: str | None = None, paper: paperdb.Recorder | None = None,
-                 deadline_ns: int | None = None):
+                 deadline_ns: int | None = None, warmup_s: float = 0):
         self.args, self.cfg, self.gate, self.source = args, cfg, gate, source
+        self.paper_settings: dict | None = None  # the settings_json written at start; updated on a warm-up
         self.run_dir, self.recorder = run_dir, recorder
         self.paper = paper              # paper DB writer (trades as they close, Jev decisions)
         self.deadline_ns = deadline_ns  # wall clock: stop reading the feed after this (early halts)
         self.bus = Bus()
         self.engine = Engine(day, symbol, cfg, gate, jev, baselines,
-                             answer_latency=source.live, on_change=self._changed)
+                             answer_latency=source.live, on_change=self._changed, warmup_s=warmup_s)
         self.mode = "live" if source.live else "replay"
         self.engine.real_jev = getattr(self.engine, "real_jev", False)
         self.status = "WAITING"
@@ -705,6 +729,14 @@ class Session:
     def _changed(self, kind: str, **kw) -> None:
         e = self.engine
         jn = e.jev_name or "imbalance"
+        if kind == "warmup":
+            until = ns_to_et(kw["until_ns"])
+            print(f"late start: warming up {e.warmup_s:g}s on live data (no catch-up replay on Tradovate); "
+                  f"decisions until {until} ET are HOLD", flush=True)
+            if self.paper and self.paper_settings is not None:
+                self.paper_settings["warmup_until_et"] = until
+                self._paper_safe(self.paper.set_settings, self.paper_settings)
+            return
         if kind == "decision" and e.results.get(e.jev_name) and e.results[e.jev_name].decisions:
             last = e.results[e.jev_name].decisions[-1]
             if self.dec_fh:
@@ -995,9 +1027,30 @@ def error_text(e: BaseException) -> str:
     return (f"{type(e).__name__}: {e}\n" + traceback.format_exc(limit=8))[-4000:]
 
 
+def source_from_env(env=os.environ) -> str:
+    """TRADE_JEV_SOURCE: databento (default) | tradovate | off. Returns the value, lower-cased."""
+    return (env.get("TRADE_JEV_SOURCE") or "databento").strip().lower()
+
+
+def skip_reason(source: str, env=os.environ, explicit: bool = False) -> str | None:
+    """Why today's live run must not start a feed (names only, never secret values), or None.
+    TRADE_JEV_SOURCE=off is only a default: an explicit --source (`explicit`) wins over it."""
+    if source_from_env(env) == "off" and not explicit:
+        return "TRADE_JEV_SOURCE=off"
+    if source == "tradovate":
+        missing = missing_credentials(env)
+        if missing:
+            return "tradovate credentials missing: " + ", ".join(missing)
+    return None
+
+
 async def amain(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Live (or rehearsed) Jev signals on NQ with a local view.")
-    ap.add_argument("--symbol", default=None, help="raw Databento symbol, default: NQ front month")
+    ap.add_argument("--source", choices=SOURCES, default=None,
+                    help="live feed: databento or tradovate (default: $TRADE_JEV_SOURCE, else databento; "
+                         "TRADE_JEV_SOURCE=off skips the day)")
+    ap.add_argument("--symbol", default=None,
+                    help="raw symbol for the chosen feed (e.g. NQZ6 on both), default: NQ front month")
     ap.add_argument("--from-file", metavar="DAY", default=None, help="rehearse on a recorded day (no subscription)")
     ap.add_argument("--speed", type=float, default=60.0, help="--from-file: x real time (0 = as fast as possible)")
     ap.add_argument("--stored-answers", metavar="RUN_DIR", default=None, help="play back a run's Jev answers")
@@ -1023,6 +1076,12 @@ async def amain(argv: list[str] | None = None) -> int:
     ap.add_argument("--paper-db", action=argparse.BooleanOptionalAction, default=None,
                     help="record the session in the paper DB (default: on for live sessions that save)")
     args = ap.parse_args(argv)
+    explicit_source = args.source is not None
+    env_source = source_from_env()
+    if env_source not in (*SOURCES, "off"):
+        ap.error(f"TRADE_JEV_SOURCE={env_source!r}: use databento, tradovate or off")
+    if args.source is None:
+        args.source = "databento" if env_source == "off" else env_source
 
     cfg = Config(**{f.name: getattr(args, f.name) for f in fields(Config)})
     gate = Settings(args.min_conf, args.agree, args.min_hold, cfg.stop_ticks, cfg.target_ticks)
@@ -1034,6 +1093,7 @@ async def amain(argv: list[str] | None = None) -> int:
     use_paper = args.paper_db if args.paper_db is not None else (not args.from_file and not args.no_save)
 
     recorder, deadline_ns = None, None
+    warmup_s, late_start = 0, False
     if args.from_file:
         day = args.from_file
         days = list_days()
@@ -1055,6 +1115,12 @@ async def amain(argv: list[str] | None = None) -> int:
             if use_paper:
                 paperdb.record_holiday(f"live-{day}", day, symbol, closed)
             return 0
+        if (why := skip_reason(args.source, explicit=explicit_source)) is not None:
+            print(f"{day}: skipped ({why}); no feed started", flush=True)
+            if use_paper:
+                paperdb.record_skip(f"live-{day}", day, symbol, "skipped", why,
+                                    source="off" if why == "TRADE_JEV_SOURCE=off" else args.source)
+            return 0
         open_ns = et_to_ns(day, cfg.start_et) - secs(max(LOOKBACKS) + 60)
         start_ns = None
         if now_ns > open_ns:  # late start: intraday replay so the 60s look-back and streaks exist
@@ -1065,14 +1131,25 @@ async def amain(argv: list[str] | None = None) -> int:
                 print(f"the {day} session is over (ends {cfg.end_et} ET); nothing to do", flush=True)
                 return 0
             ap.error(f"the {day} session is over (ends {cfg.end_et} ET); use --from-file to rehearse")
-        if not os.environ.get("DATABENTO_API_KEY"):
-            ap.error("set DATABENTO_API_KEY in .env (or use --from-file)")
-        source = DatabentoSource(symbol, start_ns, stop_ns)
+        if args.source == "tradovate":
+            try:
+                TradovateConfig.from_env()  # validates TRADOVATE_ENV; credentials were checked by skip_reason
+            except TradovateError as e:
+                ap.error(str(e))
+            source = TradovateSource(symbol, stop_ns)
+            late_start = now_ns > open_ns
+            warmup_s = WARMUP_S
+            how = ("now" if not late_start else f"now (late start: {WARMUP_S}s warm-up, no catch-up replay)")
+        else:
+            if not os.environ.get("DATABENTO_API_KEY"):
+                ap.error("set DATABENTO_API_KEY in .env (or use --from-file)")
+            source = DatabentoSource(symbol, start_ns, stop_ns)
+            how = "now" if start_ns is None else ns_to_et(start_ns) + " ET (intraday replay)"
         deadline_ns = stop_ns + secs(120)
         run_dir = None if args.no_save else new_run_dir("live", day)
         if not args.no_save:
-            recorder = Recorder(day, symbol)
-        print(f"{symbol} live from {'now' if start_ns is None else ns_to_et(start_ns) + ' ET (intraday replay)'}; "
+            recorder = Recorder(day, symbol, feed=args.source)
+        print(f"{symbol} live ({args.source}) from {how}; "
               f"decisions {cfg.start_et}–{cfg.end_et} ET every {cfg.cadence_s:g}s", flush=True)
 
     jev, client = None, None
@@ -1098,7 +1175,7 @@ async def amain(argv: list[str] | None = None) -> int:
 
     baselines = [b for b in args.baselines.split(",") if b]
     session = Session(args, cfg, gate, day, symbol, source, jev, baselines, run_dir, recorder, args.exec_url,
-                      paper=paper, deadline_ns=deadline_ns)
+                      paper=paper, deadline_ns=deadline_ns, warmup_s=warmup_s)
     if run_dir:
         write_config(run_dir, cfg, [day], list(session.engine.policies), args.encoder, args.model,
                      {"min_conf": gate.min_conf, "agree": gate.agree, "min_hold_s": gate.min_hold_s},
@@ -1106,9 +1183,13 @@ async def amain(argv: list[str] | None = None) -> int:
     hb = None
     if paper:
         model = None if jev is None else f"stored:{args.stored_answers}" if args.stored_answers else args.model
-        paper.start(day, symbol, {**session.snapshot["settings"], "encoder": args.encoder,
-                                  "policies": list(session.engine.policies)},
-                    model, session.snapshot["run_dir"])
+        settings = {**session.snapshot["settings"], "encoder": args.encoder,
+                    "policies": list(session.engine.policies)}
+        if late_start:
+            settings["late_start_warmup_s"] = WARMUP_S
+        session.paper_settings = settings
+        paper.start(day, symbol, settings, model, session.snapshot["run_dir"],
+                    source=None if args.from_file else args.source)
         hb = asyncio.create_task(heartbeat(paper))
     sigterm = []  # launchd / the extension stop jobs with SIGTERM: close the session like Ctrl-C, exit 0
     main_task = asyncio.current_task()
@@ -1140,6 +1221,9 @@ async def amain(argv: list[str] | None = None) -> int:
 
     try:
         await session.run()
+        if not args.from_file and args.source == "tradovate" and session.engine.day.n == 0:
+            raise RuntimeError("no Tradovate book data received all session: likely no CME market-data "
+                               "entitlement for API access yet (run scripts/tradovate_check.py)")
         session.write_outputs()
         end_paper("done")
         if args.exit_at_close:

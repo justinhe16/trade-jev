@@ -14,7 +14,9 @@ function ago(iso) {
   const s = Math.max(0, Math.round((Date.now() - Date.parse(iso)) / 1000));
   return s < 90 ? `${s}s ago` : s < 5400 ? `${Math.round(s / 60)}m ago` : s < 129600 ? `${Math.round(s / 3600)}h ago` : `${Math.round(s / 86400)}d ago`;
 }
+const noSession = (s) => s.status === "holiday" || s.status === "skipped";  // the runner chose not to trade
 function statusOf(s) {
+  if (s.status === "skipped") return ["skipped", "skipped", s.error || "skipped"];
   if (s.status === "running" && s.stale) return ["dead?", "dead", "running, but no heartbeat since " + ago(s.heartbeat_at)];
   return [s.status, s.status, s.status === "running" ? "heartbeat " + ago(s.heartbeat_at) : ""];
 }
@@ -36,14 +38,14 @@ function renderList() {
   renderTiles(ss); renderSessions(ss);
 }
 function renderTiles(ss) {
-  const traded = ss.filter((s) => s.status !== "holiday" && Object.keys(s.policies).length);
+  const traded = ss.filter((s) => !noSession(s) && Object.keys(s.policies).length);
   const names = [...new Set(traded.flatMap((s) => Object.keys(s.policies)))].sort((a, b) => isJev(b) - isJev(a));
   const total = (n) => traded.reduce((a, s) => a + (s.policies[n]?.pnl || 0), 0);
   const jev = names.find(isJev);
   const jevDays = traded.filter((s) => jev && s.policies[jev]);
   const won = jevDays.filter((s) => s.policies[jev].pnl > 0).length;
   const cost = traded.reduce((a, s) => a + (s.policies[jev]?.jev_cost_usd || 0), 0);
-  const items = [["Days traded", traded.length, `${ss.filter((s) => s.status === "holiday").length} skipped (holiday / weekend)`]];
+  const items = [["Days traded", traded.length, `${ss.filter(noSession).length} skipped (holiday / weekend / feed off or credentials missing)`]];
   if (jev) items.push(["Jev P&L", `<span class="${cls(total(jev))}">${fmtUsd(total(jev))}</span>`, `${won} of ${jevDays.length} days positive`]);
   for (const n of names.filter((n) => !isJev(n))) items.push([n, `<span class="${cls(total(n))}">${fmtUsd(total(n))}</span>`, "baseline"]);
   if (jev) items.push(["Jev cost", "$" + cost.toFixed(3), "API spend, finished days"]);
@@ -51,18 +53,19 @@ function renderTiles(ss) {
 }
 function renderSessions(ss) {
   const base = [...new Set(ss.flatMap((s) => Object.keys(s.policies)).filter((n) => !isJev(n)))].sort();
-  $("sessions").innerHTML = `<thead><tr><th>Day</th><th>Status</th><th>Jev P&amp;L</th>${base.map((n) => `<th>${esc(n)}</th>`).join("")}
+  $("sessions").innerHTML = `<thead><tr><th>Day</th><th>Status</th><th>Source</th><th>Jev P&amp;L</th>${base.map((n) => `<th>${esc(n)}</th>`).join("")}
     <th>Jev trades</th><th>Wins</th><th>Max DD</th><th>Jev cost</th><th>Session</th></tr></thead><tbody>` +
     ss.map((s) => {
       const [label, c, title] = statusOf(s), j = jevOf(s), jp = j ? s.policies[j] : null;
       const cell = (p) => p ? `<td class="${cls(p.pnl)}">${fmtUsd(p.pnl)}${s.final ? "" : "*"}</td>` : "<td>–</td>";
       return `<tr class="click ${S.sel === s.session_id ? "sel" : ""}" data-id="${esc(s.session_id)}"><td>${esc(s.day)}</td>
-        <td><span class="st ${c}" title="${esc(title)}">${esc(label)}</span>${s.error && s.status !== "holiday" ? " ⚠" : ""}</td>
+        <td><span class="st ${c}" title="${esc(title)}">${esc(label)}</span>${s.error && !noSession(s) ? " ⚠" : ""}</td>
+        <td class="muted">${esc(s.source || "–")}</td>
         ${cell(jp)}${base.map((n) => cell(s.policies[n])).join("")}
         <td>${jp ? jp.trades : "–"}</td><td>${jp ? jp.wins : "–"}</td><td>${jp ? fmtUsd(-jp.max_drawdown) : "–"}</td>
         <td>${jp?.jev_cost_usd != null ? "$" + jp.jev_cost_usd.toFixed(3) : "–"}</td>
-        <td style="text-align:left" class="muted">${esc(s.status === "holiday" ? s.error : s.session_id)}</td></tr>`;
-    }).join("") + `</tbody><tfoot><tr><td colspan="${8 + base.length}" class="note" style="text-align:left">* still running: totals from the trades closed so far.</td></tr></tfoot>`;
+        <td style="text-align:left" class="muted">${esc(noSession(s) ? s.error : s.session_id)}</td></tr>`;
+    }).join("") + `</tbody><tfoot><tr><td colspan="${9 + base.length}" class="note" style="text-align:left">* still running: totals from the trades closed so far.</td></tr></tfoot>`;
 }
 $("sessions").addEventListener("click", (e) => {
   const tr = e.target.closest("tr[data-id]"); if (!tr) return;
@@ -89,9 +92,9 @@ function renderDetail() {
   $("detail").hidden = false;
   const [label, , title] = statusOf(d);
   $("dtitle").innerHTML = `${esc(d.day)} <span class="sub">· ${esc(d.symbol || "")} · ${esc(label)}${title ? " (" + esc(title) + ")" : ""}</span>`;
-  $("dmeta").textContent = [d.session_id, d.run_dir, d.jev_model && "model " + d.jev_model,
+  $("dmeta").textContent = [d.session_id, d.source && "source " + d.source, d.run_dir, d.jev_model && "model " + d.jev_model,
     d.started_at && "started " + new Date(d.started_at).toLocaleString(), d.ended_at && "ended " + new Date(d.ended_at).toLocaleString()].filter(Boolean).join(" · ");
-  $("derror").hidden = !d.error || d.status === "holiday"; $("derror").textContent = d.error || "";
+  $("derror").hidden = !d.error || noSession(d); $("derror").textContent = d.error || "";
   const names = Object.keys(d.policies).sort((a, b) => isJev(b) - isJev(a) || a.localeCompare(b));
   $("dpolicies").innerHTML = names.length ? `<thead><tr><th>Policy</th><th>P&amp;L</th><th>Trades</th><th>Wins</th><th>Win %</th><th>Max DD</th><th>Jev calls</th><th>Jev cost</th></tr></thead><tbody>` +
     names.map((n) => {
@@ -100,7 +103,7 @@ function renderDetail() {
         <td>${p.trades ? Math.round(100 * p.wins / p.trades) + "%" : "–"}</td><td>${fmtUsd(-p.max_drawdown)}</td>
         <td>${isJev(n) && p.jev_calls != null ? p.jev_calls.toLocaleString() : "–"}</td><td>${isJev(n) && p.jev_cost_usd != null ? "$" + p.jev_cost_usd.toFixed(3) : "–"}</td></tr>`;
     }).join("") + "</tbody>" + (d.final ? "" : `<tfoot><tr><td colspan="8" class="note" style="text-align:left">Running: totals from trades closed so far; Jev calls and cost are written at the session end.</td></tr></tfoot>`)
-    : `<tbody><tr><td class="empty">${d.status === "holiday" ? "No session: " + esc(d.error) : "No trades yet."}</td></tr></tbody>`;
+    : `<tbody><tr><td class="empty">${noSession(d) ? (d.status === "skipped" ? "Skipped: " : "No session: ") + esc(d.error) : "No trades yet."}</td></tr></tbody>`;
   const st = d.settings;
   $("dsettings").textContent = st ? `Settings: confidence ≥ ${st.min_conf}, ${st.agree} agreeing, ${st.min_hold_s}s min hold, stop ${st.stop_ticks || "off"} / target ${st.target_ticks || "off"} ticks, every ${st.cadence_s}s from ${st.start_et} to ${st.end_et} ET, ${st.latency_ms} ms latency, $${st.commission}/side.` : "";
   renderTrades(d, names); renderDecs(d);
@@ -122,13 +125,14 @@ function renderDecs(d) {
   const all = d.decisions;
   const pick = { all: () => true, acted: (x) => x.action !== "HOLD", errors: (x) => !!x.error }[S.dfilter] || (() => true);
   const rows = all.filter(pick).reverse();
-  $("dcount").textContent = `· ${all.length.toLocaleString()} answers${all.length ? `, ${all.filter((x) => x.action !== "HOLD").length} acted on, ${all.filter((x) => x.error).length} errors` : ""}`;
+  $("dcount").textContent = `· ${all.length.toLocaleString()} answers${all.length ? `, ${all.filter((x) => x.action !== "HOLD").length} acted on, ${all.filter((x) => x.error).length} errors${all.some((x) => x.raw_action === "WARMUP") ? `, ${all.filter((x) => x.raw_action === "WARMUP").length} warm-up` : ""}` : ""}`;
   $("dfilter").innerHTML = [["all", "All"], ["acted", "Acted on"], ["errors", "Errors"]]
     .map(([k, l]) => `<button class="btn" data-f="${k}" aria-pressed="${S.dfilter === k}">${l}</button>`).join("");
   $("ddecs").innerHTML = rows.length ? `<thead><tr><th>Time ET</th><th>Mid</th><th>Answer</th><th>p</th><th>Acted</th><th>Position</th><th>ms</th><th>Error</th></tr></thead><tbody>` +
     rows.map((x) => {
       const raw = x.raw_action || x.action, p = x.probs?.[raw];
-      return `<tr><td>${esc(x.time_et)}</td><td>${fmtPx(x.mid)}</td><td>${esc(raw)}</td><td>${p != null ? (p * 100).toFixed(0) + "%" : "–"}</td>
+      const warm = raw === "WARMUP";  // Tradovate late start: HOLD without a Jev call, not an error
+      return `<tr><td>${esc(x.time_et)}</td><td>${fmtPx(x.mid)}</td><td${warm ? ' class="muted" title="late-start warm-up: no Jev call"' : ""}>${warm ? "warmup" : esc(raw)}</td><td>${p != null ? (p * 100).toFixed(0) + "%" : "–"}</td>
         <td>${x.action !== "HOLD" ? "<b>" + esc(x.action) + "</b>" : "–"}</td><td>${x.position > 0 ? "long" : x.position < 0 ? "short" : "flat"}</td>
         <td>${x.jev_ms != null ? Math.round(x.jev_ms) : "–"}</td><td style="text-align:left" class="muted">${esc(x.error || "")}</td></tr>`;
     }).join("") + "</tbody>"

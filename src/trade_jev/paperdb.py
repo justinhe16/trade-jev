@@ -4,7 +4,10 @@
 
 Tables (other tools read these; don't rename columns):
   paper_sessions   one row per session (session_id = the run dir name, e.g. live-2026-11-02)
-                   status: running | done | crashed | holiday | aborted
+                   status: running | done | crashed | holiday | aborted | skipped
+                   (skipped: the runner chose not to trade, e.g. TRADE_JEV_SOURCE=off or missing
+                   Tradovate credentials; the reason is in `error`)
+                   source: the feed, databento | tradovate (NULL on older rows). Added to old DBs by connect().
                    timestamps ISO-8601 UTC; day = ET trading date. heartbeat_at is refreshed at least
                    every 60s while running: `running` with a stale heartbeat means the process died.
   paper_trades     one row per closed trade, every policy, written as it closes. side: long | short
@@ -71,6 +74,12 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA synchronous=NORMAL")
     con.executescript(SCHEMA)
+    if "source" not in {r[1] for r in con.execute("PRAGMA table_info(paper_sessions)")}:
+        try:
+            con.execute("ALTER TABLE paper_sessions ADD COLUMN source TEXT")  # older DBs; idempotent
+            con.commit()
+        except sqlite3.OperationalError:  # another process added it first
+            pass
     return con
 
 
@@ -143,18 +152,23 @@ class Recorder:
 
     # -- session lifecycle
 
-    def start(self, day: str, symbol: str, settings: dict, jev_model: str | None, run_dir: str | None) -> None:
+    def start(self, day: str, symbol: str, settings: dict, jev_model: str | None, run_dir: str | None,
+              source: str | None = None) -> None:
         now = utc_now()
         self._put("""INSERT INTO paper_sessions
                      (session_id, day, symbol, status, started_at, ended_at, heartbeat_at,
-                      settings_json, jev_model, run_dir, error)
-                     VALUES (?, ?, ?, 'running', ?, NULL, ?, ?, ?, ?, NULL)
+                      settings_json, jev_model, run_dir, error, source)
+                     VALUES (?, ?, ?, 'running', ?, NULL, ?, ?, ?, ?, NULL, ?)
                      ON CONFLICT(session_id) DO UPDATE SET
                        day=excluded.day, symbol=excluded.symbol, status='running',
                        started_at=excluded.started_at, ended_at=NULL, heartbeat_at=excluded.heartbeat_at,
                        settings_json=excluded.settings_json, jev_model=excluded.jev_model,
-                       run_dir=excluded.run_dir, error=NULL""",
-                  (self.session_id, day, symbol, now, now, json.dumps(settings), jev_model, run_dir))
+                       run_dir=excluded.run_dir, error=NULL, source=excluded.source""",
+                  (self.session_id, day, symbol, now, now, json.dumps(settings), jev_model, run_dir, source))
+
+    def set_settings(self, settings: dict) -> None:
+        self._put("UPDATE paper_sessions SET settings_json=? WHERE session_id=?",
+                  (json.dumps(settings), self.session_id))
 
     def heartbeat(self) -> None:
         self._put("UPDATE paper_sessions SET heartbeat_at=? WHERE session_id=?", (utc_now(), self.session_id))
@@ -196,18 +210,29 @@ class Recorder:
             self.thread.join(timeout)
 
 
-def record_holiday(session_id: str, day: str, symbol: str | None, reason: str, path: Path | None = None) -> None:
-    """A skipped day: one `holiday` row, so a watcher knows the runner ran and chose not to trade."""
+def record_skip(session_id: str, day: str, symbol: str | None, status: str, reason: str,
+                source: str | None = None, path: Path | None = None) -> None:
+    """A day the runner chose not to trade (`holiday` or `skipped`): one row with the reason in `error`, so a
+    watcher knows the runner ran. Never overwrites a real session: only holiday/skipped rows are replaced."""
     now = utc_now()
-    with connect(path) as con:
-        con.execute("""INSERT INTO paper_sessions
-                       (session_id, day, symbol, status, started_at, ended_at, heartbeat_at, error)
-                       VALUES (?, ?, ?, 'holiday', ?, ?, ?, ?)
-                       ON CONFLICT(session_id) DO UPDATE SET status='holiday', ended_at=excluded.ended_at,
-                         heartbeat_at=excluded.heartbeat_at, error=excluded.error
-                       WHERE paper_sessions.status IN ('holiday')""",
-                    (session_id, day, symbol, now, now, now, reason))
-    con.close()
+    con = connect(path)
+    try:
+        with con:
+            con.execute("""INSERT INTO paper_sessions
+                           (session_id, day, symbol, status, started_at, ended_at, heartbeat_at, error, source)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           ON CONFLICT(session_id) DO UPDATE SET status=excluded.status,
+                             ended_at=excluded.ended_at, heartbeat_at=excluded.heartbeat_at,
+                             error=excluded.error, source=excluded.source
+                           WHERE paper_sessions.status IN ('holiday', 'skipped')""",
+                        (session_id, day, symbol, status, now, now, now, reason, source))
+    finally:
+        con.close()
+
+
+def record_holiday(session_id: str, day: str, symbol: str | None, reason: str, path: Path | None = None) -> None:
+    """A holiday / weekend: one `holiday` row (see `record_skip`)."""
+    record_skip(session_id, day, symbol, "holiday", reason, path=path)
 
 
 # ---------------------------------------------------------------- readers (viewer)

@@ -1,0 +1,71 @@
+# trade-jev: Jev paper-trading NQ on the Mini. Reads the paper runner's SQLite DB (read-only)
+# and can start or stop its launchd job. It never places orders: paper only. See README.md.
+name: trade-jev
+version: 1
+description: Jev paper-trading NQ on the Mini; session status, P&L vs baselines, trades, start/stop.
+examples:
+  - is trade-jev running?
+  - how did jev do this week vs hold
+  - start trade-jev
+approvers: [owner]
+repos: [justinhe16/trade-jev]
+
+tools:
+  # Tool names match the evals (trade_jev_status is a plain read; start/stop ask first).
+  trade_jev_status:
+    description: >-
+      Today's paper session (ET): running, done, crashed, or stale (likely dead), Jev's
+      position, P&L and trade count so far, and whether the launchd job is loaded.
+    run: ./cli.py status
+    effect: read
+  trade_jev_pnl:
+    description: >-
+      Paper P&L for Jev vs the baselines (hold, random, imbalance): pnl, trades, wins,
+      drawdown, Jev cost. date is "" for the latest session, "today", "yesterday",
+      YYYY-MM-DD, "week" (Mon to today), "month", or "YYYY-MM-DD..YYYY-MM-DD"; ranges add totals and a per-day list.
+    run: ./cli.py pnl --date {date}
+    effect: read
+    args: {date: string}
+  trade_jev_trades:
+    description: >-
+      Compact list of paper trades (ET times, side, prices, reason, pnl). date as in
+      trade_jev_pnl ("" = latest session); policy "" means Jev, or a baseline name;
+      limit 0 means 20 (max 50); the latest trades are shown.
+    run: ./cli.py trades --date {date} --policy {policy} --limit {limit}
+    effect: read
+    args: {date: string, policy: string, limit: integer}
+  trade_jev_start:
+    description: Start today's paper session (kickstarts the launchd job com.tradejev.paper).
+    run: ./cli.py start
+    effect: write
+    level: L2          # asks when the model chose it; runs and reports when the owner typed it
+    approval_summary: start trade-jev paper trading
+    timeout_s: 30
+  trade_jev_stop:
+    description: Stop the paper session for today (SIGTERM to the launchd job com.tradejev.paper).
+    run: ./cli.py stop
+    effect: write
+    level: L2          # not L3: a misread "stop" would end the day's session unasked
+    approval_summary: stop trade-jev paper trading for today
+    timeout_s: 30
+
+jobs:
+  - id: close-summary
+    schedule: "10 16 * * 1-5"
+    tz: America/New_York
+    run: ./cli.py close-summary
+    effect: read
+    level: L0
+    timeout_s: 60
+    catchup: 6h        # if the daemon was down at 16:10, report that day once it's back
+  - id: watch
+    schedule: "5,20,35,50 9-15 * * 1-5"   # checks 09:35..15:50 ET on trading days (script-guarded)
+    tz: America/New_York
+    run: ./cli.py watch
+    effect: read
+    level: L0
+    timeout_s: 60
+
+# watch's "trade-jev/down" texts at once; close-summary's daily P&L rides the hourly pulse.
+report: {max_urgency: urgent}
+health: {check: ./cli.py health, every: 5m}

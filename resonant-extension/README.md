@@ -38,18 +38,18 @@ Results stay under 4 KB: long lists drop their oldest entries and report `omitte
 
 **Which policy is Jev?** Any policy whose name contains `jev`, in any case (`is_jev()` in `cli.py`, the only place that rule lives). Every other policy is a baseline. If several match, the first by name is the headline one.
 
-**Where the P&L comes from.** pnl, trades and wins come from `paper_trades` closed trades (`exit_ns` set), so they are current even mid-session. Drawdown, Jev calls and Jev cost come from `paper_summary` when it has a row. `paper_summary` is only written at session end, so for a session without one (still running, or killed before writing it) the Jev policy's `jev_calls` is the count of model calls in its `paper_decisions` log, marked `jev_calls_from: "decisions"` (or `"summary+decisions"` when a day mixes both); `jev_cost_usd` stays null there, because the log has no token counts. A policy with summary rows but no trade rows uses the summary's numbers. A day with several sessions (a restart after a crash) is summed. `holiday` and `skipped` sessions are ignored; `pnl` for a day that was only skipped answers `skipped: <reason>`.
+**Where the P&L comes from.** pnl, trades and wins come from `paper_trades` closed trades (`exit_ns` set), so they are current even mid-session. Drawdown, Jev calls and Jev cost come from `paper_summary` when it has a row. `paper_summary` is only written at session end, so for a session without one (still running, or killed before writing it) the Jev policy's `jev_calls` is the count of model calls in its `paper_decisions` log, marked `jev_calls_from: "decisions"` (a Jev that has decisions but no closed trade yet still gets its row) (or `"summary+decisions"` when a day mixes both); `jev_cost_usd` stays null there, because the log has no token counts. A policy with summary rows but no trade rows uses the summary's numbers. A day with several sessions (a restart after a crash) is summed. `holiday` and `skipped` sessions are ignored; `pnl` for a day that was only skipped answers `skipped: <reason>`.
 
 ### Is Jev making model calls?
 
 `paper_decisions` is written as each 15 s decision is made, so it answers this mid-session (the 8765 viewer is not attached to the live session, and the session's own view on 8767 isn't something the brain should curl). `jev_live` (in `trade_jev_status`) and `live` (in `trade_jev_decisions`) hold, for one session's Jev policy:
 
-- `decisions`, `warmup` (late-start warm-up rows, `raw_action = WARMUP`), `model_calls`, `errors`, `last_error` (`HH:MM:SS <error>`)
+- `decisions`, `warmup` (late-start warm-up rows, `raw_action = WARMUP`), `model_calls` (answered), `errors`, `last_error` (`HH:MM:SS <error>`)
 - `avg_ms`, `p95_ms` over the model calls; `last_decision_et`, `last_decision_age_s`
 - `raw` and `gated`: the action mix before and after the filters (`raw_action` vs `action`)
 - `model` (`paper_sessions.jev_model`) and **`calls_mode`**
 
-The signal is `jev_ms`: live.py records the wall time of the policy call (`Guarded.last_ms`) on every Jev decision. Stored answers (`--stored-answers`) and jsonl cache hits answer from memory in well under 1 ms; a real Jev API call takes about 90 ms or more (avg ~123 ms on the Mini). So a **model call** is a decision with no error and `jev_ms >= 20` (`CALL_MS` in `cli.py`). `calls_mode` judges the latest 20 decisions (5 minutes), so it is about now:
+The signal is `jev_ms`: live.py records the wall time of the policy call (`Guarded.last_ms`) on every Jev decision. Stored answers (`--stored-answers`) and jsonl cache hits answer from memory in well under 1 ms; a real Jev API call takes about 90 ms or more (avg ~123 ms on the Mini). So a **model call** is an *answered* call: a decision with no error and `jev_ms >= 20` (`CALL_MS` in `cli.py`); failed attempts are counted in `errors`, so attempts = `model_calls + errors`. This log-based count is not the same definition as `paper_summary.jev_calls` (non-cached answers that reported tokens), which is why pnl marks it with `jev_calls_from`. `p95_ms` is nearest-rank. `calls_mode` judges the latest 20 decisions (5 minutes), so it is about now:
 
 | `calls_mode` | Means |
 |---|---|

@@ -840,7 +840,7 @@ def test_status_running_has_live_jev_stats_without_a_summary(db: PaperDB) -> Non
     assert j["decisions"] == 12 and j["model_calls"] == 11 and j["errors"] == 1
     assert j["last_error"] == "10:01:15 TimeoutError: jev"
     assert j["avg_ms"] == round(sum(100 + 10 * i for i in range(12) if i != 5) / 11)
-    assert j["p95_ms"] == 210
+    assert j["p95_ms"] == 210  # nearest rank of 11: the 11th
     assert j["last_decision_et"] == "10:02:45" and j["last_decision_age_s"] == 15
     assert j["raw"] == {"BUY": 4, "SELL": 4, "HOLD": 4} and j["gated"] == {"BUY": 1, "HOLD": 11}
     assert "Jev: live model calls (11 calls, 1 errors, avg" in out["summary"]
@@ -1061,3 +1061,29 @@ def test_manifest_validates_against_the_resonant_sdk() -> None:
     assert set(m["jobs"]) == {"close-summary", "watch"} and all(m["jobs"].values())
     assert set(m["agents"]) == set(AGENTS) and all(m["agents"].values())
     assert all(n <= 300 for n in m["tool_desc"].values())
+
+
+def test_pnl_has_jev_calls_before_jevs_first_closed_trade(db: PaperDB) -> None:
+    """Review: early in a session Jev has decisions but no closed trade; pnl still shows its calls."""
+    db.session("s1", TUE, "running", heartbeat=et(TUE, "09:35"))
+    db.trade("s1", "hold", TUE, "09:30", "09:31", 5.0)
+    for i in range(5):
+        db.decision("s1", JEV, TUE, "09:31", 0, action="HOLD", raw="HOLD", ms=120.0, sec=i * 10)
+    out = cli.run(["pnl", "--date", "today"], now=et(TUE, "09:35"))
+    jev = next(p for p in out["policies"] if p["jev"])
+    assert out["jev_policy"] == JEV and jev["trades"] == 0 and jev["pnl"] == 0.0
+    assert jev["jev_calls"] == 5 and jev["jev_calls_from"] == "decisions"
+    assert out["summary"].startswith("Paper NQ Tue 11/3: Jev +$0 (0 trades), hold +$5")
+
+
+def test_p95_is_nearest_rank(db: PaperDB) -> None:
+    db.session("s1", TUE, "running", heartbeat=et(TUE, "10:05"))
+    for i in range(20):  # 101..120 ms: nearest-rank p95 is the 19th value, not the max
+        db.decision("s1", JEV, TUE, "10:00", 0, ms=101.0 + i, sec=i)
+    assert cli.run(["status"], now=et(TUE, "10:05"))["jev_live"]["p95_ms"] == 119
+
+
+def test_close_summary_ttl_across_the_dst_change(db: PaperDB, reports) -> None:
+    """Fri 2026-03-06 16:10 EST → Mon 03-09 09:30 EDT is 64h20m elapsed (clocks spring forward)."""
+    seed_day(db, "s1", "2026-03-06")
+    assert cli.run(["close-summary"], now=et("2026-03-06", "16:10"))["ttl"] == "65h"

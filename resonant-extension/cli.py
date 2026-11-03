@@ -315,6 +315,14 @@ def policy_stats(conn: sqlite3.Connection, session_ids: list[str]) -> dict[str, 
                 e["jev_calls"] = (e["jev_calls"] or 0) + int(r["jev_calls"])
             if r["jev_cost_usd"] is not None:
                 e["jev_cost_usd"] = (e["jev_cost_usd"] or 0.0) + float(r["jev_cost_usd"])
+    # Jev before its first closed trade has no row yet: seed it from the decision log, so pnl
+    # answers "are calls going out?" from the first decision.
+    if not any(is_jev(p) for p in stats) and has_table(conn, "paper_decisions"):
+        logged = [r["policy"] for r in conn.execute(
+            f"SELECT DISTINCT policy FROM paper_decisions WHERE session_id IN ({marks})",  # noqa: S608
+            session_ids)]  # fmt: skip
+        if (jp := pick_jev(logged)) is not None:
+            entry(jp)
     # paper_summary is written at session end, so a running session has no jev_calls yet: count the
     # live model calls in its decision log instead (jev_cost_usd stays null: the log has no tokens).
     for p, e in stats.items():
@@ -427,7 +435,7 @@ def jev_live(
         if last_err is None
         else f"{last_err['time_et']} {clip(last_err['error'], 100)}",
         "avg_ms": round(sum(ms) / len(ms)) if ms else None,
-        "p95_ms": round(ms[min(len(ms) - 1, int(0.95 * len(ms)))]) if ms else None,
+        "p95_ms": round(ms[-(-95 * len(ms) // 100) - 1]) if ms else None,  # nearest rank
         "last_decision_et": ns_to_et(last_t),
         "last_decision_age_s": None if last_t is None else int(now.timestamp() - last_t / 1e9),
         "raw": raw,
@@ -1036,7 +1044,9 @@ def next_open_ttl(day: str, now: datetime, cfg: Config) -> str:
     d = date.fromisoformat(day) + timedelta(days=1)
     while not is_trading_day(d, cfg):
         d += timedelta(days=1)
-    left = (datetime.combine(d, OPEN, ET) - now).total_seconds()
+    # both sides in UTC: an aware ET `now` would otherwise subtract as wall clock across DST
+    left = (datetime.combine(d, OPEN, ET).astimezone(timezone.utc) - now.astimezone(timezone.utc))
+    left = left.total_seconds()
     return f"{min(168, max(1, -(-int(left) // 3600)))}h"
 
 

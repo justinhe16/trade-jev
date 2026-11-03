@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""trade-jev Resonant extension: paper-trading status, P&L, trades, start/stop, two jobs.
+"""trade-jev Resonant extension: paper status, P&L, trades, Jev decisions, start/stop, two jobs.
 
 Stdlib only. Resonant runs this as ``python -I -S cli.py <cmd>`` with ``PATH=/usr/bin:/bin``
 and ``HOME``/``RESONANT_EXT_DATA`` set to the extension's data dir (never the real home).
@@ -46,6 +46,13 @@ NO_SESSIONS = "no paper sessions yet"
 
 DEFAULT_TRADES = 20
 MAX_TRADES = 50
+DEFAULT_DECISIONS = 20
+MAX_DECISIONS = 50
+# A Jev decision whose jev_ms (the wall time of the policy call, `Guarded.last_ms` in live.py) is at
+# least this long went over the network. Stored answers (--stored-answers) and jsonl cache hits
+# answer from memory in well under 1 ms; a real Jev API call takes ~90 ms or more. Warm-up rows: 0.
+CALL_MS = 20.0
+RECENT_DECISIONS = 20  # calls_mode judges the latest 20 decisions (5 min at 15 s): "right now"
 RESULT_BUDGET = 3800  # bytes of JSON; the model sees at most 4 KB of a result
 PNL_BUCKET = 50  # close summary state: P&L rounded to this, so tiny revisions aren't news
 DOWN_KEY = "trade-jev/down"
@@ -192,12 +199,12 @@ def num(x: Any) -> float | None:
 def fit(out: dict[str, Any], list_key: str) -> dict[str, Any]:
     """Drop the oldest entries of ``out[list_key]`` until the JSON fits the result budget."""
     items = out.get(list_key)
+    base = out.get("omitted", 0)
     dropped = 0
     while isinstance(items, list) and items and len(json.dumps(out)) > RESULT_BUDGET:
         items.pop(0)
         dropped += 1
-    if dropped:
-        out["omitted"] = out.get("omitted", 0) + dropped
+        out["omitted"] = base + dropped  # counted in the size check that follows
     return out
 
 
@@ -288,11 +295,13 @@ def policy_stats(conn: sqlite3.Connection, session_ids: list[str]) -> dict[str, 
             e = entry(r["policy"])
             e.update(pnl=float(r["pnl"]), trades=int(r["n"]), wins=int(r["wins"] or 0))
             e["_traded"] = True
+    summarized: dict[str, set[str]] = {}  # policy -> sessions with a paper_summary row
     if has_table(conn, "paper_summary"):
         for r in conn.execute(
             f"SELECT * FROM paper_summary WHERE session_id IN ({marks})",  # noqa: S608
             session_ids,
         ):
+            summarized.setdefault(r["policy"], set()).add(r["session_id"])
             e = entry(r["policy"])
             s = e["_summary"] = e["_summary"] or {"pnl": 0.0, "trades": 0, "wins": 0}
             s["pnl"] += float(r["pnl"] or 0)
@@ -306,6 +315,14 @@ def policy_stats(conn: sqlite3.Connection, session_ids: list[str]) -> dict[str, 
                 e["jev_calls"] = (e["jev_calls"] or 0) + int(r["jev_calls"])
             if r["jev_cost_usd"] is not None:
                 e["jev_cost_usd"] = (e["jev_cost_usd"] or 0.0) + float(r["jev_cost_usd"])
+    # paper_summary is written at session end, so a running session has no jev_calls yet: count the
+    # live model calls in its decision log instead (jev_cost_usd stays null: the log has no tokens).
+    for p, e in stats.items():
+        live = [sid for sid in session_ids if sid not in summarized.get(p, set())]
+        if is_jev(p) and live and (n := live_call_count(conn, live, p)) is not None:
+            e["jev_calls"] = (e["jev_calls"] or 0) + n
+            only_live = len(live) == len(session_ids)
+            e["jev_calls_from"] = "decisions" if only_live else "summary+decisions"
     for e in stats.values():
         summary = e.pop("_summary")
         if not e.pop("_traded") and summary:
@@ -325,6 +342,111 @@ def jev_position(conn: sqlite3.Connection, session_id: str, policy: str) -> Any:
         (session_id, policy),
     ).fetchone()
     return row["position"] if row else None
+
+
+def live_call_count(conn: sqlite3.Connection, session_ids: list[str], policy: str) -> int | None:
+    """Answered model calls (``jev_ms >= CALL_MS``) in the decision log; None without a log."""
+    if not has_table(conn, "paper_decisions"):
+        return None
+    marks = ",".join("?" * len(session_ids))
+    return int(conn.execute(
+        f"SELECT COUNT(*) FROM paper_decisions WHERE session_id IN ({marks}) AND policy=? "  # noqa: S608
+        f"AND jev_ms >= ? AND error IS NULL",
+        [*session_ids, policy, CALL_MS],
+    ).fetchone()[0])  # fmt: skip
+
+
+def calls_mode(jev_model: str | None, recent: list[sqlite3.Row]) -> str:
+    """Whether Jev is making real model calls right now, from the latest decisions:
+
+    - ``replay/no calls``: the session plays stored answers (``jev_model`` is ``stored:<run>``), or
+      every recent decision answered in under ``CALL_MS`` (a stored or cached answer)
+    - ``live model calls``: at least one recent decision took a network round trip and answered
+    - ``calls failing``: every recent decision recorded an error (a failed call is a HOLD)
+    - ``warming up`` / ``no decisions yet``
+    """
+    if jev_model and jev_model.startswith("stored:"):
+        return "replay/no calls"
+    if not recent:
+        return "no decisions yet"
+    real = [r for r in recent if r["raw_action"] != "WARMUP"]
+    if not real:
+        return "warming up"
+    if any(r["error"] is None and (r["jev_ms"] or 0) >= CALL_MS for r in real):
+        return "live model calls"
+    if all(r["error"] is not None for r in real):
+        return "calls failing"
+    return "replay/no calls"
+
+
+def jev_live(
+    conn: sqlite3.Connection, session: sqlite3.Row, policy: str | None, now: datetime
+) -> dict[str, Any] | None:
+    """Live Jev stats for one session from ``paper_decisions`` (written as each decision is made;
+    ``paper_summary`` only appears at session end): decisions, model calls, errors, latency, the
+    last decision and the action mix before (raw) and after (gated) the filters."""
+    if not has_table(conn, "paper_decisions"):
+        return None
+    if policy is None:  # no Jev decision or trade yet (the first decision is at 09:30:00 ET)
+        return {"policy": None, "calls_mode": "no decisions yet", "model": session["jev_model"],
+                "decisions": 0}  # fmt: skip
+    sid = session["session_id"]
+    agg = conn.execute(
+        "SELECT COUNT(*) n, SUM(raw_action = 'WARMUP') warm, "
+        "SUM(error IS NULL AND jev_ms >= ?) calls, SUM(error IS NOT NULL) errors, MAX(t_ns) last_t "
+        "FROM paper_decisions WHERE session_id=? AND policy=?",
+        (CALL_MS, sid, policy),
+    ).fetchone()
+    n = int(agg["n"] or 0)
+    ms = [r[0] for r in conn.execute(
+        "SELECT jev_ms FROM paper_decisions WHERE session_id=? AND policy=? AND error IS NULL "
+        "AND jev_ms >= ? ORDER BY jev_ms", (sid, policy, CALL_MS))]  # fmt: skip
+    recent = conn.execute(
+        "SELECT raw_action, jev_ms, error FROM paper_decisions WHERE session_id=? AND policy=? "
+        "ORDER BY t_ns DESC LIMIT ?", (sid, policy, RECENT_DECISIONS)).fetchall()  # fmt: skip
+    last_err = conn.execute(
+        "SELECT time_et, error FROM paper_decisions WHERE session_id=? AND policy=? "
+        "AND error IS NOT NULL ORDER BY t_ns DESC LIMIT 1", (sid, policy)).fetchone()  # fmt: skip
+    raw: dict[str, int] = {}
+    gated: dict[str, int] = {}
+    for r in conn.execute(
+        "SELECT COALESCE(raw_action, action) raw, action, COUNT(*) c FROM paper_decisions "
+        "WHERE session_id=? AND policy=? GROUP BY 1, 2", (sid, policy)):  # fmt: skip
+        raw[r["raw"]] = raw.get(r["raw"], 0) + r["c"]
+        gated[r["action"]] = gated.get(r["action"], 0) + r["c"]
+    last_t = agg["last_t"]
+    return {
+        "policy": policy,
+        "calls_mode": calls_mode(session["jev_model"], recent),
+        "model": session["jev_model"],
+        "decisions": n,
+        "warmup": int(agg["warm"] or 0),
+        "model_calls": int(agg["calls"] or 0),
+        "errors": int(agg["errors"] or 0),
+        "last_error": None
+        if last_err is None
+        else f"{last_err['time_et']} {clip(last_err['error'], 100)}",
+        "avg_ms": round(sum(ms) / len(ms)) if ms else None,
+        "p95_ms": round(ms[min(len(ms) - 1, int(0.95 * len(ms)))]) if ms else None,
+        "last_decision_et": ns_to_et(last_t),
+        "last_decision_age_s": None if last_t is None else int(now.timestamp() - last_t / 1e9),
+        "raw": raw,
+        "gated": gated,
+    }
+
+
+def jev_live_line(j: dict[str, Any] | None) -> str:
+    """``Jev: live model calls (1224 calls, 0 errors, avg 123 ms, last 14:36:45 ET)``."""
+    if not j:
+        return ""
+    if not j["decisions"]:
+        return f"; Jev: {j['calls_mode']}"
+    bits = [f"{j['model_calls']} calls", f"{j['errors']} errors"]
+    if j["avg_ms"] is not None:
+        bits.append(f"avg {j['avg_ms']} ms")
+    if j["last_decision_et"]:
+        bits.append(f"last {j['last_decision_et']} ET")
+    return f"; Jev: {j['calls_mode']} ({', '.join(bits)})"
 
 
 def resolve_days(arg: str, conn: sqlite3.Connection, today: date) -> tuple[str, list[str]]:
@@ -500,6 +622,7 @@ def cmd_status(cfg: Config, now: datetime) -> dict[str, Any]:
         jev = pick_jev(list(stats)) or pick_jev(_decision_policies(conn, s["session_id"]))
         j = stats.get(jev or "", {})
         position = jev_position(conn, s["session_id"], jev) if jev else None
+        live = jev_live(conn, s, jev, now)
     out = {
         "day": today,
         "running": health == "running",
@@ -521,6 +644,7 @@ def cmd_status(cfg: Config, now: datetime) -> dict[str, Any]:
             "trades": j.get("trades", 0),
             "wins": j.get("wins", 0),
         },
+        "jev_live": live,
         "launchd": launchd,
         "token": token,
     }
@@ -532,7 +656,8 @@ def cmd_status(cfg: Config, now: datetime) -> dict[str, Any]:
     src = f" [{source_of(s)}]" if source_of(s) else ""
     out["summary"] = (
         f"{s['symbol']}{src} paper session {label}; Jev {money(out['jev']['pnl'])} "
-        f"({out['jev']['trades']} trades), position {position if position is not None else '?'}{note}"
+        f"({out['jev']['trades']} trades), position {position if position is not None else '?'}"
+        f"{jev_live_line(live)}{note}"
     )
     return out
 
@@ -600,24 +725,50 @@ def cmd_pnl(cfg: Config, now: datetime, date_arg: str) -> dict[str, Any]:
         }
     if len(by_day) == 1:
         out["status"] = "/".join(sorted({s["status"] for s in sessions}))
-    out["summary"] = summary_line(sessions[-1]["symbol"], stats, len(by_day))
+    out["summary"] = summary_line(sessions[-1]["symbol"], stats, len(by_day), min(by_day))
+    last = sessions[-1]
+    if len(by_day) == 1 and last["status"] == "crashed":  # don't let a crash read as a flat day
+        err = short_error(last["error"])
+        out["summary"] += " (crashed" + (f": {err})" if err else ")")
     if daily:
         out["daily"] = daily
         fit(out, "daily")
     return out
 
 
-def summary_line(symbol: str | None, stats: dict[str, dict[str, Any]], ndays: int = 1) -> str:
-    """``Paper NQ: Jev +$420 (6 trades), hold −$110, random +$30``."""
+def day_label(day: str) -> str:
+    """``2026-11-02`` → ``Mon 11/2``: every one-day line names its day, so yesterday's result is
+    never read as today's (the 08:00 briefing lists still-open items verbatim)."""
+    d = date.fromisoformat(day)
+    return f"{d:%a} {d.month}/{d.day}"
+
+
+def pnl_parts(stats: dict[str, dict[str, Any]]) -> str:
+    """``Jev +$420 (6 trades), hold −$110, random +$30``."""
     jev = pick_jev(list(stats))
-    head = f"Paper {symbol or '?'}"
-    if ndays > 1:
-        head += f" ({ndays} days)"
     parts = []
     if jev:
         parts.append(f"Jev {money(stats[jev]['pnl'])} ({stats[jev]['trades']} trades)")
     parts += [f"{p} {money(v['pnl'])}" for p, v in sorted(stats.items()) if not is_jev(p)]
-    return f"{head}: {', '.join(parts) or 'no trades'}"
+    return ", ".join(parts) or "no trades"
+
+
+def summary_line(
+    symbol: str | None, stats: dict[str, dict[str, Any]], ndays: int = 1, day: str | None = None
+) -> str:
+    """``Paper NQ Mon 11/2: Jev +$420 (6 trades), hold −$110, random +$30``."""
+    head = f"Paper {symbol or '?'}"
+    if ndays > 1:
+        head += f" ({ndays} days)"
+    elif day:
+        head += f" {day_label(day)}"
+    return f"{head}: {pnl_parts(stats)}"
+
+
+def short_error(err: str | None, n: int = 90) -> str | None:
+    """The first line of a session error (the exception, not its traceback), clipped."""
+    first = next((ln for ln in (err or "").splitlines() if ln.strip()), "")
+    return clip(first, n) or None
 
 
 def cmd_trades(
@@ -687,6 +838,84 @@ def cmd_trades(
     fit(out, "trades")
     out["shown"] = len(out["trades"])
     out["summary"] = f"{policy}: {total} trades in {label}, showing the last {out['shown']}"
+    return out
+
+
+def _probs(raw: str | None) -> dict[str, float]:
+    try:
+        probs = json.loads(raw or "{}")
+    except ValueError:
+        return {}
+    if not isinstance(probs, dict):
+        return {}
+    return {str(k): round(float(v), 2) for k, v in probs.items() if isinstance(v, (int, float))}
+
+
+def cmd_decisions(cfg: Config, now: datetime, date_arg: str, limit: int) -> dict[str, Any]:
+    """The latest ``limit`` Jev decisions (oldest first, ET): raw answer, gated action, position,
+    probabilities, latency and error, plus the live stats (``jev_live``) of the latest session."""
+    conn = connect(cfg)
+    if conn is None:
+        return no_sessions(decisions=[])
+    limit = DEFAULT_DECISIONS if limit <= 0 else min(limit, MAX_DECISIONS)
+    with closing(conn):
+        label, days = resolve_days(date_arg, conn, now.astimezone(ET).date())
+        found = sessions_on(conn, days) if days else []
+        sessions = [s for s in found if s["status"] not in NO_TRADE]
+        if not sessions or not has_table(conn, "paper_decisions"):
+            return {"range": label, "decisions": [], "summary": f"no paper sessions for {label}"}
+        ids = [s["session_id"] for s in sessions]
+        marks = ",".join("?" * len(ids))
+        known = [r["policy"] for r in conn.execute(
+            f"SELECT DISTINCT policy FROM paper_decisions WHERE session_id IN ({marks})",  # noqa: S608
+            ids)]  # fmt: skip
+        policy = pick_jev(known)
+        if policy is None:
+            return {"range": label, "decisions": [],
+                    "summary": f"no Jev decisions in {label}"}  # fmt: skip
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM paper_decisions WHERE session_id IN ({marks}) AND policy=?",  # noqa: S608
+            [*ids, policy],
+        ).fetchone()[0]
+        rows = conn.execute(
+            f"SELECT * FROM paper_decisions WHERE session_id IN ({marks}) AND policy=? "  # noqa: S608
+            f"ORDER BY t_ns DESC LIMIT ?",
+            [*ids, policy, limit],
+        ).fetchall()
+        live = jev_live(conn, sessions[-1], policy, now)
+    multi_day = len({s["day"] for s in sessions}) > 1
+    day_of = {s["session_id"]: s["day"] for s in sessions}
+    decisions = []
+    for r in reversed(rows):
+        d: dict[str, Any] = {
+            "t": r["time_et"],
+            "raw": r["raw_action"],
+            "act": r["action"],
+            "pos": r["position"],
+            "p": _probs(r["probs_json"]),
+            "ms": r["jev_ms"],
+            "err": clip(r["error"], 80),
+        }
+        if multi_day:
+            d = {"day": day_of.get(r["session_id"]), **d}
+        decisions.append(d)
+    out: dict[str, Any] = {
+        "range": label,
+        "policy": policy,
+        "total": total,
+        "shown": len(decisions),
+        "times": "ET",
+        "live": live,
+        "decisions": decisions,
+    }
+    def said() -> str:
+        shown = f"showing the last {out['shown']}"
+        return f"{policy}: {total} decisions in {label}, {shown}{jev_live_line(live)}"
+
+    out["summary"] = said()  # counted in the budget: fit() trims with it in place
+    fit(out, "decisions")
+    out["shown"] = len(out["decisions"])
+    out["summary"] = said()
     return out
 
 
@@ -780,9 +1009,41 @@ def cmd_health(cfg: Config, now: datetime) -> dict[str, Any]:
 # --- jobs -------------------------------------------------------------------------------------
 
 
+CLOSE_WORDS = {"stale": "stale (likely dead)", "running": "still running"}
+
+
+def close_title(
+    session: sqlite3.Row, health: str, stats: dict[str, dict[str, Any]], day: str
+) -> str:
+    """``Paper NQ Mon 11/2: Jev +$420 (6 trades), hold −$110`` for a finished day. Any other end
+    leads with it: ``Paper NQZ6 Mon 11/2: crashed — BentoError: A live data license is required…``,
+    then the P&L only if something traded (a crash before the first trade has nothing to add)."""
+    head = f"Paper {session['symbol'] or '?'} {day_label(day)}"
+    if health == "done":
+        return f"{head}: {pnl_parts(stats)}"
+    title = f"{head}: {CLOSE_WORDS.get(health, health)}"
+    if health == "crashed" and (err := short_error(session["error"])):
+        title += f" — {err}"
+    if any(v["trades"] for v in stats.values()):
+        title += f"; {pnl_parts(stats)}"
+    return title
+
+
+def next_open_ttl(day: str, now: datetime, cfg: Config) -> str:
+    """The report's ttl: until the next trading day's 09:30 ET open, when that day's own session
+    takes over (status and watch report it). So a day's result can be in the next morning's
+    briefing, labelled with its day, but is never left open as if it were the current session."""
+    d = date.fromisoformat(day) + timedelta(days=1)
+    while not is_trading_day(d, cfg):
+        d += timedelta(days=1)
+    left = (datetime.combine(d, OPEN, ET) - now).total_seconds()
+    return f"{min(168, max(1, -(-int(left) // 3600)))}h"
+
+
 def cmd_close_summary(cfg: Config, now: datetime) -> dict[str, Any]:
     """After the close: one normal-urgency report per trading day, keyed by the day, with
-    the Jev and baseline P&L. Nothing on a holiday or a day with no session."""
+    the Jev and baseline P&L. Nothing on a holiday or a day with no session. The title names
+    the day and the report expires at the next open (``next_open_ttl``)."""
     day = now.astimezone(ET).date().isoformat()
     conn = connect(cfg)
     if conn is None:
@@ -793,9 +1054,8 @@ def cmd_close_summary(cfg: Config, now: datetime) -> dict[str, Any]:
             return {"reported": False, "day": day, "summary": f"no paper session on {day}"}
         stats = policy_stats(conn, [s["session_id"] for s in sessions])
     last = sessions[-1]
-    title = summary_line(last["symbol"], stats)
-    if last["status"] != "done":
-        title += f" ({last['status']})"
+    health, _ = health_of(last, now)
+    title = close_title(last, health, stats, day)
     jev = pick_jev(list(stats))
     jpnl = stats[jev]["pnl"] if jev else None
     state = {
@@ -804,8 +1064,9 @@ def cmd_close_summary(cfg: Config, now: datetime) -> dict[str, Any]:
         "jev_bucket": None if jpnl is None else round(jpnl / PNL_BUCKET) * PNL_BUCKET,
         "jev_trades": stats[jev]["trades"] if jev else 0,
     }
-    report(f"trade-jev/pnl/{day}", title, urgency="normal", state=state, ttl="24h")
-    return {"reported": True, "day": day, "title": title, "state": state}
+    ttl = next_open_ttl(day, now, cfg)
+    report(f"trade-jev/pnl/{day}", title, urgency="normal", state=state, ttl=ttl)
+    return {"reported": True, "day": day, "title": title, "state": state, "ttl": ttl}
 
 
 def down_reason(conn: sqlite3.Connection | None, now: datetime) -> str | None:
@@ -927,6 +1188,9 @@ def build_parser() -> argparse.ArgumentParser:
     tr.add_argument("--date", default="")
     tr.add_argument("--policy", default="")
     tr.add_argument("--limit", type=int, default=0)
+    dec = sub.add_parser("decisions")
+    dec.add_argument("--date", default="")
+    dec.add_argument("--limit", type=int, default=0)
     return p
 
 
@@ -937,6 +1201,8 @@ def run(argv: list[str], now: datetime | None = None) -> dict[str, Any]:
         return cmd_pnl(cfg, now or now_utc(), args.date)
     if args.cmd == "trades":
         return cmd_trades(cfg, now or now_utc(), args.date, args.policy, args.limit)
+    if args.cmd == "decisions":
+        return cmd_decisions(cfg, now or now_utc(), args.date, args.limit)
     if args.cmd in ("close-summary", "watch"):
         fn = cmd_close_summary if args.cmd == "close-summary" else cmd_watch
         # close-summary reports the day it was due for; watch is about right now.

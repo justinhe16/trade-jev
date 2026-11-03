@@ -69,12 +69,13 @@ class PaperDB:
         heartbeat: datetime | None = None,
         error: str | None = None,
         symbol: str = "NQ",
+        jev_model: str | None = "jev-1",
     ) -> None:
         start = et(day, started)
         self.conn.execute(
             "INSERT INTO paper_sessions VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (sid, day, symbol, status, utc_iso(start), None,
-             utc_iso(heartbeat or start), "{}", "jev-1", f"runs/{sid}", error),
+             utc_iso(heartbeat or start), "{}", jev_model, f"runs/{sid}", error),
         )  # fmt: skip
         self.conn.commit()
 
@@ -97,11 +98,17 @@ class PaperDB:
         )  # fmt: skip
         self.conn.commit()
 
-    def decision(self, sid: str, policy: str, day: str, hm: str, position: int) -> None:
+    def decision(
+        self, sid: str, policy: str, day: str, hm: str, position: int, *, action: str = "BUY",
+        raw: str | None = "BUY", ms: float | None = 900.0, error: str | None = None,
+        probs: str = "{}", sec: int = 0,
+    ) -> None:  # fmt: skip
+        """One Jev decision as live.py logs it (``jev_ms`` = the policy call's wall time)."""
         self.conn.execute(
             "INSERT INTO paper_decisions VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            (sid, policy, ns(day, hm), hm, 21000.0, position, "BUY", "BUY", "{}", 900.0, None),
-        )
+            (sid, policy, ns(day, hm) + sec * 10**9, f"{hm}:{sec:02d}", 21000.0, position, action,
+             raw, probs, ms, error),
+        )  # fmt: skip
         self.conn.commit()
 
     def summary(

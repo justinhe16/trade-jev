@@ -2,28 +2,37 @@
 # and can start or stop its launchd job. It never places orders: paper only. See README.md.
 name: trade-jev
 version: 1
-description: Jev paper-trading NQ on the Mini; session status, P&L vs baselines, trades, start/stop.
+description: Jev paper-trading NQ on the Mini; session status, live Jev calls, P&L vs baselines, trades, start/stop.
 examples:
   - is trade-jev running?
   - how did jev do this week vs hold
   - start trade-jev
 approvers: [owner]
 repos: [justinhe16/trade-jev]
+# Display only (the dashboard's diagram): the launchd agents scripts/install_launchd.sh installs from
+# deploy/launchd. Resonant never installs, loads or reads them.
+launch_agents:
+  - label: com.tradejev.paper
+    description: "Weekdays 06:15 PT: scripts/run_paper_day.sh runs one live paper session (Jev + baselines, no orders) to the close into data/paper.db; its live view is :8767."
+  - label: com.tradejev.view
+    description: "Always-on viewer at http://127.0.0.1:8765 (Replay, Live, Paper, Docs); /paper reads data/paper.db read-only. Not attached to the running live session."
+  - label: com.tradejev.tvtoken
+    description: "24/7 Tradovate token keep-alive: checks every minute, renews the web-session tokens before they lapse, writes data/tradovate_token_status.json."
 
 tools:
   # Tool names match the evals (trade_jev_status is a plain read; start/stop ask first).
   trade_jev_status:
     description: >-
-      Today's paper session (ET): running, done, crashed, or stale (likely dead), Jev's
-      position, P&L and trade count so far, whether the launchd job is loaded, and the health of
-      the Tradovate token (a `token` block: expires in N min, renewal failures; no secrets).
+      Today's paper session (ET): running, done, crashed or stale; Jev's position, P&L, trades;
+      `jev_live` (calls_mode: live model calls vs replay/no calls, call and error counts, latency,
+      last decision, raw vs gated actions); launchd state; Tradovate token health (no secrets).
     run: ./cli.py status
     effect: read
   trade_jev_pnl:
     description: >-
       Paper P&L for Jev vs the baselines (hold, random, imbalance): pnl, trades, wins,
-      drawdown, Jev cost. date is "" for the latest session, "today", "yesterday",
-      YYYY-MM-DD, "week" (Mon to today), "month", or "YYYY-MM-DD..YYYY-MM-DD"; ranges add totals and a per-day list.
+      drawdown, Jev calls (live from the decision log while running), cost. date "" = latest session, "today", "yesterday",
+      YYYY-MM-DD, "week" (Mon to today), "month", or "A..B" (YYYY-MM-DD); ranges add a per-day list.
     run: ./cli.py pnl --date {date}
     effect: read
     args: {date: string}
@@ -35,6 +44,14 @@ tools:
     run: ./cli.py trades --date {date} --policy {policy} --limit {limit}
     effect: read
     args: {date: string, policy: string, limit: integer}
+  trade_jev_decisions:
+    description: >-
+      The latest Jev decisions (ET): raw answer, gated action, position, probabilities, latency
+      ms, error, plus `live` call stats (calls_mode). date as in trade_jev_pnl ("" = latest
+      session); limit 0 means 20 (max 50). Answers "are model calls going out?".
+    run: ./cli.py decisions --date {date} --limit {limit}
+    effect: read
+    args: {date: string, limit: integer}
   trade_jev_start:
     description: Start today's paper session (kickstarts the launchd job com.tradejev.paper).
     run: ./cli.py start
@@ -52,6 +69,7 @@ tools:
 
 jobs:
   - id: close-summary
+    description: "Weekday 16:10 ET: reads paper.db and adds the day's paper P&L (Jev vs baselines, or why it crashed), named by its day, to the hourly pulse."
     schedule: "10 16 * * 1-5"
     tz: America/New_York
     run: ./cli.py close-summary
@@ -60,6 +78,7 @@ jobs:
     timeout_s: 60
     catchup: 6h        # if the daemon was down at 16:10, report that day once it's back
   - id: watch
+    description: "Every 15 min: texts at once if the Tradovate token is failing or expiring, or (trading days 09:35-15:50 ET) if the paper session crashed, stalled or is missing."
     # every 15 min, ALL day and every day: the Tradovate token check has no hours (tokens die over a
     # weekend). The paper-session check inside it stays script-guarded to 09:35..15:50 ET trading days.
     schedule: "5,20,35,50 * * * *"

@@ -88,6 +88,20 @@ jobs:
     level: L0
     timeout_s: 60
 
+# Dashboard panel (Resonant panels): a read-only L0 run that prints data, never acts. Every minute
+# 09:00-16:59 ET on weekdays (cron has no 09:15-16:15; that covers the session), every 15 min otherwise.
+panels:
+  - id: paper
+    title: Paper trading
+    description: "Jev vs baselines today: P&L, model calls, session, token, agents; daily P&L and sessions for 30 trading days."
+    command: [./cli.py, panel, paper]
+    refresh:
+      idle: "*/15 * * * *"
+      active: "*/1 9-16 * * 1-5"
+    tz: America/New_York
+    timeout_s: 30
+    max_bytes: 24576
+
 # watch's "trade-jev/down" and "trade-jev/token" text at once; close-summary's daily P&L rides the hourly pulse.
 report: {max_urgency: urgent}
 health: {check: ./cli.py health, every: 5m}

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""trade-jev Resonant extension: paper status, P&L, trades, Jev decisions, start/stop, two jobs.
+"""trade-jev Resonant extension: paper status, P&L, trades, Jev decisions, start/stop, two jobs,
+and the `paper` dashboard panel.
 
 Stdlib only. Resonant runs this as ``python -I -S cli.py <cmd>`` with ``PATH=/usr/bin:/bin``
 and ``HOME``/``RESONANT_EXT_DATA`` set to the extension's data dir (never the real home).
@@ -19,8 +20,9 @@ import os
 import sqlite3
 import subprocess
 import sys
+from collections.abc import Iterable
 from contextlib import closing
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -29,6 +31,7 @@ from zoneinfo import ZoneInfo
 # emit.py is the SDK's stdlib helper, copied next to this file. ``-I`` keeps this directory
 # off sys.path, so add it before importing.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import panel as pw  # noqa: E402 - the SDK's panel builders, copied like emit.py
 from emit import report  # noqa: E402
 
 DEFAULT_DB = "/Users/justinhe/trade-jev/data/paper.db"
@@ -1184,6 +1187,311 @@ def _write_state(path: Path, updates: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
+# --- dashboard panel (Resonant panels, PER-280) ----------------------------------------------
+#
+# `./cli.py panel paper` prints one object in Resonant's panel format (built with panel.py, the
+# SDK's builders copied next to this file). It draws what the tools already compute: cmd_status
+# (session, jev_live, token, launchd), cmd_pnl (per-policy P&L) and policy_stats. Read-only.
+
+PANEL_LOCAL_URL = "http://127.0.0.1:8765/paper"
+PANEL_LIVE_URL = "http://127.0.0.1:8767/live"  # the running session's own view
+# Core averages a time axis over 240 points into 240 buckets; a running total sampled at 240 of its
+# own points stays exact instead, and keeps the output small.
+PANEL_POINTS = 240
+PANEL_TRADES = 20
+PANEL_DAYS = 30  # History: the last 30 trading days
+PANEL_SESSIONS = 30
+PANEL_BASELINES = ("imbalance", "random")  # charted next to Jev; other baselines fill up to 4 lines
+PANEL_LINES = 4
+ALWAYS_ON = ("com.tradejev.view", "com.tradejev.tvtoken")  # KeepAlive agents: always running
+SESSION_TONE = {"running": "ok", "done": "ok", "crashed": "bad", "stale": "bad", "aborted": "warn"}
+TOKEN_BAD = ("expired", "renewal failing", "unreadable")
+
+
+def chart_policies(policies: Iterable[str]) -> list[str]:
+    """Jev first, then imbalance and random, then any other baselines by name: at most 4."""
+    names = set(policies)
+    jev = pick_jev(list(names))
+    rest = [p for p in PANEL_BASELINES if p in names]
+    rest += sorted(p for p in names if not is_jev(p) and p not in PANEL_BASELINES)
+    return ([jev] if jev else []) + rest[: PANEL_LINES - (1 if jev else 0)]
+
+
+def closed_trades(conn: sqlite3.Connection, session_ids: list[str]) -> list[sqlite3.Row]:
+    """Every closed trade of the sessions, in exit order, all policies. (``trades`` answers one
+    policy and at most 50 rows; the cumulative curve needs them all.)"""
+    if not session_ids or not has_table(conn, "paper_trades"):
+        return []
+    marks = ",".join("?" * len(session_ids))
+    return conn.execute(
+        f"SELECT policy, side, exit_ns, points, pnl, reason FROM paper_trades "  # noqa: S608
+        f"WHERE session_id IN ({marks}) AND exit_ns IS NOT NULL ORDER BY exit_ns, id",
+        session_ids,
+    ).fetchall()
+
+
+def cumulative(
+    trades: list[sqlite3.Row], policies: list[str], day: str
+) -> tuple[list[int], dict[str, list[float]]]:
+    """Each policy's running realized P&L: 0 at the 09:30 open, then a point per exit second
+    (unix seconds), thinned to ``PANEL_POINTS`` evenly spaced points (exact where sampled)."""
+    total = dict.fromkeys(policies, 0.0)
+    xs = [int(datetime.combine(date.fromisoformat(day), OPEN, ET).timestamp())]
+    ys: dict[str, list[float]] = {p: [0.0] for p in policies}
+    for r in trades:
+        if r["policy"] not in total:
+            continue
+        total[r["policy"]] += float(r["pnl"] or 0)
+        t = int(r["exit_ns"] // 10**9)
+        if t > xs[-1]:
+            xs.append(t)
+            for p in policies:
+                ys[p].append(0.0)
+        for p in policies:  # same second (or before the open): folds into the last point
+            ys[p][-1] = round(total[p], 2)
+    n = len(xs)
+    if n > PANEL_POINTS:
+        keep = sorted({round(i * (n - 1) / (PANEL_POINTS - 1)) for i in range(PANEL_POINTS)})
+        xs = [xs[i] for i in keep]
+        ys = {p: [v[i] for i in keep] for p, v in ys.items()}
+    return xs, ys
+
+
+def _expect_paper_running(cfg: Config, now: datetime, session: dict[str, Any] | None) -> bool:
+    """Should com.tradejev.paper be running right now (a trading day's session hours, not
+    stopped by the owner, and today's session not already over)?"""
+    et = now.astimezone(ET)
+    if not is_trading_day(et.date(), cfg) or not OPEN <= et.time() <= CLOSE:
+        return False
+    if _stopped_today(et.date().isoformat()):
+        return False
+    return session is None or session["status"] not in ("done", "aborted", *NO_TRADE)
+
+
+def agent_item(label: str, st: dict[str, Any], expected: bool) -> dict[str, Any]:
+    """A launchd agent as a status item: down when not loaded, warn when it should be running
+    and isn't (the always-on viewer and keep-alive, or the paper job during its session)."""
+    if st.get("loaded") is None:
+        return {"name": label, "state": "unknown", "detail": "launchctl unavailable"}
+    if st["loaded"] is False:
+        return {"name": label, "state": "down", "detail": "not loaded"}
+    state = st.get("state") or "loaded"
+    if state == "running":
+        pid = st.get("pid")
+        return {"name": label, "state": "up", "detail": f"running (pid {pid})" if pid else "running"}
+    ok = not (expected or label in ALWAYS_ON)
+    return {"name": label, "state": "up" if ok else "warn", "detail": f"loaded, {state}"}
+
+
+def feed_item(session: dict[str, Any] | None) -> dict[str, Any]:
+    """The live data feed, judged by the session heartbeat (written at least every 60 s)."""
+    if session is None:
+        return {"name": "data feed", "state": "unknown", "detail": "no session today"}
+    name = f"data feed ({session['source']})" if session.get("source") else "data feed"
+    age, health = session["heartbeat_age_s"], session["health"]
+    if health == "running":
+        return {"name": name, "state": "up", "detail": f"heartbeat {age}s ago"}
+    if health == "stale":
+        gone = f"{age // 60} min" if age is not None else "ever"
+        return {"name": name, "state": "down", "detail": f"no heartbeat for {gone}"}
+    return {"name": name, "state": "unknown", "detail": f"session {health}"}
+
+
+def session_stat(st: dict[str, Any], cfg: Config, raw_error: str | None) -> dict[str, Any]:
+    """Today's session state; ``raw_error`` is the row's own error (status clips it to one line)."""
+    s, today = st.get("session"), date.fromisoformat(st["day"])
+    if s is None:
+        last = st.get("last_session_day")
+        why = "market closed" if not is_trading_day(today, cfg) else "not started"
+        hint = f"{why}; last {day_label(last)}" if last else why
+        return pw.stat("Session", "no session", hint=hint)
+    health = s["health"]
+    if health == "running":
+        hint = f"{day_label(st['day'])}, heartbeat {s['heartbeat_age_s']}s ago"
+    elif health in ("crashed", "skipped", "stale"):
+        hint = short_error(raw_error, 78) or day_label(st["day"])
+    else:
+        hint = day_label(st["day"])
+    return pw.stat("Session", health, health=SESSION_TONE.get(health), hint=hint)
+
+
+def token_stat(tok: dict[str, Any]) -> dict[str, Any]:
+    if tok.get("problem") == "unreadable":
+        return pw.stat("Tradovate token", "unreadable", health="bad", hint="status file unreadable")
+    if not tok.get("known"):
+        return pw.stat("Tradovate token", "n/a", hint="no status file (token mode off)")
+    problem, mins = tok.get("problem"), tok.get("expires_in_min")
+    tone = "ok" if problem is None else "bad" if problem in TOKEN_BAD else "warn"
+    value = None if mins is None else max(0, mins) * 60
+    return pw.stat("Token expires in", value, format="duration", health=tone,
+                   hint=problem or "keep-alive ok")  # fmt: skip
+
+
+def call_stats(st: dict[str, Any], jev: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Model calls, errors and calls_mode: today's ``jev_live``, else the shown day's call count."""
+    live = st.get("jev_live")
+    if not live or not live.get("decisions"):
+        calls = jev.get("jev_calls") if jev else None
+        mode = live["calls_mode"] if live else "no session today"
+        return [pw.stat("Model calls", calls, format="integer"),
+                pw.stat("Call errors", None, format="integer"),
+                pw.stat("Calls mode", mode)]  # fmt: skip
+    ms = f"avg {live['avg_ms']} ms, p95 {live['p95_ms']} ms" if live["avg_ms"] is not None else None
+    errors, mode = live["errors"], live["calls_mode"]
+    err_tone = "ok" if not errors else "bad" if mode == "calls failing" else "warn"
+    mode_tone = {"live model calls": "ok", "calls failing": "bad"}.get(mode)
+    return [
+        pw.stat("Model calls", live["model_calls"], format="integer", hint=ms),
+        pw.stat("Call errors", errors, format="integer", health=err_tone,
+                hint=clip(live["last_error"], 80)),
+        pw.stat("Calls mode", mode, health=mode_tone,
+                hint=f"last {live['last_decision_et']} ET" if live["last_decision_et"] else None),
+    ]
+
+
+def panel_health(st: dict[str, Any], items: list[dict[str, Any]], expected: bool) -> str:
+    """bad: the session crashed, stalled or is missing during its hours, Jev's calls all fail,
+    or the token is dead; warn: the token needs attention soon, or an agent or Jev call is off."""
+    s, tok, live = st.get("session"), st["token"], st.get("jev_live") or {}
+    if s and s["health"] in ("crashed", "stale"):
+        return "bad"
+    if (s is None and expected) or tok.get("problem") in TOKEN_BAD:
+        return "bad"
+    if live.get("calls_mode") == "calls failing" and s and s["health"] == "running":
+        return "bad"
+    if tok.get("problem") or any(i["state"] in ("down", "warn") for i in items):
+        return "warn"
+    if live.get("errors") and s and s["health"] == "running":
+        return "warn"
+    return "ok"
+
+
+def today_view(
+    cfg: Config, now: datetime, st: dict[str, Any], conn: sqlite3.Connection | None
+) -> tuple[dict[str, Any], str]:
+    """Today's tiles, cumulative P&L, recent trades and agents (with no session today, the P&L
+    widgets show the latest trading day, named in their titles). Returns (view, health)."""
+    pnl = cmd_pnl(cfg, now, "today")
+    if not pnl.get("sessions"):
+        pnl = cmd_pnl(cfg, now, "")
+    day = pnl.get("from")
+    jev = next((p for p in pnl.get("policies", []) if p["jev"]), None)
+    row = latest_session(conn, st["day"]) if conn is not None and st.get("session") else None
+    raw_error = row["error"] if row is not None else None
+    when = "today" if day == st["day"] else (day_label(day) if day else None)
+    pnl_hint = None if when is None else when if day == st["day"] else f"last session {when}"
+    widgets = [
+        pw.stat("Jev P&L", jev["pnl"] if jev else None, format="money",
+                health=None if not jev else "ok" if (jev["pnl"] or 0) >= 0 else "bad",
+                hint=pnl_hint),
+        pw.stat("Jev trades / wins", f"{jev['trades']} / {jev['wins']}" if jev else "0 / 0",
+                hint=pnl_hint),
+        *call_stats(st, jev),
+        session_stat(st, cfg, raw_error),
+        token_stat(st["token"]),
+    ]
+    trades: list[sqlite3.Row] = []
+    if conn is not None and day:
+        ids = [s["session_id"] for s in sessions_on(conn, [day]) if s["status"] not in NO_TRADE]
+        trades = closed_trades(conn, ids)
+    policies = chart_policies(p["policy"] for p in pnl.get("policies", []))
+    if trades and policies:
+        xs, ys = cumulative(trades, policies, day)
+        widgets.append(pw.series("line", xs, ys, format="money", id="cum-pnl",
+                                 title=f"Cumulative P&L, {when}"))  # fmt: skip
+    else:
+        widgets.append(pw.text(f"No closed trades {'yet ' if when == 'today' else ''}"
+                               f"{'today' if when in (None, 'today') else 'on ' + when}.",
+                               id="cum-pnl", title="Cumulative P&L"))  # fmt: skip
+    recent = trades[-PANEL_TRADES:][::-1]
+    if recent:
+        widgets.append(pw.table(
+            [pw.column("t", "Time ET"), pw.column("policy", "Policy"), pw.column("side", "Side"),
+             pw.column("pts", "Pts", "number"), pw.column("pnl", "$", "money"),
+             pw.column("why", "Why")],
+            [{"t": (ns_to_et(r["exit_ns"]) or "")[:5], "policy": r["policy"], "side": r["side"],
+              "pts": num(r["points"]), "pnl": num(r["pnl"]), "why": r["reason"]} for r in recent],
+            id="trades", title=f"Recent trades, {when} ({len(trades)} closed)",
+        ))  # fmt: skip
+    expected = _expect_paper_running(cfg, now, st.get("session"))
+    items = []
+    for label in (cfg.label, *ALWAYS_ON):
+        ls = st["launchd"] if label == cfg.label else launchd_state(replace(cfg, label=label))
+        items.append(agent_item(label, ls, expected and label == cfg.label))
+    items.append(feed_item(st.get("session")))
+    widgets.append(pw.status(items, id="agents", title="Agents and feed"))
+    return pw.view("today", "Today", widgets), panel_health(st, items, expected)
+
+
+def history_view(conn: sqlite3.Connection | None, now: datetime) -> dict[str, Any]:
+    """Daily P&L per policy over the last 30 trading days, and the latest sessions."""
+    if conn is None:
+        return pw.view("history", "History", [pw.text(NO_SESSIONS + ".", id="none")])
+    days = sorted(r["day"] for r in conn.execute(
+        "SELECT DISTINCT day FROM paper_sessions WHERE status NOT IN ('holiday', 'skipped') "
+        "ORDER BY day DESC LIMIT ?", (PANEL_DAYS,)))  # fmt: skip
+    stats: dict[str, dict[str, dict[str, Any]]] = {}
+    per_day: dict[str, dict[str, float]] = {d: {} for d in days}
+    for s in sessions_on(conn, days) if days else []:
+        if s["status"] in NO_TRADE:
+            continue
+        stats[s["session_id"]] = st = policy_stats(conn, [s["session_id"]])
+        for p, v in st.items():
+            per_day[s["day"]][p] = round(per_day[s["day"]].get(p, 0.0) + (v["pnl"] or 0.0), 2)
+    widgets: list[dict[str, Any]] = []
+    policies = chart_policies({p for d in per_day.values() for p in d})
+    if days and policies:
+        widgets.append(pw.series(
+            "bar", [day_label(d) for d in days],
+            {p: [per_day[d].get(p) for d in days] for p in policies},
+            x_type="category", format="money", id="daily-pnl",
+            title=f"Daily P&L, last {len(days)} trading days",
+        ))  # fmt: skip
+    rows = []
+    for s in conn.execute(
+        "SELECT * FROM paper_sessions ORDER BY day DESC, started_at DESC, rowid DESC LIMIT ?",
+        (PANEL_SESSIONS,),
+    ):
+        sid = s["session_id"]
+        if sid not in stats and s["status"] not in NO_TRADE:
+            stats[sid] = policy_stats(conn, [sid])
+        st = stats.get(sid, {})
+        jp = pick_jev(list(st))
+        j = st.get(jp or "", {})
+        health, _ = health_of(s, now)
+        rows.append({
+            "day": day_label(s["day"]),
+            "status": pw.pill(health, SESSION_TONE.get(health, "neutral")),
+            "jev": j.get("pnl"),
+            "trades": j.get("trades"),
+            "calls": j.get("jev_calls"),
+            "error": short_error(s["error"], 100),
+        })  # fmt: skip
+    if rows:
+        widgets.append(pw.table(
+            [pw.column("day", "Day"), pw.column("status", "Status", "pill"),
+             pw.column("jev", "Jev $", "money"), pw.column("trades", "Trades", "number"),
+             pw.column("calls", "Calls", "number"), pw.column("error", "Error")],
+            rows, id="sessions", title="Sessions",
+        ))  # fmt: skip
+    return pw.view("history", "History", widgets or [pw.text(NO_SESSIONS + ".", id="none")])
+
+
+def cmd_panel(cfg: Config, now: datetime) -> dict[str, Any]:
+    """The ``paper`` dashboard panel: views Today and History (see README)."""
+    st = cmd_status(cfg, now)
+    conn = connect(cfg)
+    try:
+        today, health = today_view(cfg, now, st, conn)
+        history = history_view(conn, now)
+    finally:
+        if conn is not None:
+            conn.close()
+    running = bool(st.get("session")) and st["session"]["health"] == "running"
+    return pw.panel([today, history], updated_at=now, health=health,
+                    local_url=PANEL_LIVE_URL if running else PANEL_LOCAL_URL)  # fmt: skip
+
+
 # --- main -------------------------------------------------------------------------------------
 
 
@@ -1201,12 +1509,16 @@ def build_parser() -> argparse.ArgumentParser:
     dec = sub.add_parser("decisions")
     dec.add_argument("--date", default="")
     dec.add_argument("--limit", type=int, default=0)
+    pan = sub.add_parser("panel")
+    pan.add_argument("name", choices=["paper"])
     return p
 
 
 def run(argv: list[str], now: datetime | None = None) -> dict[str, Any]:
     args = build_parser().parse_args(argv)
     cfg = load_config()
+    if args.cmd == "panel":
+        return cmd_panel(cfg, now or now_utc())
     if args.cmd == "pnl":
         return cmd_pnl(cfg, now or now_utc(), args.date)
     if args.cmd == "trades":

@@ -1023,7 +1023,7 @@ def test_manifest_display_metadata_stdlib() -> None:
     plists the repo installs (deploy/launchd)."""
     text = (EXT_DIR / "resonant.yaml").read_text()
     assert "  trade_jev_decisions:\n" in text
-    jobs = text.split("\njobs:\n", 1)[1].split("\nreport:", 1)[0]
+    jobs = text.split("\njobs:\n", 1)[1].split("\npanels:", 1)[0]
     assert jobs.count("  - id: ") == jobs.count("    description: ") == 2
     plists = {p.stem for p in (EXT_DIR.parent / "deploy" / "launchd").glob("*.plist")}
     assert plists == set(AGENTS)

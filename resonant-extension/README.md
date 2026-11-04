@@ -13,7 +13,7 @@ resonant ext validate /Users/justinhe/trade-jev/resonant-extension
 resonant ext add path:/Users/justinhe/trade-jev/resonant-extension
 ```
 
-`ext add` shows the review screen. Type `trade-jev` to confirm. After a later change, run `resonant ext update trade-jev` (the token alert needs this update: it changes the `watch` schedule and `trade_jev_status`; so does the live Jev visibility below: it adds `trade_jev_decisions`, job descriptions and `launch_agents`, so the review screen asks again). The update only swaps the extension's files: the running paper session (`com.tradejev.paper`) is not touched and needs no restart.
+`ext add` shows the review screen. Type `trade-jev` to confirm. After a later change, run `resonant ext update trade-jev` (the token alert needs this update: it changes the `watch` schedule and `trade_jev_status`; so does the live Jev visibility below: it adds `trade_jev_decisions`, job descriptions and `launch_agents`, so the review screen asks again; the `paper` dashboard panel below also needs one: the review screen lists `+ panel paper`). The update only swaps the extension's files: the running paper session (`com.tradejev.paper`) is not touched and needs no restart.
 
 Each job's first run after install is a silent baseline. Run `/ext run trade-jev/watch` once before relying on it.
 
@@ -86,6 +86,26 @@ The manifest grants `report: {max_urgency: urgent}` and a 5-minute `health` chec
 
 Trading days: weekdays minus the NYSE full closures for 2026–2027 built into `cli.py`. Add more in `config.json`.
 
+## Dashboard panel
+
+The manifest declares one Resonant panel, `paper` (title "Paper trading"): `./cli.py panel paper` prints one JSON object in Resonant's panel format ([docs/extensions.md §6a](https://github.com/justinhe16/resonant/blob/main/docs/extensions.md)), and the dashboard draws it, so the local paper page (`:8765/paper`, `:8767/live`) can be read on a phone. It is an L0 read like the tools: it reads `paper.db` (read-only) and the token status file, runs `launchctl print` on the three agents, and never acts. It runs every minute 09:00-16:59 ET on weekdays (`active: "*/1 9-16 * * 1-5"`, which covers the 09:15-16:15 session because cron only has whole hours) and every 15 minutes otherwise (`idle`), with `max_bytes: 24576`. `local_url` is the session's live view (`http://127.0.0.1:8767/live`) while a session runs, else `http://127.0.0.1:8765/paper`.
+
+Everything comes from the tools' own helpers (`cmd_status`, `cmd_pnl`, `policy_stats`, `launchd_state`), so the panel and the chat answers agree. The cumulative curve and the recent-trades table need every closed trade of the day (`trades` returns one policy and at most 50 rows), which is the panel's one extra query (`closed_trades`).
+
+**Today.** With no session today (a weekend, a holiday, before the start), the P&L widgets show the latest trading day and say so (`last session Fri 11/6`).
+
+- Stats: **Jev P&L**, **Jev trades / wins**, **Model calls** (avg and p95 ms), **Call errors** (last error), **Calls mode** (`jev_live.calls_mode`), **Session** (`running`, `done`, `crashed` with the error's first line, `stale`, `aborted`, `skipped`, or `no session` with the last session day), **Token expires in** (Tradovate, from the keep-alive's status file; `n/a` when token mode isn't in use).
+- Series: **Cumulative P&L** through the day, one line per policy (Jev, imbalance, random, then other baselines, at most 4): 0 at the 09:30 open, then a point at each exit. Over 240 points it is thinned to 240 evenly spaced points, so the running totals stay exact instead of being bucket-averaged by Resonant.
+- Table: **Recent trades**, the latest 20 closed trades of every policy (time ET, policy, side, points, $, why).
+- Status: `com.tradejev.paper`, `com.tradejev.view`, `com.tradejev.tvtoken` (down when not loaded; warn when the always-on viewer or keep-alive isn't running, or the paper job isn't during session hours), and the **data feed**, judged by the session heartbeat (up while running, down when stale).
+
+**History.**
+
+- Series: **Daily P&L** per policy for the last 30 trading days (bars).
+- Table: the latest 30 **sessions** (day, status, Jev $, trades, Jev calls, the error's first line).
+
+**Health.** `bad` when today's session crashed or went stale, no session is up during session hours (unless stopped with `trade_jev_stop`), every recent Jev call fails, or the Tradovate token is expired, failing renewal or unreadable. `warn` when the token is expiring or its renewer stopped, an agent is down or not running when it should be, or Jev has call errors in a running session. Otherwise `ok`.
+
 ## Data source and config
 
 The default DB is `/Users/justinhe/trade-jev/data/paper.db`, opened as `file:…?mode=ro`. If the DB or its `paper_sessions` table doesn't exist yet, the tools answer "no paper sessions yet" rather than failing.
@@ -111,7 +131,7 @@ Schema expected (written by the paper runner):
 - Stdlib only, run as `python -I -S cli.py <cmd>` with `PATH=/usr/bin:/bin`.
 - No dependency files in this directory.
 - Prints one JSON object on stdout and exits 0. On failure it prints one stderr line and exits 1, and nothing changed.
-- `emit.py` is an unmodified copy of `resonant_sdk/emit.py`. Copy it again if the SDK changes.
+- `emit.py` and `panel.py` are unmodified copies of `resonant_sdk/emit.py` and `resonant_sdk/panel.py`. Copy them again if the SDK changes.
 
 ## Tests
 
@@ -122,4 +142,4 @@ uv run pytest -q                      # whole repo, including these
 uv run pytest -q resonant-extension   # just the extension
 ```
 
-The tests build a temp DB with the schema above, fake `launchctl` and `report()`, and run the CLI under `python -I -S` with a scratch environment. One test validates `resonant.yaml` with the real parser (`resonant_sdk.manifest.load_manifest`) through `uv run --frozen --no-sync --project $RESONANT_REPO` (default `/Users/justinhe/resonant`; it installs nothing and never reads `~/.resonant`), and is skipped where there is no Resonant checkout. They use no network and never run the real `launchctl`. The test modules have no `__init__.py` and use unique names, so they don't collide with the repo's `tests` package.
+The tests build a temp DB with the schema above, fake `launchctl` and `report()`, and run the CLI under `python -I -S` with a scratch environment. One test validates `resonant.yaml` with the real parser (`resonant_sdk.manifest.load_manifest`) through `uv run --frozen --no-sync --project $RESONANT_REPO` (default `/Users/justinhe/resonant`; it installs nothing and never reads `~/.resonant`), and is skipped where there is no Resonant checkout. `test_trade_jev_panel.py` checks the panel on a running day, a crashed day, a weekend with no session and no DB, keeps a heavy 60-day history under the 24 KB budget, and runs every output through the same checkout's `docs/panel.schema.json` and core's own `normalize()` with the manifest's `max_bytes` (skipped likewise). They use no network and never run the real `launchctl`. The test modules have no `__init__.py` and use unique names, so they don't collide with the repo's `tests` package.

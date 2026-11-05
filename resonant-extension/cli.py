@@ -54,8 +54,12 @@ CHECK_FROM = time(9, 31)
 CHECK_UNTIL = time(15, 50)
 EOD = time(15, 55)
 STALL_S = 120  # a running session whose last decision is older than this is stalled (normally every 15 s)
-GRACE_S = 180  # a new session (or the open) gets this long to log its first decision
+GRACE_S = 360  # a new session (or the open) gets this long to log its first decision (3m42s seen live)
+CATCH_UP_MAX_S = 2700  # a late start's catch-up replay longer than this (45 min) is judged stalled
 RECOVER_WAIT_S = 20  # recover: how long the old process gets to exit after SIGTERM
+RECOVER_COOLDOWN_S = 600  # recover: at most one restart per 10 min (the new session needs its grace)
+RECOVER_MAX = 3  # recover: restarts per ET day; past that it's the owner's (health stays unhealthy)
+RECOVER_STATE = "recover_state.json"  # {"day", "count", "last_at"}: recover's attempts today
 UNHEALTHY = 2  # health's exit code when the session is down (1 stays "the command failed")
 NO_SESSIONS = "no paper sessions yet"
 
@@ -1064,6 +1068,9 @@ def session_check(cfg: Config, now: datetime) -> dict[str, Any]:
         if s is None:  # before MISSING_AFTER
             return {"problem": None, "why": "no session yet"}
         health, _ = health_of(s, now)
+        if health == "aborted" and _aborted_by_recover(s, day):
+            # recover's SIGTERM ended it but no new session followed (a failed kickstart): retry
+            return {"problem": "session aborted by recover, no new session", "why": ""}
         if health != "running":
             return {"problem": None, "why": f"session {health}"}
         stalled, why = stall_reason(conn, s, now)
@@ -1081,7 +1088,8 @@ def stall_reason(conn: sqlite3.Connection, s: sqlite3.Row, now: datetime) -> tup
     """(problem, why) for a running session with a fresh heartbeat. Stalled when its last decision is
     older than STALL_S, or none came within GRACE_S of the later of its start and the open. A decision
     from before the session started is a late start's intraday catch-up replay (decisions' ``t_ns``
-    is market time), not a stall: judged once the replay reaches the present."""
+    is market time), not a stall, for up to CATCH_UP_MAX_S. ``paper_decisions`` is Jev's log only
+    (baselines don't write it), so the latest row is Jev's latest decision."""
     if not has_table(conn, "paper_decisions"):
         return None, "can't tell: no decisions table"
     last = conn.execute(
@@ -1096,7 +1104,10 @@ def stall_reason(conn: sqlite3.Connection, s: sqlite3.Row, now: datetime) -> tup
         return None, "session starting, no decision yet"
     last_at = datetime.fromtimestamp(last / 1e9, timezone.utc)
     if started is not None and last_at < started:
-        return None, f"session catching up (replay at {last_at.astimezone(ET):%H:%M} ET)"
+        replay = f"{last_at.astimezone(ET):%H:%M} ET"
+        if (now - started).total_seconds() > CATCH_UP_MAX_S:
+            return f"still catching up after {age_text(CATCH_UP_MAX_S)} (replay at {replay})", ""
+        return None, f"session catching up (replay at {replay})"
     age = int((now - last_at).total_seconds())
     if age > STALL_S:
         return f"no decisions for {age_text(age)}", ""
@@ -1147,7 +1158,10 @@ def cmd_recover(cfg: Config, now: datetime) -> dict[str, Any]:
     """Restart the paper session when ``session_check`` finds it down (crashed, stale, missing or
     stalled) in the session window: SIGTERM the launchd job if it is running, wait up to
     RECOVER_WAIT_S for it to exit, then kickstart it (the runner writes a new session row, so nothing
-    is counted twice). Otherwise ``nothing to do: <reason>``. Exit 1 only when launchctl fails.
+    is counted twice). At most RECOVER_MAX restarts per ET day, RECOVER_COOLDOWN_S apart (a session
+    that keeps dying is the owner's: health stays unhealthy). An attempt is recorded before acting, so
+    a session its SIGTERM aborted without a successful kickstart is retried after the cooldown.
+    Otherwise ``nothing to do: <reason>``. Exit 1 only when launchctl fails.
     Paper only: it starts and stops the paper runner, never anything that places orders."""
     chk = session_check(cfg, now)
     problem = chk["problem"]
@@ -1155,14 +1169,27 @@ def cmd_recover(cfg: Config, now: datetime) -> dict[str, Any]:
         return {"restarted": False, "summary": f"nothing to do: {chk['why']}"}
     if now.astimezone(ET).time() >= EOD:  # session_check's window already ends before EOD
         return {"restarted": False, "summary": "nothing to do: after EOD"}
+    day = now.astimezone(ET).date().isoformat()
+    done = _recover_state(day)
+    if done["count"] >= RECOVER_MAX:
+        return {"restarted": False, "problem": problem,
+                "summary": f"nothing to do: already restarted {done['count']} times today, needs the owner ({problem})"}  # fmt: skip
+    last = parse_ts(done.get("last_at"))
+    if last is not None and (now - last).total_seconds() < RECOVER_COOLDOWN_S:
+        ago = age_text(int((now - last).total_seconds()))
+        return {"restarted": False, "problem": problem,
+                "summary": f"nothing to do: restarted {ago} ago, waiting for it ({problem})"}  # fmt: skip
     st = launchd_state(cfg)
     if st["loaded"] is False:
         raise Fail(f"launchd job {cfg.label} isn't loaded; can't restart ({problem})")
+    # Recorded before acting: a SIGTERM that went out counts even if the kickstart then fails.
+    _write_state(data_dir() / RECOVER_STATE,
+                 {"day": day, "count": done["count"] + 1, "last_at": now.astimezone(timezone.utc).isoformat()})  # fmt: skip
     try:
         if st.get("state") == "running":
             launchctl_checked("kill", "SIGTERM", service(cfg))
             if not _wait_stopped(cfg):
-                raise Fail(f"{cfg.label} still running {RECOVER_WAIT_S}s after SIGTERM; not kickstarted")
+                raise Fail(f"{cfg.label} not confirmed stopped {RECOVER_WAIT_S}s after SIGTERM; not kickstarted")
         launchctl_checked("kickstart", service(cfg))
     except subprocess.TimeoutExpired as e:
         raise Fail(f"launchctl {e.cmd[1]} timed out; check trade_jev_status") from None
@@ -1170,11 +1197,28 @@ def cmd_recover(cfg: Config, now: datetime) -> dict[str, Any]:
             "summary": f"restarted paper session ({problem})"}  # fmt: skip
 
 
+def _recover_state(day: str) -> dict[str, Any]:
+    """recover's attempts today: ``{"count", "last_at"}`` (zero on another day or no file)."""
+    st = _read_state(data_dir() / RECOVER_STATE)
+    if st.get("day") != day or not isinstance(st.get("count"), int):
+        return {"count": 0, "last_at": None}
+    return {"count": st["count"], "last_at": st.get("last_at")}
+
+
+def _aborted_by_recover(s: sqlite3.Row, day: str) -> bool:
+    """The session started before recover's last attempt today, so that SIGTERM ended it."""
+    last = parse_ts(_recover_state(day)["last_at"])
+    started = parse_ts(s["started_at"])
+    return last is not None and started is not None and started <= last
+
+
 def _wait_stopped(cfg: Config) -> bool:
-    """Poll launchd once a second until the job isn't running (True), for up to RECOVER_WAIT_S."""
+    """Poll launchd once a second until the job is known not to be running (True), for up to
+    RECOVER_WAIT_S. An unreadable state (``launchctl print`` failed) is not "stopped"."""
     deadline = clock.monotonic() + RECOVER_WAIT_S
     while True:
-        if launchd_state(cfg).get("state") != "running":
+        st = launchd_state(cfg)
+        if st["loaded"] is False or (st["loaded"] and st.get("state") != "running"):
             return True
         if clock.monotonic() >= deadline:
             return False

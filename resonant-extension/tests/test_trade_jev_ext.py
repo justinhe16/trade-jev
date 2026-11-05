@@ -1036,7 +1036,7 @@ def test_manifest_display_metadata_stdlib() -> None:
         assert f"  - label: {label}\n" in text
 
 
-from conftest import RESONANT_REPO  # noqa: E402
+from conftest import RESONANT_REPO
 
 
 def test_manifest_validates_against_the_resonant_sdk(tmp_path: Path) -> None:

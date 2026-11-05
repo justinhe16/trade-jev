@@ -68,19 +68,21 @@ def test_health_stall_threshold_is_120s(db: PaperDB) -> None:
 
 
 def test_health_startup_grace(db: PaperDB) -> None:
-    """A session restarted at 14:30 with no decision yet: ok for 3 min, then bad."""
-    running(db, THU, hb="14:32", last=None, started="14:30")
-    code, out = health(et(THU, "14:32"))
-    assert code == 0 and out["summary"] == "ok: session starting, no decision yet"
+    """A session restarted at 14:30 with no decision yet: ok for 6 min (the live restart on
+    2026-11-05 took 3m42s to its first decision), then bad."""
+    running(db, THU, hb="14:34", last=None, started="14:30")
     code, out = health(et(THU, "14:34"))
-    assert code == cli.UNHEALTHY and out["problem"] == "no decisions for 4m00s"
+    assert code == 0 and out["summary"] == "ok: session starting, no decision yet"
+    assert health(et(THU, "14:36"))[0] == 0
+    code, out = health(et(THU, "14:37"))
+    assert code == cli.UNHEALTHY and out["problem"] == "no decisions for 7m00s"
 
 
 def test_health_grace_counts_from_the_open(db: PaperDB) -> None:
-    """Started 09:15 (before the open): decisions begin at 09:30, so 09:32 is still in grace."""
-    running(db, THU, hb="09:32", last=None, started="09:15")
-    assert health(et(THU, "09:32"))[0] == 0
-    assert health(et(THU, "09:34"))[0] == cli.UNHEALTHY
+    """Started 09:15 (before the open): decisions begin at 09:30, so 09:35 is still in grace."""
+    running(db, THU, hb="09:35", last=None, started="09:15")
+    assert health(et(THU, "09:35"))[0] == 0
+    assert health(et(THU, "09:37"))[0] == cli.UNHEALTHY
 
 
 def test_health_catch_up_replay_is_not_a_stall(db: PaperDB) -> None:
@@ -88,6 +90,14 @@ def test_health_catch_up_replay_is_not_a_stall(db: PaperDB) -> None:
     running(db, THU, hb="14:31", last="10:02", started="14:30")
     code, out = health(et(THU, "14:31"))
     assert code == 0 and out["summary"] == "ok: session catching up (replay at 10:02 ET)"
+
+
+def test_health_catch_up_is_bounded(db: PaperDB) -> None:
+    """A replay that never reaches the present (hung before its first live decision) is a stall."""
+    running(db, THU, hb="15:16", last="10:02", started="14:30")
+    assert health(et(THU, "15:15"))[0] == 0
+    code, out = health(et(THU, "15:16"))
+    assert code == cli.UNHEALTHY and out["problem"] == "still catching up after 45m00s (replay at 10:02 ET)"
 
 
 @pytest.mark.parametrize(
@@ -281,13 +291,10 @@ def test_recover_after_eod_guard(db: PaperDB, launchd, monkeypatch: pytest.Monke
 
 
 @pytest.mark.parametrize("verb", ["kill", "kickstart"])
-def test_recover_launchctl_failure_exits_1(db: PaperDB, launchd, verb: str, capsys) -> None:
+def test_recover_launchctl_failure_exits_1(db: PaperDB, launchd, verb: str) -> None:
     running(db, THU, hb="14:00", last="13:55")
     launchd.state = "running" if verb == "kill" else "not running"
     launchd.fail[verb] = 5
-    assert cli.main(["recover"]) in (0, 1)  # real clock: may be outside the window; pin it below
-    capsys.readouterr()
-    launchd.calls.clear()
     with pytest.raises(cli.Fail, match=f"launchctl {verb} exited 5"):
         cli.run(["recover"], now=et(THU, "14:00"))
     if verb == "kill":
@@ -313,9 +320,9 @@ def test_recover_job_not_loaded_exits_1(db: PaperDB, launchd) -> None:
 def test_recover_old_process_never_exits(db: PaperDB, launchd, monkeypatch: pytest.MonkeyPatch, no_sleep) -> None:
     """SIGTERM sent but the job stays running: no kickstart on top of it, exit 1."""
     running(db, THU, hb="14:00", last="13:55")
-    ticks = iter(range(0, 1000))
+    ticks = iter(range(1000))
     monkeypatch.setattr(cli.clock, "monotonic", lambda: float(next(ticks)))
-    with pytest.raises(cli.Fail, match="still running 20s after SIGTERM"):
+    with pytest.raises(cli.Fail, match="not confirmed stopped 20s after SIGTERM"):
         cli.run(["recover"], now=et(THU, "14:00"))
     assert ("kickstart", SVC) not in launchd.calls and len(no_sleep) >= 19
 
@@ -332,3 +339,95 @@ def test_manifest_declares_recover() -> None:
     text = (cli.Path(cli.__file__).parent / "resonant.yaml").read_text()
     assert "\nhealth: {check: ./cli.py health, every: 5m}\n" in text
     assert "\nrecover: {run: ./cli.py recover, timeout: 120s}\n" in text
+
+
+def test_recover_unreadable_state_while_waiting_is_not_stopped(
+    db: PaperDB, launchd, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``launchctl print`` failing after the SIGTERM is "unknown", not "stopped": no kickstart."""
+    running(db, THU, hb="14:00", last="13:55")
+    real = type(launchd).__call__
+
+    def flaky(*args: str) -> subprocess.CompletedProcess[str]:
+        if args[0] == "print" and any(c[0] == "kill" for c in launchd.calls):
+            launchd.calls.append(args)
+            raise OSError("launchctl went away")
+        return real(launchd, *args)
+
+    monkeypatch.setattr(cli, "launchctl", flaky)
+    ticks = iter(range(1000))
+    monkeypatch.setattr(cli.clock, "monotonic", lambda: float(next(ticks)))
+    with pytest.raises(cli.Fail, match="not confirmed stopped"):
+        cli.run(["recover"], now=et(THU, "14:00"))
+    assert ("kickstart", SVC) not in launchd.calls
+
+
+def test_recover_cooldown_then_cap(db: PaperDB, launchd) -> None:
+    """At most one restart per 10 min and 3 per day; health stays unhealthy meanwhile (owner alert)."""
+    db.session("s1", THU, "crashed", started="09:15", heartbeat=et(THU, "10:00"), error="boom")
+    launchd.state = "not running"
+    assert cli.run(["recover"], now=et(THU, "10:05"))["restarted"] is True
+    out = cli.run(["recover"], now=et(THU, "10:10"))
+    assert out["restarted"] is False
+    assert out["summary"] == "nothing to do: restarted 5m00s ago, waiting for it (session crashed: boom)"
+    assert cli.run(["recover"], now=et(THU, "10:15"))["restarted"] is True
+    assert cli.run(["recover"], now=et(THU, "10:25"))["restarted"] is True
+    out = cli.run(["recover"], now=et(THU, "10:35"))
+    assert out["summary"] == (
+        "nothing to do: already restarted 3 times today, needs the owner (session crashed: boom)")
+    assert [c for c in launchd.calls if c[0] == "kickstart"] == [("kickstart", SVC)] * 3
+    assert health(et(THU, "10:35"))[0] == cli.UNHEALTHY
+
+
+def test_recover_cap_resets_the_next_day(db: PaperDB, data_dir: Path, launchd) -> None:
+    (data_dir / cli.RECOVER_STATE).write_text(json.dumps(
+        {"day": "2026-11-04", "count": 3, "last_at": "2026-11-04T19:00:00+00:00"}))
+    db.session("s1", THU, "crashed", heartbeat=et(THU, "10:00"), error="boom")
+    launchd.state = "not running"
+    assert cli.run(["recover"], now=et(THU, "10:05"))["restarted"] is True
+
+
+def test_failed_kickstart_after_sigterm_is_retried(db: PaperDB, launchd, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Blocker from review: SIGTERM makes the runner write `aborted`, which alone is healthy. If the
+    kickstart then failed, the aborted session is recover's doing: still a problem, retried."""
+    running(db, THU, hb="14:00", last="13:55")
+    real = type(launchd).__call__
+
+    def stops_on_sigterm(*args: str) -> subprocess.CompletedProcess[str]:
+        if args[0] == "kill":
+            launchd.state = "not running"
+        return real(launchd, *args)
+
+    monkeypatch.setattr(cli, "launchctl", stops_on_sigterm)
+    launchd.fail["kickstart"] = 5
+    with pytest.raises(cli.Fail, match="launchctl kickstart exited 5"):
+        cli.run(["recover"], now=et(THU, "14:00"))
+    db.conn.execute("UPDATE paper_sessions SET status='aborted' WHERE session_id='s1'")  # the runner on SIGTERM
+    db.conn.commit()
+    code, out = health(et(THU, "14:05"))
+    assert code == cli.UNHEALTHY and out["problem"] == "session aborted by recover, no new session"
+    launchd.fail.clear()
+    launchd.state = "not running"
+    launchd.calls.clear()
+    out = cli.run(["recover"], now=et(THU, "14:10"))
+    assert out["restarted"] is True and launchd.calls[-1] == ("kickstart", SVC)
+    assert ("kill", "SIGTERM", SVC) not in launchd.calls  # already down: kickstart only
+
+
+def test_new_session_after_recover_is_judged_normally(db: PaperDB, launchd) -> None:
+    """Once the kickstart worked, the old aborted row is history: the new session's grace applies."""
+    running(db, THU, hb="14:00", last="13:55")
+    launchd.state = "not running"
+    cli.run(["recover"], now=et(THU, "14:00"))
+    db.conn.execute("UPDATE paper_sessions SET status='aborted' WHERE session_id='s1'")
+    db.conn.commit()
+    db.session("s2", THU, "running", started="14:01", heartbeat=et(THU, "14:03"))
+    assert health(et(THU, "14:03"))[0] == 0
+
+
+def test_owner_abort_is_not_recovers(db: PaperDB, data_dir: Path) -> None:
+    """An aborted session with no recover attempt after its start (e.g. a manual SIGTERM) stays ok."""
+    db.session("s1", THU, "aborted", started="11:00")
+    (data_dir / cli.RECOVER_STATE).write_text(json.dumps(
+        {"day": THU, "count": 1, "last_at": "2026-11-05T15:00:00+00:00"}))  # 10:00 ET, before 11:00
+    assert health(et(THU, "12:00")) == (0, {"ok": True, "db": "ok", "sessions": 1, "summary": "ok: session aborted"})

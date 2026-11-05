@@ -636,6 +636,9 @@ class Session:
             p.parent.mkdir(parents=True, exist_ok=True)
             self.dec_fh = p.open("w")
         self.paper_sent = {n: 0 for n in self.engine.policies}  # trades already written, per policy
+        # chart-only paper rows (paper_bars, paper_open): fed from the quotes and the Jev book, never read back
+        self.paper_bars = paperdb.MinuteBars()
+        self.paper_open: tuple[int, int] = (0, 0)  # the Jev (side, entry_ns) last written to paper_open
         self._rebuild()
 
     # -- feed side
@@ -644,6 +647,8 @@ class Session:
         self.last_rx = time.monotonic()
         if self.recorder:
             self.recorder.add(b)
+        if self.paper:
+            self._paper_safe(self._paper_minute_bars, b)
         ts, bid, ask = int(b.ts[-1]), int(b.bid_px[-1, 0]), int(b.ask_px[-1, 0])
         sec = ts // 1_000_000_000
         if self.track and self.track[-1][0] == sec:
@@ -748,6 +753,7 @@ class Session:
                 self._paper_safe(self.paper.decision, e.jev_name, last)
         if self.paper:
             self._paper_safe(self._paper_trades)
+            self._paper_safe(self._paper_open_position)
         if kind in ("fill", "exit", "closed") and (kw.get("policy") in (None, jn)):
             self._update_signal(kind, kw)
         if e.jev_name and kw.get("policy") in (None, e.jev_name):
@@ -768,6 +774,28 @@ class Session:
             for t in r.trades[self.paper_sent[name]:]:
                 self.paper.trade(name, t)
             self.paper_sent[name] = len(r.trades)
+
+    def _paper_minute_bars(self, b: Batch) -> None:
+        """Queue each 1-minute mid bar the batch completes (chart only; see paperdb.MinuteBars)."""
+        for bar in self.paper_bars.add(b.ts, b.bid_px[:, 0], b.ask_px[:, 0]):
+            self.paper.bar(*bar)
+
+    def _paper_open_position(self) -> None:
+        """Write the Jev paper position when it changes (chart only: an open trade on the price chart)."""
+        e = self.engine
+        if not e.jev_name:
+            return
+        pos = e.books[e.jev_name].pos
+        key = (pos.side, pos.entry_ns if pos.side else 0)
+        if key != self.paper_open:
+            self.paper.open_position(e.jev_name, pos.side, pos.entry_ns, pos.entry_px)
+            self.paper_open = key
+
+    def paper_flush(self) -> None:
+        """Session end: the minute in progress, and the final Jev position."""
+        for bar in self.paper_bars.flush():
+            self.paper.bar(*bar)
+        self._paper_open_position()
 
     def paper_summary(self) -> list[dict]:
         """paper_summary rows: one per policy, from the closed trades so far."""
@@ -1214,6 +1242,7 @@ async def amain(argv: list[str] | None = None) -> int:
             return
         if hb:
             hb.cancel()
+        session._paper_safe(session.paper_flush)
         try:
             session._paper_trades()
             summary = session.paper_summary()

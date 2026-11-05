@@ -13,6 +13,10 @@ Tables (other tools read these; don't rename columns):
   paper_trades     one row per closed trade, every policy, written as it closes. side: long | short
   paper_decisions  the Jev decision log (one row per 15s decision)
   paper_summary    per policy, written at session end (and best effort on a crash)
+  paper_bars       1-minute OHLC of the top-of-book mid (t_s = the minute's start, unix seconds), from every
+                   quote, written as each minute completes (the last one at session end). For charts only:
+                   nothing in the engine reads it. Backfill a recorded day with `python -m trade_jev.paperdb bars`.
+  paper_open       the Jev policy's open paper position (one row while open, deleted when flat). Chart only.
 
 The runner writes through `Recorder`, which queues statements to one writer thread, so the event
 loop never waits on the disk. The viewer opens the file read-only (`connect_ro`).
@@ -28,7 +32,10 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
+
 from trade_jev import ROOT
+from trade_jev.data import TICK
 
 STALE_S = 180  # a running session whose heartbeat is older than this is presumed dead
 
@@ -50,6 +57,14 @@ CREATE TABLE IF NOT EXISTS paper_decisions (
 CREATE TABLE IF NOT EXISTS paper_summary (
     session_id TEXT, policy TEXT, trades INTEGER, wins INTEGER, pnl REAL, max_drawdown REAL,
     jev_calls INTEGER, jev_cost_usd REAL,
+    PRIMARY KEY (session_id, policy)
+);
+CREATE TABLE IF NOT EXISTS paper_bars (
+    session_id TEXT, t_s INTEGER, o REAL, h REAL, l REAL, c REAL,
+    PRIMARY KEY (session_id, t_s)
+);
+CREATE TABLE IF NOT EXISTS paper_open (
+    session_id TEXT, policy TEXT, side TEXT, entry_ns INTEGER, entry_px REAL,
     PRIMARY KEY (session_id, policy)
 );
 CREATE INDEX IF NOT EXISTS paper_sessions_day ON paper_sessions(day);
@@ -105,6 +120,49 @@ def max_drawdown(pnls: list[float]) -> float:
 
 def side_word(side: int) -> str:
     return "long" if side > 0 else "short"
+
+
+# ---------------------------------------------------------------- minute bars
+
+Bar = tuple[int, float, float, float, float]  # (minute start in unix s, o, h, l, c) in points
+
+
+class MinuteBars:
+    """1-minute OHLC of the top-of-book mid from every quote (prices in ticks, as the feed's Batch).
+    `add` returns the minutes it completed; `flush` returns the one in progress. A row with an empty or
+    crossed top of book is skipped, and so is a minute older than the current one (out-of-order data)."""
+
+    def __init__(self) -> None:
+        self.cur: list[int] | None = None  # [minute_s, o, h, l, c] in half-ticks (bid + ask)
+
+    def add(self, ts: np.ndarray, bid: np.ndarray, ask: np.ndarray) -> list[Bar]:
+        ok = (bid > 0) & (ask >= bid)
+        ts = np.asarray(ts, np.int64)[ok]
+        if not len(ts):
+            return []
+        two_mid = bid[ok].astype(np.int64) + ask[ok].astype(np.int64)
+        minute = ts // 60_000_000_000 * 60
+        starts = np.flatnonzero(np.r_[True, minute[1:] != minute[:-1]])
+        done: list[Bar] = []
+        for a, z in zip(starts, np.r_[starts[1:], len(ts)]):
+            t, seg = int(minute[a]), two_mid[a:z]
+            o, h, lo, c = int(seg[0]), int(seg.max()), int(seg.min()), int(seg[-1])
+            cur = self.cur
+            if cur is None or t > cur[0]:
+                if cur is not None:
+                    done.append(self._bar(cur))
+                self.cur = [t, o, h, lo, c]
+            elif t == cur[0]:
+                cur[2], cur[3], cur[4] = max(cur[2], h), min(cur[3], lo), c
+        return done
+
+    def flush(self) -> list[Bar]:
+        cur, self.cur = self.cur, None
+        return [self._bar(cur)] if cur is not None else []
+
+    @staticmethod
+    def _bar(b: list[int]) -> Bar:
+        return (b[0], *(v * TICK / 2 for v in b[1:]))  # type: ignore[return-value]
 
 
 # ---------------------------------------------------------------- writer
@@ -190,6 +248,20 @@ class Recorder:
                   (self.session_id, policy, int(d["t_ns"]), d["time_et"], float(d["mid"]), int(d["position"]),
                    d["action"], d.get("raw_action"), json.dumps(d.get("probs") or {}),
                    d.get("jev_ms"), d.get("error")))
+
+    def bar(self, t_s: int, o: float, h: float, lo: float, c: float) -> None:
+        """One completed 1-minute mid bar (see `MinuteBars`)."""
+        self._put("INSERT OR REPLACE INTO paper_bars (session_id, t_s, o, h, l, c) VALUES (?, ?, ?, ?, ?, ?)",
+                  (self.session_id, int(t_s), float(o), float(h), float(lo), float(c)))
+
+    def open_position(self, policy: str, side: int, entry_ns: int = 0, entry_px: float = 0.0) -> None:
+        """The policy's open position now: a row while long/short, none while flat."""
+        if side:
+            self._put("""INSERT OR REPLACE INTO paper_open (session_id, policy, side, entry_ns, entry_px)
+                         VALUES (?, ?, ?, ?, ?)""",
+                      (self.session_id, policy, side_word(side), int(entry_ns), float(entry_px)))
+        else:
+            self._put("DELETE FROM paper_open WHERE session_id=? AND policy=?", (self.session_id, policy))
 
     def finish(self, status: str, summary: list[dict], error: str | None = None) -> None:
         """End the session: summary rows (one per policy) and the final status."""
@@ -303,3 +375,51 @@ def get_session(session_id: str, path: Path | None = None) -> dict | None:
         return s
     finally:
         con.close()
+
+
+# ---------------------------------------------------------------- backfill (CLI)
+
+def backfill_bars(session_id: str, parquet: Path, path: Path | None = None, chunk: int = 200_000) -> int:
+    """Write `paper_bars` for a session from its recorded feed (a day Parquet file, as live.Recorder writes):
+    the same `MinuteBars` the live runner uses. Idempotent (rows are replaced). Returns the bar count."""
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    bars, out = MinuteBars(), []
+    for b in pq.ParquetFile(parquet).iter_batches(chunk, columns=["ts_event", "bid_px", "ask_px"]):
+        ts = b.column("ts_event").cast("int64").to_numpy()
+        top = [np.rint(pc.list_element(b.column(c), 0).to_numpy(zero_copy_only=False) / TICK).astype(np.int64)
+               for c in ("bid_px", "ask_px")]
+        out += bars.add(ts, *top)
+    out += bars.flush()
+    con = connect(path)
+    try:
+        with con:
+            con.executemany("INSERT OR REPLACE INTO paper_bars (session_id, t_s, o, h, l, c) VALUES (?, ?, ?, ?, ?, ?)",
+                            [(session_id, *bar) for bar in out])
+    finally:
+        con.close()
+    return len(out)
+
+
+def main(argv: list[str] | None = None) -> None:
+    import argparse
+
+    ap = argparse.ArgumentParser(prog="python -m trade_jev.paperdb", description=__doc__.splitlines()[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    b = sub.add_parser("bars", help="backfill paper_bars for a recorded day (the chart's 1-min candles)")
+    b.add_argument("--day", required=True, help="YYYY-MM-DD")
+    b.add_argument("--session", help="session id (default live-DAY)")
+    b.add_argument("--file", type=Path, help="the day's Parquet recording (default: the one in data/live)")
+    args = ap.parse_args(argv)
+    from trade_jev.data import LIVE_DIR
+
+    f = args.file or next(iter(sorted(LIVE_DIR.glob(f"*__{args.day}__live.parquet"))), None)
+    if f is None or not f.exists():
+        ap.error(f"no recording for {args.day} in {LIVE_DIR}")
+    sid = args.session or f"live-{args.day}"
+    print(f"{sid}: {backfill_bars(sid, f)} bars from {f.name} → {db_path()}")
+
+
+if __name__ == "__main__":
+    main()

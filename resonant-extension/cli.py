@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """trade-jev Resonant extension: paper status, P&L, trades, Jev decisions, start/stop, two jobs,
-and the `paper` dashboard panel.
+and the `paper` and `chart` dashboard panels.
 
 Stdlib only. Resonant runs this as ``python -I -S cli.py <cmd>`` with ``PATH=/usr/bin:/bin``
 and ``HOME``/``RESONANT_EXT_DATA`` set to the extension's data dir (never the real home).
@@ -1224,7 +1224,8 @@ def closed_trades(conn: sqlite3.Connection, session_ids: list[str]) -> list[sqli
         return []
     marks = ",".join("?" * len(session_ids))
     return conn.execute(
-        f"SELECT policy, side, exit_ns, points, pnl, reason FROM paper_trades "  # noqa: S608
+        f"SELECT policy, side, entry_ns, entry_px, exit_ns, exit_px, points, pnl, reason "  # noqa: S608
+        f"FROM paper_trades "
         f"WHERE session_id IN ({marks}) AND exit_ns IS NOT NULL ORDER BY exit_ns, id",
         session_ids,
     ).fetchall()
@@ -1492,6 +1493,125 @@ def cmd_panel(cfg: Config, now: datetime) -> dict[str, Any]:
                     local_url=PANEL_LIVE_URL if running else PANEL_LOCAL_URL)  # fmt: skip
 
 
+# --- the `chart` panel (PER-283) ---------------------------------------------------------------
+
+CHART_TRADES = 100  # the price widget's cap: the newest are kept
+CHART_DAYS = 10  # how far back to look for the last session with data
+WHY = {"jev": "reversal"}  # paper_trades.reason: Jev's own order closed it; target, stop, eod as is
+
+
+def _window(day: str) -> tuple[int, int]:
+    """09:30 and 16:00 ET of ``day`` in unix seconds: the candles are [open, close)."""
+    d = date.fromisoformat(day)
+    return tuple(int(datetime.combine(d, t, ET).timestamp()) for t in (OPEN, CLOSE))  # type: ignore[return-value]
+
+
+def chart_bars(conn: sqlite3.Connection, day: str, ids: list[str]) -> dict[int, list[float]]:
+    """The day's 1-minute mid bars (``paper_bars``, written by the runner) keyed by minute start; a
+    minute two sessions both saw (a restart) merges in session order."""
+    if not ids or not has_table(conn, "paper_bars"):
+        return {}
+    lo, hi = _window(day)
+    out: dict[int, list[float]] = {}
+    for sid in ids:
+        for t, o, h, lw, c in conn.execute(
+            "SELECT t_s, o, h, l, c FROM paper_bars WHERE session_id=? AND t_s>=? AND t_s<? ORDER BY t_s",
+            (sid, lo, hi),
+        ):
+            b = out.get(t)
+            out[t] = [o, h, lw, c] if b is None else [b[0], max(b[1], h), min(b[2], lw), c]
+    return out
+
+
+def chart_mids(conn: sqlite3.Connection, day: str, ids: list[str]) -> dict[int, float]:
+    """Fallback for a session from before ``paper_bars`` existed: the last 15 s decision mid of each
+    minute. Too coarse for candles (their high/low miss most of the range), so it is drawn as a line."""
+    if not ids or not has_table(conn, "paper_decisions"):
+        return {}
+    lo, hi = _window(day)
+    marks = ",".join("?" * len(ids))
+    out: dict[int, float] = {}
+    for t_ns, mid in conn.execute(
+        f"SELECT t_ns, mid FROM paper_decisions WHERE session_id IN ({marks}) "  # noqa: S608
+        f"AND t_ns>=? AND t_ns<? AND mid IS NOT NULL ORDER BY t_ns",
+        (*ids, lo * 10**9, hi * 10**9),
+    ):
+        out[t_ns // 10**9 // 60 * 60] = float(mid)
+    return out
+
+
+def chart_trades(conn: sqlite3.Connection, ids: list[str], running: str | None) -> list[dict[str, Any]]:
+    """Jev's trades on the chart: every closed one (newest ``CHART_TRADES``, the open one included)
+    and, while ``running`` (that session's id), its open position from ``paper_open``."""
+    out = [
+        pw.trade(r["side"], r["entry_ns"] // 10**9, r["entry_px"], r["exit_ns"] // 10**9, r["exit_px"],
+                 pnl=num(r["pnl"]), currency="USD", label="jev", why=WHY.get(r["reason"], r["reason"]))
+        for r in closed_trades(conn, ids) if is_jev(r["policy"])
+    ]  # fmt: skip
+    if running and has_table(conn, "paper_open"):
+        for r in conn.execute(
+            "SELECT policy, side, entry_ns, entry_px FROM paper_open WHERE session_id=?", (running,)
+        ):
+            if is_jev(r["policy"]) and r["side"] in ("long", "short"):
+                out.append(pw.trade(r["side"], r["entry_ns"] // 10**9, r["entry_px"],
+                                    currency="USD", label="jev"))  # fmt: skip
+    return out[-CHART_TRADES:]
+
+
+def chart_view(conn: sqlite3.Connection | None, now: datetime) -> tuple[list[dict[str, Any]], str | None, bool]:
+    """The chart's widgets, health and whether the charted session is running. The day is today once
+    its session has market data or has ended; otherwise (weekend, holiday, before 09:30) the latest
+    earlier session, named in the title."""
+    if conn is None:
+        return [pw.text(NO_SESSIONS + ".", id="none")], None, False
+    today = now.astimezone(ET).date().isoformat()
+    days = [r["day"] for r in conn.execute(
+        "SELECT DISTINCT day FROM paper_sessions WHERE status NOT IN ('holiday', 'skipped') AND day<=? "
+        "ORDER BY day DESC LIMIT ?", (today, CHART_DAYS))]  # fmt: skip
+    for day in days:
+        sess = [s for s in sessions_on(conn, [day]) if s["status"] not in NO_TRADE]
+        ids = [s["session_id"] for s in sess]
+        bars = chart_bars(conn, day, ids)
+        mids = {} if bars else chart_mids(conn, day, ids)
+        last = sess[-1]
+        if bars or mids or last["status"] != "running" or day == days[-1]:
+            break
+    else:
+        return [pw.text(NO_SESSIONS + ".", id="none")], None, False
+    health = health_of(last, now)[0]
+    running = health == "running"
+    when = "today" if day == today else f"{day_label(day)} (last session)"
+    symbol = last["symbol"] or "NQ"
+    trades = chart_trades(conn, ids, last["session_id"] if running else None)
+    widgets: list[dict[str, Any]] = []
+    if bars:
+        xs = sorted(bars)
+        widgets.append(pw.price(xs, candles=[bars[t] for t in xs], trades=trades, format="number",
+                                id="price", title=f"{symbol} 1-min mid, {when}"))  # fmt: skip
+    elif mids:
+        xs = sorted(mids)
+        widgets.append(pw.price(xs, line=[mids[t] for t in xs], trades=trades, format="number", id="price",
+                                title=f"{symbol} mid (15 s samples; no 1-min bars), {when}"))  # fmt: skip
+    else:
+        widgets.append(pw.text(f"No market data recorded for {when} yet.", id="none"))
+    if last["status"] == "crashed":
+        widgets.append(pw.text(f"Session crashed: {short_error(last['error'], 160) or 'no error recorded'}",
+                               id="crash", title="Crashed"))  # fmt: skip
+    return widgets, "bad" if health in ("crashed", "stale") else None, running
+
+
+def cmd_chart(cfg: Config, now: datetime) -> dict[str, Any]:
+    """The ``chart`` dashboard panel: NQ 1-minute candles with Jev's trades (see README)."""
+    conn = connect(cfg)
+    try:
+        widgets, health, running = chart_view(conn, now)
+    finally:
+        if conn is not None:
+            conn.close()
+    return pw.panel([pw.view("chart", "Jev trades", widgets)], updated_at=now, health=health,
+                    local_url=PANEL_LIVE_URL if running else PANEL_LOCAL_URL)  # fmt: skip
+
+
 # --- main -------------------------------------------------------------------------------------
 
 
@@ -1510,7 +1630,7 @@ def build_parser() -> argparse.ArgumentParser:
     dec.add_argument("--date", default="")
     dec.add_argument("--limit", type=int, default=0)
     pan = sub.add_parser("panel")
-    pan.add_argument("name", choices=["paper"])
+    pan.add_argument("name", choices=["paper", "chart"])
     return p
 
 
@@ -1518,7 +1638,7 @@ def run(argv: list[str], now: datetime | None = None) -> dict[str, Any]:
     args = build_parser().parse_args(argv)
     cfg = load_config()
     if args.cmd == "panel":
-        return cmd_panel(cfg, now or now_utc())
+        return (cmd_chart if args.name == "chart" else cmd_panel)(cfg, now or now_utc())
     if args.cmd == "pnl":
         return cmd_pnl(cfg, now or now_utc(), args.date)
     if args.cmd == "trades":

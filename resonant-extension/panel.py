@@ -5,12 +5,15 @@ A panel command prints one JSON object (the contract is ``panel_schema.py`` and
 ``docs/extensions.md`` 6a). These helpers build the pieces as plain dicts, leave out what is
 None, and turn ``datetime`` values into ISO-8601 text:
 
-    from panel import kv, panel, print_panel, series, stat, table, view
+    from panel import kv, panel, price, print_panel, series, stat, table, trade, view
 
     print_panel([
         view("overview", "Overview", [
             stat("Equity", 10432.5, format="money"),
             series("line", [t0, t1, t2], {"Equity": [10000, 10200, 10432.5]}, format="money"),
+        ]),
+        view("chart", "Chart", [
+            price(times, candles=rows, trades=[trade("long", t1, 101.5, t2, 103.0, pnl=150.0)]),
         ]),
     ])
 """
@@ -111,6 +114,59 @@ def text(body: str, **fields: Any) -> dict[str, Any]:
 def details(data: Any, *, collapsed: bool = True, **fields: Any) -> dict[str, Any]:
     """Any JSON value, shown as an expandable tree."""
     return {"type": "details", "data": _jsonable(data), "collapsed": collapsed} | _clean(**fields)
+
+
+def price(
+    x: Sequence[Any],
+    *,
+    candles: Mapping[str, Sequence[Any]] | Sequence[Sequence[Any] | None] | None = None,
+    line: Sequence[Any] | None = None,
+    trades: Sequence[Mapping[str, Any]] = (),
+    markers: Sequence[Mapping[str, Any]] = (),
+    **fields: Any,
+) -> dict[str, Any]:
+    """A price chart (PER-282): ``x`` is each candle's open time, strictly increasing. Give
+    ``candles`` as ``{"o": [...], "h": [...], "l": [...], "c": [...]}`` or as rows
+    ``(o, h, l, c)`` (None for a gap), or ``line`` (closes only). Build ``trades`` with
+    :func:`trade` and ``markers`` with :func:`marker`. Fields: unit, format, currency, id,
+    title."""
+    body: dict[str, Any] = {"type": "price", "x": list(x)}
+    if candles is not None:
+        if isinstance(candles, Mapping):
+            body["candles"] = {k: list(candles[k]) for k in ("o", "h", "l", "c")}
+        else:
+            rows = [r or (None, None, None, None) for r in candles]
+            body["candles"] = {k: [r[i] for r in rows] for i, k in enumerate("ohlc")}
+    if line is not None:
+        body["line"] = list(line)
+    if trades:
+        body["trades"] = list(trades)
+    if markers:
+        body["markers"] = list(markers)
+    return _jsonable(body) | _clean(**fields)
+
+
+def trade(
+    side: str,
+    entry_t: Any,
+    entry_px: float,
+    exit_t: Any = None,
+    exit_px: float | None = None,
+    **fields: Any,
+) -> dict[str, Any]:
+    """A trade on a price chart: ``side`` is long or short; leave ``exit_t`` and ``exit_px``
+    out while it is open. Fields: pnl, currency, label, why."""
+    return _clean(
+        side=side, entry_t=entry_t, entry_px=entry_px, exit_t=exit_t, exit_px=exit_px, **fields
+    )
+
+
+def marker(
+    t: Any, price: float, kind: str = "dot", tone: str = "neutral", **fields: Any
+) -> dict[str, Any]:
+    """A point on a price chart: ``kind`` up, down or dot; ``tone`` ok, warn, bad or neutral.
+    Fields: label."""
+    return _clean(t=t, price=price, kind=kind, tone=tone, **fields)
 
 
 def view(id: str, title: str, widgets: Sequence[Mapping[str, Any]]) -> dict[str, Any]:

@@ -10,6 +10,7 @@ import urllib.request
 from datetime import date, datetime, timedelta, timezone
 from http.server import ThreadingHTTPServer
 
+import numpy as np
 import pytest
 
 from trade_jev import live, outputs, paperdb, tradingdays
@@ -321,3 +322,122 @@ def test_sigterm_aborts_with_a_summary_and_exits_0(sandbox, db):
     s = rows(db, "SELECT * FROM paper_sessions")[0]
     assert s["status"] == "aborted" and s["ended_at"]
     assert {r["policy"] for r in rows(db, "SELECT policy FROM paper_summary")} == {"hold", "random", "imbalance"}
+
+
+# ---------------------------------------------------------------- chart rows: paper_bars, paper_open
+
+def brute_bars(b, lo=0, hi=None):
+    """1-minute OHLC of the top-of-book mid, the slow obvious way."""
+    out = {}
+    for t, bid, ask in zip(b.ts[lo:hi], b.bid_px[lo:hi, 0], b.ask_px[lo:hi, 0]):
+        m, mid = int(t) // 60_000_000_000 * 60, (int(bid) + int(ask)) * 0.125
+        o, h, l, c = out.get(m, (mid, mid, mid, mid))
+        out[m] = (o, max(h, mid), min(l, mid), mid)
+    return [(m, *v) for m, v in sorted(out.items())]
+
+
+def test_minute_bars_match_brute_force_across_any_batch_split():
+    b = synthetic()
+    for chunk in (1, 7, 50, len(b)):
+        mb = paperdb.MinuteBars()
+        got = []
+        for i in range(0, len(b), chunk):
+            got += mb.add(b.ts[i:i + chunk], b.bid_px[i:i + chunk, 0], b.ask_px[i:i + chunk, 0])
+        got += mb.flush()
+        assert got == brute_bars(b), chunk
+        assert all(h >= max(o, c) and l <= min(o, c) for _, o, h, l, c in got)
+    assert mb.flush() == []
+
+
+def test_minute_bars_skip_empty_crossed_and_out_of_order_rows():
+    m0 = et_ns("09:30:00")
+    ts = np.array([m0, m0 + 1, m0 + 2, m0 + 60 * 10**9, m0 + 3], np.int64)
+    bid = np.array([80_000, 0, 80_010, 80_004, 70_000])
+    ask = np.array([80_001, 80_001, 80_005, 80_005, 70_001])  # row 1 empty bid, row 2 crossed, row 4 late
+    mb = paperdb.MinuteBars()
+    got = mb.add(ts, bid, ask) + mb.flush()
+    s0 = m0 // 10**9
+    assert got == [(s0, 20000.125, 20000.125, 20000.125, 20000.125),
+                   (s0 + 60, 20001.125, 20001.125, 20001.125, 20001.125)]
+
+
+def et_ns(hms):
+    from tests.test_live import et_to_ns
+    return et_to_ns(DAY, hms)
+
+
+def run_session(paper):
+    b = synthetic()
+    cfg = Config(cadence_s=5, start_et="09:30:00", end_et="09:35:00", stop_ticks=6, target_ticks=8)
+    s = Session(None, cfg, Settings(0.6, 2, 0, 6, 8), DAY, "NQU6", MemSource(b), Script(), ["random"],
+                None, None, paper=paper)
+    asyncio.run(s.run())
+    return s, b
+
+
+def test_session_writes_minute_bars_and_the_open_jev_position(db):
+    rec = paperdb.Recorder("rehearsal-x")
+    opens = []
+    real = rec.open_position
+    rec.open_position = lambda *a: (opens.append(a), real(*a))  # every change, in order
+    s, b = run_session(rec)
+    s.paper_flush()
+    rec.close()
+    got = [tuple(r.values()) for r in rows(db, "SELECT t_s, o, h, l, c FROM paper_bars ORDER BY t_s")]
+    want = brute_bars(b)
+    assert len(got) == 7 and got[:6] == want[:6]  # 09:29..09:34 complete
+    assert got[6][0] == want[6][0]  # 09:35, from paper_flush: a rehearsal stops reading at the session end
+    jev = s.engine.jev_name
+    trades = s.engine.results[jev].trades
+    assert trades and [o for o in opens if o[1]] == [(jev, t.side, t.entry_ns, t.entry_px) for t in trades]
+    assert opens[-1] == (jev, 0, 0, 0.0)  # flat at the close: the row is gone
+    assert rows(db, "SELECT * FROM paper_open") == []
+
+
+def test_open_position_row_while_open(db):
+    rec = paperdb.Recorder("s")
+    rec.open_position("jev[raw_l10]", -1, 123, 21000.25)
+    rec.close()
+    assert rows(db, "SELECT * FROM paper_open") == [
+        {"session_id": "s", "policy": "jev[raw_l10]", "side": "short", "entry_ns": 123, "entry_px": 21000.25}]
+
+
+def test_chart_rows_never_change_the_trading(db):
+    """Same decisions and fills with or without the paper writer (bars and open rows are write-only)."""
+    with_paper, _ = run_session(paperdb.Recorder("a"))
+    without, _ = run_session(None)
+    for name, r in without.engine.results.items():
+        assert with_paper.engine.results[name].trades == r.trades, name
+        assert [d["action"] for d in with_paper.engine.results[name].decisions] == [d["action"] for d in r.decisions]
+
+
+def test_a_failing_bar_write_never_stops_the_session(db, capsys):
+    rec = paperdb.Recorder("x")
+    rec.bar = None  # not callable: every bar write raises
+    s, _ = run_session(rec)
+    rec.close()
+    assert s.engine.closed and "[paperdb] not recorded" in capsys.readouterr().out
+
+
+def test_backfill_from_a_recording_matches_the_live_bars(db, tmp_path):
+    b = synthetic()
+    rec = Recorder(DAY, "NQU6", out_dir=tmp_path / "live", rows_per_group=500)
+    rec.add(b)
+    rec.close()
+    n = paperdb.backfill_bars(f"live-{DAY}", rec.path, chunk=333)
+    got = [tuple(r.values()) for r in rows(db, "SELECT t_s, o, h, l, c FROM paper_bars ORDER BY t_s")]
+    assert n == 7 and got == brute_bars(b)
+    assert paperdb.backfill_bars(f"live-{DAY}", rec.path) == 7  # idempotent
+    assert len(rows(db, "SELECT * FROM paper_bars")) == 7
+
+
+def test_backfill_cli(db, tmp_path, monkeypatch, capsys):
+    import trade_jev.data as data
+    monkeypatch.setattr(data, "LIVE_DIR", tmp_path / "live")
+    rec = Recorder(DAY, "NQU6", out_dir=tmp_path / "live")
+    rec.add(synthetic())
+    rec.close()
+    paperdb.main(["bars", "--day", DAY])
+    assert f"live-{DAY}: 7 bars" in capsys.readouterr().out
+    with pytest.raises(SystemExit):
+        paperdb.main(["bars", "--day", "2020-01-01"])

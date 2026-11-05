@@ -88,7 +88,7 @@ jobs:
     level: L0
     timeout_s: 60
 
-# Dashboard panel (Resonant panels): a read-only L0 run that prints data, never acts. Every minute
+# Dashboard panels (Resonant panels): read-only L0 runs that print data, never act. Every minute
 # 09:00-16:59 ET on weekdays (cron has no 09:15-16:15; that covers the session), every 15 min otherwise.
 panels:
   - id: paper
@@ -101,6 +101,16 @@ panels:
     tz: America/New_York
     timeout_s: 30
     max_bytes: 24576
+  - id: chart
+    title: Jev trades
+    description: "Today's NQ 1-minute mid candles with Jev's paper trades (entry to exit, $ P&L, why); the last session's when there's none today."
+    command: [./cli.py, panel, chart]
+    refresh:
+      idle: "*/15 * * * *"
+      active: "*/1 9-16 * * 1-5"
+    tz: America/New_York
+    timeout_s: 30
+    max_bytes: 32768
 
 # watch's "trade-jev/down" and "trade-jev/token" text at once; close-summary's daily P&L rides the hourly pulse.
 report: {max_urgency: urgent}

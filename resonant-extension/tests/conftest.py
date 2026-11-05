@@ -111,6 +111,36 @@ class PaperDB:
         )  # fmt: skip
         self.conn.commit()
 
+    def chart_tables(self) -> None:
+        """The runner's chart tables (PER-283); absent on a DB from before them."""
+        self.conn.executescript(
+            "CREATE TABLE IF NOT EXISTS paper_bars(session_id TEXT, t_s INTEGER, o REAL, h REAL,"
+            " l REAL, c REAL, PRIMARY KEY(session_id, t_s));"
+            "CREATE TABLE IF NOT EXISTS paper_open(session_id TEXT, policy TEXT, side TEXT,"
+            " entry_ns INTEGER, entry_px REAL, PRIMARY KEY(session_id, policy));"
+        )
+
+    def bars(self, sid: str, day: str, start: str, n: int, base: float = 21000.0, seed: int = 0) -> None:
+        """``n`` 1-minute mid bars from ``start`` ET: a seeded random walk in 0.125 steps."""
+        import random
+
+        self.chart_tables()
+        rng, px, t0 = random.Random(seed), base, int(et(day, start).timestamp())
+        rows = []
+        for i in range(n):
+            o = px
+            path = [o + 0.125 * rng.randint(-12, 12) for _ in range(4)]
+            px = path[-1]
+            rows.append((sid, t0 + 60 * i, o, max(o, *path), min(o, *path), px))
+        self.conn.executemany("INSERT OR REPLACE INTO paper_bars VALUES (?,?,?,?,?,?)", rows)
+        self.conn.commit()
+
+    def open_position(self, sid: str, policy: str, side: str, hm: str, px: float, day: str) -> None:
+        self.chart_tables()
+        self.conn.execute("INSERT OR REPLACE INTO paper_open VALUES (?,?,?,?,?)",
+                          (sid, policy, side, ns(day, hm), px))  # fmt: skip
+        self.conn.commit()
+
     def summary(
         self, sid: str, policy: str, trades: int, wins: int, pnl: float, dd: float,
         calls: int | None = None, cost: float | None = None,

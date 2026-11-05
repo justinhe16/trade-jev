@@ -90,6 +90,8 @@ jobs:
 
 # Dashboard panels (Resonant panels): read-only L0 runs that print data, never act. Every minute
 # 09:00-16:59 ET on weekdays (cron has no 09:15-16:15; that covers the session), every 15 min otherwise.
+# history: Resonant keeps each ended ET day (the command + `--date D`; a day with no session prints
+# {"schema": 1, "none": true} and is left out of the day picker).
 panels:
   - id: paper
     title: Paper trading
@@ -101,6 +103,7 @@ panels:
     tz: America/New_York
     timeout_s: 30
     max_bytes: 24576
+    history: {every: daily, keep: 365d}   # PER-286: archived per ET day via `--date YYYY-MM-DD`
   - id: chart
     title: Jev trades
     description: "Today's NQ 1-minute mid candles with Jev's paper trades (entry to exit, $ P&L, why); the last session's when there's none today."
@@ -111,6 +114,7 @@ panels:
     tz: America/New_York
     timeout_s: 30
     max_bytes: 32768
+    history: {every: daily, keep: 365d}   # PER-286: archived per ET day via `--date YYYY-MM-DD`
 
 # watch's "trade-jev/down" and "trade-jev/token" text at once; close-summary's daily P&L rides the hourly pulse.
 report: {max_urgency: urgent}

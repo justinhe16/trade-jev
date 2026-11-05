@@ -248,12 +248,12 @@ import jsonschema
 from resonant.extensions.panels import PanelRefused, normalize
 from resonant_sdk.manifest import load_manifest
 m = load_manifest(Path(sys.argv[1]))
-(p,) = m.panels
+(p,) = [p for p in m.panels if p.id == sys.argv[3]]
 schema = json.loads(Path(sys.argv[2]).read_text())
 tools = frozenset(m.tools)
 res = {"panel": {"id": p.id, "command": list(p.command), "max_bytes": p.max_bytes,
                  "idle": p.refresh.idle, "active": p.refresh.active, "tz": p.tz}, "runs": {}}
-for f in sys.argv[3:]:
+for f in sys.argv[4:]:
     raw = json.loads(Path(f).read_text())
     jsonschema.validate(raw, schema)
     n = normalize(raw, max_bytes=p.max_bytes, tools=tools, ran_at=datetime.now(UTC))
@@ -264,7 +264,9 @@ print(json.dumps(res))
 """
 
 
-def resonant_validate(tmp_path: Path, outputs: dict[str, dict[str, Any]]) -> dict[str, Any]:
+def resonant_validate(
+    tmp_path: Path, outputs: dict[str, dict[str, Any]], panel_id: str = "paper"
+) -> dict[str, Any]:
     uv = shutil.which("uv")
     schema = RESONANT_REPO / "docs" / "panel.schema.json"
     if uv is None or not schema.is_file():
@@ -276,7 +278,7 @@ def resonant_validate(tmp_path: Path, outputs: dict[str, dict[str, Any]]) -> dic
         files.append(str(f))
     proc = subprocess.run(  # noqa: S603
         [uv, "run", "--frozen", "--no-sync", "--project", str(RESONANT_REPO), "python", "-c",
-         VALIDATE, str(EXT_DIR / "resonant.yaml"), str(schema), *files],
+         VALIDATE, str(EXT_DIR / "resonant.yaml"), str(schema), panel_id, *files],
         capture_output=True, text=True, timeout=120, check=False,
     )  # fmt: skip
     if proc.returncode != 0 and "No module named" in proc.stderr:

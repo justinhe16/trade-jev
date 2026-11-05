@@ -8,12 +8,12 @@ import os
 import shutil
 import subprocess
 import sys
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import cli
 import pytest
-from conftest import EXT_DIR, PaperDB, et, utc_iso, write_token_status
+from conftest import EXT_DIR, PaperDB, et, sdk_manifest, utc_iso, write_token_status
 
 MON = "2026-11-02"  # a Monday
 TUE = "2026-11-03"
@@ -319,11 +319,12 @@ def test_launchd_label_from_config(data_dir: Path, launchd) -> None:
 
 
 def test_health(data_dir: Path, db: PaperDB) -> None:
-    assert cli.run(["health"])["db"] == "ok"
+    assert cli.run(["health"], now=et(MON, "17:00"))["db"] == "ok"
 
 
 def test_health_without_db(data_dir: Path) -> None:
-    assert cli.run(["health"]) == {"ok": True, "db": "absent", "summary": "no paper sessions yet"}
+    assert cli.run(["health"], now=et(MON, "17:00")) == {
+        "ok": True, "db": "absent", "summary": "ok: no paper sessions yet"}  # fmt: skip
 
 
 # --- close-summary job --------------------------------------------------------------------
@@ -505,6 +506,10 @@ def run_isolated(data_dir: Path, *argv: str) -> subprocess.CompletedProcess[str]
 
 def test_cli_prints_one_json_object_under_isolation(db: PaperDB, data_dir: Path) -> None:
     seed_day(db, "s1", MON)
+    # health runs on the real clock here: make today a holiday so its verdict doesn't depend on the hour
+    cfg = json.loads((data_dir / "config.json").read_text())
+    today = datetime.now(cli.ET).date().isoformat()
+    (data_dir / "config.json").write_text(json.dumps({**cfg, "holidays": [today]}))
     for argv in (["pnl", "--date", MON], ["trades", "--date", MON, "--policy", "", "--limit", "0"], ["health"]):
         proc = run_isolated(data_dir, *argv)
         assert proc.returncode == 0, proc.stderr
@@ -1031,10 +1036,10 @@ def test_manifest_display_metadata_stdlib() -> None:
         assert f"  - label: {label}\n" in text
 
 
-RESONANT_REPO = Path(os.environ.get("RESONANT_REPO", "/Users/justinhe/resonant"))
+from conftest import RESONANT_REPO
 
 
-def test_manifest_validates_against_the_resonant_sdk() -> None:
+def test_manifest_validates_against_the_resonant_sdk(tmp_path: Path) -> None:
     """The real parser (resonant_sdk.manifest.load_manifest) from a Resonant checkout's existing
     venv (--no-sync: nothing is installed; ~/.resonant is never read). Skipped off the Mini."""
     uv = shutil.which("uv")
@@ -1050,7 +1055,7 @@ def test_manifest_validates_against_the_resonant_sdk() -> None:
     )
     proc = subprocess.run(  # noqa: S603
         [uv, "run", "--frozen", "--no-sync", "--project", str(RESONANT_REPO), "python", "-c", code,
-         str(EXT_DIR / "resonant.yaml")],
+         str(sdk_manifest(tmp_path))],  # without `recover:` until the checkout has PER-284
         capture_output=True, text=True, timeout=120, check=False,
     )  # fmt: skip
     if proc.returncode != 0 and "No module named" in proc.stderr:

@@ -13,7 +13,7 @@ from typing import Any
 
 import cli
 import pytest
-from conftest import EXT_DIR, PaperDB, et, write_token_status
+from conftest import EXT_DIR, PaperDB, et, sdk_manifest, write_token_status
 from test_trade_jev_ext import JEV, RESONANT_REPO, run_isolated, seed_day
 
 MON, TUE = "2026-11-02", "2026-11-03"
@@ -278,7 +278,7 @@ def resonant_validate(
         files.append(str(f))
     proc = subprocess.run(  # noqa: S603
         [uv, "run", "--frozen", "--no-sync", "--project", str(RESONANT_REPO), "python", "-c",
-         VALIDATE, str(EXT_DIR / "resonant.yaml"), str(schema), panel_id, *files],
+         VALIDATE, str(sdk_manifest(tmp_path)), str(schema), panel_id, *files],
         capture_output=True, text=True, timeout=120, check=False,
     )  # fmt: skip
     if proc.returncode != 0 and "No module named" in proc.stderr:

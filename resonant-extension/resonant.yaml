@@ -114,4 +114,8 @@ panels:
 
 # watch's "trade-jev/down" and "trade-jev/token" text at once; close-summary's daily P&L rides the hourly pulse.
 report: {max_urgency: urgent}
+# health exits non-zero while today's session (trading days, 09:31-15:50 ET) is crashed, stale,
+# missing or stalled (running, but no decision for 2 min); Resonant then runs recover, which
+# SIGTERMs and kickstarts com.tradejev.paper (paper only, never orders) or says "nothing to do".
 health: {check: ./cli.py health, every: 5m}
+recover: {run: ./cli.py recover, timeout: 120s}

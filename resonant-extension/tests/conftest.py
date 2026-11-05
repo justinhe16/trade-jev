@@ -5,6 +5,7 @@ launchctl is never actually run."""
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -21,6 +22,24 @@ sys.path.insert(0, str(EXT_DIR))
 import cli  # noqa: E402
 
 ET = ZoneInfo("America/New_York")
+RESONANT_REPO = Path(os.environ.get("RESONANT_REPO", "/Users/justinhe/resonant"))
+
+
+def sdk_manifest(tmp_path: Path) -> Path:
+    """resonant.yaml as the Resonant checkout's SDK parser can read it. A checkout from before the
+    `recover:` hook (PER-284) rejects that key as unknown, so a copy without that one line is
+    returned; everything else is still validated. Once the SDK knows `recover`, the real file."""
+    src = EXT_DIR / "resonant.yaml"
+    sdk = RESONANT_REPO / "packages" / "resonant-sdk" / "src" / "resonant_sdk" / "manifest.py"
+    try:
+        if "recover" in sdk.read_text():
+            return src
+    except OSError:
+        return src  # no checkout: the callers skip
+    lines = src.read_text().splitlines(keepends=True)
+    out = tmp_path / "resonant.sdk.yaml"
+    out.write_text("".join(ln for ln in lines if not ln.startswith("recover:")))
+    return out
 
 SCHEMA = """
 CREATE TABLE paper_sessions(session_id TEXT PRIMARY KEY, day TEXT, symbol TEXT, status TEXT,

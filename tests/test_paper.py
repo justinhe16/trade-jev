@@ -441,3 +441,8 @@ def test_backfill_cli(db, tmp_path, monkeypatch, capsys):
     assert f"live-{DAY}: 7 bars" in capsys.readouterr().out
     with pytest.raises(SystemExit):
         paperdb.main(["bars", "--day", "2020-01-01"])
+
+
+def test_paperdb_tick_matches_the_data_tick():
+    from trade_jev import data
+    assert paperdb.TICK == data.TICK

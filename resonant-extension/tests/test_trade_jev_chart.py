@@ -301,3 +301,24 @@ def test_resonant_accepts_every_chart_output(tmp_path: Path, data_dir: Path) -> 
         assert "refused" not in r, (name, r)
         assert r["truncated"] is False and r["bytes"] <= MAX_BYTES, (name, r)
     assert res["runs"]["large"]["bytes"] <= MAX_BYTES - 4096, res["runs"]["large"]
+
+
+def test_a_crashed_last_session_does_not_keep_health_red(db: PaperDB) -> None:
+    sid = "live-2026-11-06"
+    db.session(sid, "2026-11-06", "crashed", started="09:15", error="BentoError: feed dropped")
+    db.bars(sid, "2026-11-06", "09:30", 20)
+    out = chart(et(SAT, "12:00"))
+    assert "health" not in out
+    assert widgets(out)["crash"]["text"] == "Session crashed: BentoError: feed dropped"
+
+
+def test_the_panel_leaves_the_db_unchanged(db: PaperDB) -> None:
+    import hashlib
+
+    seed_full_day(db)
+    db.conn.close()
+    before = hashlib.sha256(db.path.read_bytes()).hexdigest()
+    names = sorted(p.name for p in db.path.parent.iterdir())
+    chart(et(TUE, "16:30"))
+    assert hashlib.sha256(db.path.read_bytes()).hexdigest() == before
+    assert sorted(p.name for p in db.path.parent.iterdir()) == names

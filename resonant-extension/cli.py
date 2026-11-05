@@ -1541,8 +1541,9 @@ def chart_mids(conn: sqlite3.Connection, day: str, ids: list[str]) -> dict[int, 
 
 
 def chart_trades(conn: sqlite3.Connection, ids: list[str], running: str | None) -> list[dict[str, Any]]:
-    """Jev's trades on the chart: every closed one (newest ``CHART_TRADES``, the open one included)
-    and, while ``running`` (that session's id), its open position from ``paper_open``."""
+    """Jev's trades on the chart: the closed ones and, while ``running`` (that session's id), the
+    open position from ``paper_open`` as an open trade (last, so it survives the cap). At most the
+    newest ``CHART_TRADES``."""
     out = [
         pw.trade(r["side"], r["entry_ns"] // 10**9, r["entry_px"], r["exit_ns"] // 10**9, r["exit_px"],
                  pnl=num(r["pnl"]), currency="USD", label="jev", why=WHY.get(r["reason"], r["reason"]))
@@ -1597,7 +1598,8 @@ def chart_view(conn: sqlite3.Connection | None, now: datetime) -> tuple[list[dic
     if last["status"] == "crashed":
         widgets.append(pw.text(f"Session crashed: {short_error(last['error'], 160) or 'no error recorded'}",
                                id="crash", title="Crashed"))  # fmt: skip
-    return widgets, "bad" if health in ("crashed", "stale") else None, running
+    # health is about today: an older session's crash still shows its text, but doesn't stay red
+    return widgets, "bad" if day == today and health in ("crashed", "stale") else None, running
 
 
 def cmd_chart(cfg: Config, now: datetime) -> dict[str, Any]:

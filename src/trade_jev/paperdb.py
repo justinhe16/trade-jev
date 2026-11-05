@@ -35,7 +35,7 @@ from pathlib import Path
 import numpy as np
 
 from trade_jev import ROOT
-from trade_jev.data import TICK
+TICK = 0.25  # as trade_jev.data.TICK (not imported: that pulls pyarrow into every reader)
 
 STALE_S = 180  # a running session whose heartbeat is older than this is presumed dead
 

@@ -154,6 +154,15 @@ def test_no_session_days_print_none(db: PaperDB, panel: str) -> None:
         assert cli.run(["panel", panel, "--date", day], now=now) == NONE, day
 
 
+def test_a_holiday_row_next_to_a_real_session_is_ignored(db: PaperDB) -> None:
+    seed_day(db, "s1", TUE)
+    db.session("h", TUE, "holiday", started="23:00")  # started after the real one: would be "last"
+    out = paper(TUE, et(WED, "12:00"))
+    w = widgets(out, "today")
+    assert w["Session"]["value"] == "done" and w["day-sessions"]["title"] == "Sessions (1)"
+    assert out["updated_at"] == "2026-11-03T14:25:00+00:00"
+
+
 @pytest.mark.parametrize("panel", ["paper", "chart"])
 def test_no_db_prints_none(db: PaperDB, data_dir: Path, panel: str) -> None:
     (data_dir / "config.json").write_text(json.dumps({"db_path": str(data_dir / "nope.db")}))

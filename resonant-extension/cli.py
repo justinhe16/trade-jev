@@ -1905,12 +1905,11 @@ def panel_connect(cfg: Config) -> sqlite3.Connection | None:
 
 
 def ran_on(conn: sqlite3.Connection | None, day: str, now: datetime) -> list[sqlite3.Row]:
-    """The day's session rows, or [] when no session ran: no DB, a future day, no row, or only
-    the runner's ``holiday`` rows. A ``skipped`` day did run (it says why it didn't trade)."""
+    """The day's session rows without the runner's ``holiday`` rows; [] when no session ran (no DB,
+    a future day, no row, or only holiday rows). A ``skipped`` day did run (it says why)."""
     if conn is None or day > now.astimezone(ET).date().isoformat():
         return []
-    rows = sessions_on(conn, [day])
-    return rows if any(r["status"] != "holiday" for r in rows) else []
+    return [r for r in sessions_on(conn, [day]) if r["status"] != "holiday"]
 
 
 def data_time(sessions: list[sqlite3.Row], now: datetime) -> datetime:

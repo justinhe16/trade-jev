@@ -1575,6 +1575,37 @@ def panel_health(st: dict[str, Any], items: list[dict[str, Any]], expected: bool
     return "ok"
 
 
+def pnl_widgets(
+    conn: sqlite3.Connection | None, day: str | None, policies: list[str], when: str | None
+) -> list[dict[str, Any]]:
+    """The day's cumulative P&L per charted policy and its latest closed trades (all policies).
+    ``when`` names the day in titles: "today", or a label like "Tue 11/3"."""
+    widgets: list[dict[str, Any]] = []
+    trades: list[sqlite3.Row] = []
+    if conn is not None and day:
+        ids = [s["session_id"] for s in sessions_on(conn, [day]) if s["status"] not in NO_TRADE]
+        trades = closed_trades(conn, ids)
+    if trades and policies:
+        xs, ys = cumulative(trades, policies, day)
+        widgets.append(pw.series("line", xs, ys, format="money", id="cum-pnl",
+                                 title=f"Cumulative P&L, {when}"))  # fmt: skip
+    else:
+        widgets.append(pw.text(f"No closed trades {'yet ' if when == 'today' else ''}"
+                               f"{'today' if when in (None, 'today') else 'on ' + when}.",
+                               id="cum-pnl", title="Cumulative P&L"))  # fmt: skip
+    recent = trades[-PANEL_TRADES:][::-1]
+    if recent:
+        widgets.append(pw.table(
+            [pw.column("t", "Time ET"), pw.column("policy", "Policy"), pw.column("side", "Side"),
+             pw.column("pts", "Pts", "number"), pw.column("pnl", "$", "money"),
+             pw.column("why", "Why")],
+            [{"t": (ns_to_et(r["exit_ns"]) or "")[:5], "policy": r["policy"], "side": r["side"],
+              "pts": num(r["points"]), "pnl": num(r["pnl"]), "why": r["reason"]} for r in recent],
+            id="trades", title=f"Recent trades, {when} ({len(trades)} closed)",
+        ))  # fmt: skip
+    return widgets
+
+
 def today_view(
     cfg: Config, now: datetime, st: dict[str, Any], conn: sqlite3.Connection | None
 ) -> tuple[dict[str, Any], str]:
@@ -1599,29 +1630,8 @@ def today_view(
         session_stat(st, cfg, raw_error),
         token_stat(st["token"]),
     ]
-    trades: list[sqlite3.Row] = []
-    if conn is not None and day:
-        ids = [s["session_id"] for s in sessions_on(conn, [day]) if s["status"] not in NO_TRADE]
-        trades = closed_trades(conn, ids)
     policies = chart_policies(p["policy"] for p in pnl.get("policies", []))
-    if trades and policies:
-        xs, ys = cumulative(trades, policies, day)
-        widgets.append(pw.series("line", xs, ys, format="money", id="cum-pnl",
-                                 title=f"Cumulative P&L, {when}"))  # fmt: skip
-    else:
-        widgets.append(pw.text(f"No closed trades {'yet ' if when == 'today' else ''}"
-                               f"{'today' if when in (None, 'today') else 'on ' + when}.",
-                               id="cum-pnl", title="Cumulative P&L"))  # fmt: skip
-    recent = trades[-PANEL_TRADES:][::-1]
-    if recent:
-        widgets.append(pw.table(
-            [pw.column("t", "Time ET"), pw.column("policy", "Policy"), pw.column("side", "Side"),
-             pw.column("pts", "Pts", "number"), pw.column("pnl", "$", "money"),
-             pw.column("why", "Why")],
-            [{"t": (ns_to_et(r["exit_ns"]) or "")[:5], "policy": r["policy"], "side": r["side"],
-              "pts": num(r["points"]), "pnl": num(r["pnl"]), "why": r["reason"]} for r in recent],
-            id="trades", title=f"Recent trades, {when} ({len(trades)} closed)",
-        ))  # fmt: skip
+    widgets += pnl_widgets(conn, day, policies, when)
     expected = _expect_paper_running(cfg, now, st.get("session"))
     items = []
     for label in (cfg.label, *ALWAYS_ON):
@@ -1632,13 +1642,14 @@ def today_view(
     return pw.view("today", "Today", widgets), panel_health(st, items, expected)
 
 
-def history_view(conn: sqlite3.Connection | None, now: datetime) -> dict[str, Any]:
-    """Daily P&L per policy over the last 30 trading days, and the latest sessions."""
+def history_view(conn: sqlite3.Connection | None, now: datetime, until: str = "9999-12-31") -> dict[str, Any]:
+    """Daily P&L per policy over the last 30 trading days, and the latest sessions; both end at
+    ``until`` (an archived day's view: nothing after that day)."""
     if conn is None:
         return pw.view("history", "History", [pw.text(NO_SESSIONS + ".", id="none")])
     days = sorted(r["day"] for r in conn.execute(
         "SELECT DISTINCT day FROM paper_sessions WHERE status NOT IN ('holiday', 'skipped') "
-        "ORDER BY day DESC LIMIT ?", (PANEL_DAYS,)))  # fmt: skip
+        "AND day<=? ORDER BY day DESC LIMIT ?", (until, PANEL_DAYS)))  # fmt: skip
     stats: dict[str, dict[str, dict[str, Any]]] = {}
     per_day: dict[str, dict[str, float]] = {d: {} for d in days}
     for s in sessions_on(conn, days) if days else []:
@@ -1658,8 +1669,8 @@ def history_view(conn: sqlite3.Connection | None, now: datetime) -> dict[str, An
         ))  # fmt: skip
     rows = []
     for s in conn.execute(
-        "SELECT * FROM paper_sessions ORDER BY day DESC, started_at DESC, rowid DESC LIMIT ?",
-        (PANEL_SESSIONS,),
+        "SELECT * FROM paper_sessions WHERE day<=? ORDER BY day DESC, started_at DESC, rowid DESC LIMIT ?",
+        (until, PANEL_SESSIONS),
     ):
         sid = s["session_id"]
         if sid not in stats and s["status"] not in NO_TRADE:
@@ -1686,10 +1697,14 @@ def history_view(conn: sqlite3.Connection | None, now: datetime) -> dict[str, An
     return pw.view("history", "History", widgets or [pw.text(NO_SESSIONS + ".", id="none")])
 
 
-def cmd_panel(cfg: Config, now: datetime) -> dict[str, Any]:
-    """The ``paper`` dashboard panel: views Today and History (see README)."""
+def cmd_panel(cfg: Config, now: datetime, date_arg: str | None = None) -> dict[str, Any]:
+    """The ``paper`` dashboard panel: views Today and History (see README). With ``date_arg``
+    (``--date YYYY-MM-DD``, a past ET day) that day's archived view instead (``day_panel``)."""
+    day = archive_day(date_arg, now)
+    if day is not None:
+        return day_panel(cfg, now, day)
     st = cmd_status(cfg, now)
-    conn = connect(cfg)
+    conn = panel_connect(cfg)
     try:
         today, health = today_view(cfg, now, st, conn)
         history = history_view(conn, now)
@@ -1790,6 +1805,17 @@ def chart_view(conn: sqlite3.Connection | None, now: datetime) -> tuple[list[dic
     health = health_of(last, now)[0]
     running = health == "running"
     when = "today" if day == today else f"{day_label(day)} (last session)"
+    widgets = chart_widgets(conn, last, ids, bars, mids, when, running)
+    # health is about today: an older session's crash still shows its text, but doesn't stay red
+    return widgets, "bad" if day == today and health in ("crashed", "stale") else None, running
+
+
+def chart_widgets(
+    conn: sqlite3.Connection, last: sqlite3.Row, ids: list[str], bars: dict[int, list[float]],
+    mids: dict[int, float], when: str, running: bool, past: bool = False,
+) -> list[dict[str, Any]]:  # fmt: skip
+    """One day's chart: candles (or the decision-mid line) with Jev's trades; with no market data,
+    Jev's trades as a table; the crash line when ``last`` (the day's last session) crashed."""
     symbol = last["symbol"] or "NQ"
     trades = chart_trades(conn, ids, last["session_id"] if running else None)
     widgets: list[dict[str, Any]] = []
@@ -1802,17 +1828,38 @@ def chart_view(conn: sqlite3.Connection | None, now: datetime) -> tuple[list[dic
         widgets.append(pw.price(xs, line=[mids[t] for t in xs], trades=trades, format="number", id="price",
                                 title=f"{symbol} mid (15 s samples; no 1-min bars), {when}"))  # fmt: skip
     else:
-        widgets.append(pw.text(f"No market data recorded for {when} yet.", id="none"))
+        widgets.append(pw.text(f"No market data recorded for {when}{'' if trades or past else ' yet'}."
+                               + (" Jev's trades:" if trades else ""), id="none"))  # fmt: skip
+        if trades:
+            widgets.append(trades_table(trades))
     if last["status"] == "crashed":
         widgets.append(pw.text(f"Session crashed: {short_error(last['error'], 160) or 'no error recorded'}",
                                id="crash", title="Crashed"))  # fmt: skip
-    # health is about today: an older session's crash still shows its text, but doesn't stay red
-    return widgets, "bad" if day == today and health in ("crashed", "stale") else None, running
+    return widgets
 
 
-def cmd_chart(cfg: Config, now: datetime) -> dict[str, Any]:
-    """The ``chart`` dashboard panel: NQ 1-minute candles with Jev's trades (see README)."""
-    conn = connect(cfg)
+def trades_table(trades: list[dict[str, Any]]) -> dict[str, Any]:
+    """Jev's chart trades as rows, newest first: for a day with trades but no market data."""
+    def hm(t: int | None) -> str | None:
+        return None if t is None else datetime.fromtimestamp(t, ET).strftime("%H:%M")
+
+    return pw.table(
+        [pw.column("in", "In ET"), pw.column("out", "Out ET"), pw.column("side", "Side"),
+         pw.column("entry", "Entry", "number"), pw.column("exit", "Exit", "number"),
+         pw.column("pnl", "$", "money"), pw.column("why", "Why")],
+        [{"in": hm(t["entry_t"]), "out": hm(t.get("exit_t")), "side": t["side"], "entry": num(t["entry_px"]),
+          "exit": num(t.get("exit_px")), "pnl": t.get("pnl"), "why": t.get("why")} for t in trades[::-1]],
+        id="trades", title=f"Jev trades ({len(trades)})",
+    )  # fmt: skip
+
+
+def cmd_chart(cfg: Config, now: datetime, date_arg: str | None = None) -> dict[str, Any]:
+    """The ``chart`` dashboard panel: NQ 1-minute candles with Jev's trades (see README). With
+    ``date_arg`` (``--date YYYY-MM-DD``, a past ET day) that day's chart (``chart_day_panel``)."""
+    day = archive_day(date_arg, now)
+    if day is not None:
+        return chart_day_panel(cfg, now, day)
+    conn = panel_connect(cfg)
     try:
         widgets, health, running = chart_view(conn, now)
     finally:
@@ -1820,6 +1867,201 @@ def cmd_chart(cfg: Config, now: datetime) -> dict[str, Any]:
             conn.close()
     return pw.panel([pw.view("chart", "Jev trades", widgets)], updated_at=now, health=health,
                     local_url=PANEL_LIVE_URL if running else PANEL_LOCAL_URL)  # fmt: skip
+
+
+# --- daily history: `panel paper|chart --date YYYY-MM-DD` (PER-287) ------------------------------
+#
+# Resonant archives each panel once per ended day (manifest `history: daily`) by running its command
+# with `--date D`. A day no session ran (weekend, holiday, before the first session) prints NONE, so
+# it is recorded as such and left out of the day picker. Live-only parts (token, launchd, agents)
+# are left out: they describe now, not D.
+
+NONE = {"schema": pw.SCHEMA, "none": True}
+CANT_READ = "paper.db won't open read-only (WAL side files missing?); try again later"
+
+
+def archive_day(arg: str | None, now: datetime) -> str | None:
+    """``--date`` as the ET day to archive: None renders the live panel (no ``--date``, or today's
+    date: today renders as now). A future day is returned too; it has no session, so it is NONE."""
+    if arg is None:
+        return None
+    try:
+        d = date.fromisoformat(arg.strip())
+    except ValueError:
+        raise Fail(f"bad --date {clip(arg, 40)!r}: use YYYY-MM-DD") from None
+    return None if d == now.astimezone(ET).date() else d.isoformat()
+
+
+def panel_connect(cfg: Config) -> sqlite3.Connection | None:
+    """``connect`` for the panels: a WAL DB that won't open read-only (its -wal/-shm side files
+    missing, as ``health`` tolerates) is a clean one-line failure, so an archive run is retried
+    later instead of recording the day from the main file alone (the WAL may still hold it)."""
+    try:
+        return connect(cfg)
+    except sqlite3.Error as e:
+        if _cant_open(e):
+            raise Fail(CANT_READ) from None
+        raise
+
+
+def ran_on(conn: sqlite3.Connection | None, day: str, now: datetime) -> list[sqlite3.Row]:
+    """The day's session rows without the runner's ``holiday`` rows; [] when no session ran (no DB,
+    a future day, no row, or only holiday rows). A ``skipped`` day did run (it says why)."""
+    if conn is None or day > now.astimezone(ET).date().isoformat():
+        return []
+    return [r for r in sessions_on(conn, [day]) if r["status"] != "holiday"]
+
+
+def data_time(sessions: list[sqlite3.Row], now: datetime) -> datetime:
+    """An archived day's ``updated_at``: when its last session ended (or last beat), never after now."""
+    last = sessions[-1]
+    t = parse_ts(last["ended_at"]) or parse_ts(last["heartbeat_at"]) or parse_ts(last["started_at"])
+    return min(t, now) if t else now
+
+
+def day_calls(conn: sqlite3.Connection, sessions: list[sqlite3.Row], policy: str | None) -> dict[str, Any] | None:
+    """``jev_live`` over all of a day's sessions (a restart day has two), for ``call_stats``."""
+    ids = [s["session_id"] for s in sessions]
+    if not ids or policy is None or not has_table(conn, "paper_decisions"):
+        return None
+    marks = ",".join("?" * len(ids))
+    where = f"session_id IN ({marks}) AND policy=?"  # noqa: S608 - placeholders only
+    agg = conn.execute(
+        f"SELECT COUNT(*) n, SUM(error IS NULL AND jev_ms >= ?) calls, SUM(error IS NOT NULL) errors, "  # noqa: S608
+        f"MAX(t_ns) last_t FROM paper_decisions WHERE {where}", (CALL_MS, *ids, policy)).fetchone()  # fmt: skip
+    ms = [r[0] for r in conn.execute(
+        f"SELECT jev_ms FROM paper_decisions WHERE {where} AND error IS NULL AND jev_ms >= ? "  # noqa: S608
+        f"ORDER BY jev_ms", (*ids, policy, CALL_MS))]  # fmt: skip
+    recent = conn.execute(
+        f"SELECT raw_action, jev_ms, error FROM paper_decisions WHERE {where} "  # noqa: S608
+        f"ORDER BY t_ns DESC LIMIT ?", (*ids, policy, RECENT_DECISIONS)).fetchall()  # fmt: skip
+    last_err = conn.execute(
+        f"SELECT time_et, error FROM paper_decisions WHERE {where} AND error IS NOT NULL "  # noqa: S608
+        f"ORDER BY t_ns DESC LIMIT 1", (*ids, policy)).fetchone()  # fmt: skip
+    return {
+        "decisions": int(agg["n"] or 0),
+        "model_calls": int(agg["calls"] or 0),
+        "errors": int(agg["errors"] or 0),
+        "calls_mode": calls_mode(sessions[-1]["jev_model"], recent),
+        "last_error": None if last_err is None else f"{last_err['time_et']} {clip(last_err['error'], 100)}",
+        "avg_ms": round(sum(ms) / len(ms)) if ms else None,
+        "p95_ms": round(ms[-(-95 * len(ms) // 100) - 1]) if ms else None,
+        "last_decision_et": ns_to_et(agg["last_t"]),
+    }
+
+
+def day_sessions_table(
+    conn: sqlite3.Connection, sessions: list[sqlite3.Row], now: datetime
+) -> dict[str, Any]:
+    """Every session of the day (a restart or crash is its own row): times, status, Jev, error."""
+    rows = []
+    for s in sessions:
+        st = {} if s["status"] in NO_TRADE else policy_stats(conn, [s["session_id"]])
+        j = st.get(pick_jev(list(st)) or "", {})
+        health, _ = health_of(s, now)
+        start, end = parse_ts(s["started_at"]), parse_ts(s["ended_at"])
+        rows.append({
+            "start": start.astimezone(ET).strftime("%H:%M") if start else None,
+            "end": end.astimezone(ET).strftime("%H:%M") if end else None,
+            "status": pw.pill(health, SESSION_TONE.get(health, "neutral")),
+            "jev": j.get("pnl"),
+            "trades": j.get("trades"),
+            "calls": j.get("jev_calls"),
+            "error": short_error(s["error"], 100),
+        })  # fmt: skip
+    n = len(sessions)
+    return pw.table(
+        [pw.column("start", "Start ET"), pw.column("end", "End ET"), pw.column("status", "Status", "pill"),
+         pw.column("jev", "Jev $", "money"), pw.column("trades", "Trades", "number"),
+         pw.column("calls", "Calls", "number"), pw.column("error", "Error")],
+        rows, id="day-sessions", title=f"Sessions ({n}{', 1 restart' if n == 2 else f', {n - 1} restarts' if n > 2 else ''})",
+    )  # fmt: skip
+
+
+def day_view(conn: sqlite3.Connection, sessions: list[sqlite3.Row], day: str, now: datetime) -> tuple[dict[str, Any], str]:
+    """A past day's tiles (Jev P&L, trades, model calls, session), Jev vs the baselines, the
+    cumulative curve, recent trades, the day's sessions and the crash line. Returns (view, health)."""
+    label = day_label(day)
+    trading = [s for s in sessions if s["status"] not in NO_TRADE]
+    ids = [s["session_id"] for s in trading]
+    stats = policy_stats(conn, ids)
+    jp = pick_jev(list(stats)) or pick_jev([p for i in ids for p in _decision_policies(conn, i)])
+    jev = stats.get(jp or "")
+    last = sessions[-1]
+    health, _ = health_of(last, now)
+    if health in ("crashed", "skipped", "stale"):
+        hint = short_error(last["error"], 78) or label
+    else:
+        hint = f"{label}, {len(sessions)} sessions" if len(sessions) > 1 else label
+    widgets = [
+        pw.stat("Jev P&L", jev["pnl"] if jev else None, format="money",
+                health=None if not jev else "ok" if (jev["pnl"] or 0) >= 0 else "bad", hint=label),
+        pw.stat("Jev trades / wins", f"{jev['trades']} / {jev['wins']}" if jev else "0 / 0", hint=label),
+        *call_stats({"jev_live": day_calls(conn, trading, jp)}, jev),
+        pw.stat("Session", health, health=SESSION_TONE.get(health), hint=hint),
+    ]  # fmt: skip
+    if stats:
+        order = sorted(stats, key=lambda p: (not is_jev(p), p))
+        widgets.append(pw.table(
+            [pw.column("policy", "Policy"), pw.column("pnl", "$", "money"),
+             pw.column("trades", "Trades", "number"), pw.column("wins", "Wins", "number"),
+             pw.column("dd", "Max DD", "money")],
+            [{"policy": p, "pnl": stats[p]["pnl"], "trades": stats[p]["trades"], "wins": stats[p]["wins"],
+              "dd": stats[p].get("max_drawdown")} for p in order],
+            id="policies", title=f"Jev vs baselines, {label}",
+        ))  # fmt: skip
+    widgets += pnl_widgets(conn, day, chart_policies(stats), label)
+    widgets.append(day_sessions_table(conn, sessions, now))
+    crashed = [s for s in sessions if health_of(s, now)[0] in ("crashed", "stale")]
+    if crashed:
+        widgets.append(pw.text("; ".join(
+            f"{health_of(s, now)[0].capitalize()}: {short_error(s['error'], 160) or 'no error recorded'}"
+            for s in crashed), id="crash", title="Crashed"))  # fmt: skip
+    tone = "bad" if health in ("crashed", "stale") else "warn" if crashed else "ok"
+    return pw.view("today", label, widgets), tone
+
+
+def day_panel(cfg: Config, now: datetime, day: str) -> dict[str, Any]:
+    """``panel paper --date D``: D's view (titled like "Tue 11/3") and the History tab ending at
+    D; NONE when no session ran on D."""
+    conn = panel_connect(cfg)
+    try:
+        sessions = ran_on(conn, day, now)
+        if conn is None or not sessions:
+            return NONE
+        view, health = day_view(conn, sessions, day, now)
+        history = history_view(conn, now, until=day)
+    finally:
+        if conn is not None:
+            conn.close()
+    return pw.panel([view, history], updated_at=data_time(sessions, now), health=health,
+                    local_url=PANEL_LOCAL_URL)  # fmt: skip
+
+
+def chart_day_panel(cfg: Config, now: datetime, day: str) -> dict[str, Any]:
+    """``panel chart --date D``: D's 1-minute candles (or decision mids) with Jev's trades, or the
+    trades as a table when D has no market data; NONE when no session ran on D."""
+    conn = panel_connect(cfg)
+    try:
+        sessions = ran_on(conn, day, now)
+        if conn is None or not sessions:
+            return NONE
+        trading = [s for s in sessions if s["status"] not in NO_TRADE]
+        last = sessions[-1]
+        if trading:
+            ids = [s["session_id"] for s in trading]
+            bars = chart_bars(conn, day, ids)
+            mids = {} if bars else chart_mids(conn, day, ids)
+            widgets = chart_widgets(conn, trading[-1], ids, bars, mids, day_label(day), False, past=True)
+        else:  # only `skipped` rows: the runner ran and chose not to trade
+            widgets = [pw.text(f"Session skipped on {day_label(day)}: "
+                               f"{short_error(last['error'], 160) or 'no reason recorded'}", id="none")]  # fmt: skip
+        health = "bad" if health_of(last, now)[0] in ("crashed", "stale") else None
+    finally:
+        if conn is not None:
+            conn.close()
+    return pw.panel([pw.view("chart", f"Jev trades, {day_label(day)}", widgets)],
+                    updated_at=data_time(sessions, now), health=health, local_url=PANEL_LOCAL_URL)  # fmt: skip
 
 
 # --- main -------------------------------------------------------------------------------------
@@ -1841,6 +2083,7 @@ def build_parser() -> argparse.ArgumentParser:
     dec.add_argument("--limit", type=int, default=0)
     pan = sub.add_parser("panel")
     pan.add_argument("name", choices=["paper", "chart"])
+    pan.add_argument("--date", default=None)  # PER-287: a past ET day's archived view
     return p
 
 
@@ -1848,7 +2091,7 @@ def run(argv: list[str], now: datetime | None = None) -> dict[str, Any]:
     args = build_parser().parse_args(argv)
     cfg = load_config()
     if args.cmd == "panel":
-        return (cmd_chart if args.name == "chart" else cmd_panel)(cfg, now or now_utc())
+        return (cmd_chart if args.name == "chart" else cmd_panel)(cfg, now or now_utc(), args.date)
     if args.cmd == "pnl":
         return cmd_pnl(cfg, now or now_utc(), args.date)
     if args.cmd == "trades":

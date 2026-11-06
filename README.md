@@ -91,7 +91,7 @@ A session writes `runs/live-<day>/`, the same layout as a run plus `manual_fills
 
 ### Executor (automation)
 
-`trade_jev.executor` places the live runner's signals at a broker, inside hard limits (1 contract, daily loss halt, entry cap, heartbeat and read-back checks; see the Docs tab). It starts disarmed; arm it on the Live page. `--broker fake` is built in for rehearsals and tests. Real broker backends are kept out of this repo: `--broker NAME` loads `private/NAME.py` (gitignored), which implements the interface in `src/trade_jev/executor/broker.py`. Add `--dry-run` to highlight without placing orders. Web-based backends need the `browser` extra (`uv sync --extra browser`).
+`trade_jev.executor` places the live runner's signals at a broker (this is the single-broker, one-contract automation; the multi-account mirror of the paper position is `trade_jev.copytrade`, see "Copy trading". Both receive the same intents; `intent` and `heartbeat` messages now also carry a per-process `boot` id, and heartbeats the paper `bid` and `ask`), inside hard limits (1 contract, daily loss halt, entry cap, heartbeat and read-back checks; see the Docs tab). It starts disarmed; arm it on the Live page. `--broker fake` is built in for rehearsals and tests. Real broker backends are kept out of this repo: `--broker NAME` loads `private/NAME.py` (gitignored), which implements the interface in `src/trade_jev/executor/broker.py`. Add `--dry-run` to highlight without placing orders. Web-based backends need the `browser` extra (`uv sync --extra browser`).
 
 ```bash
 uv run python -m trade_jev.executor --broker fake --allow-replay
@@ -100,7 +100,7 @@ uv run python -m trade_jev.live --from-file 2026-06-23 --speed 60 --stored-answe
 
 ## 7) Live paper trading
 
-Every weekday the Mini runs one live session with no orders: Jev with the registered filters (`settings.DEFAULT`: cutoff 0.7, 4 agreeing, 30s min hold, 200-tick stop / 100-tick target) next to the hold / random / imbalance baselines, on a live NQ L2 feed (Databento by default, or Tradovate: see "Tradovate source" below). Each session is recorded in a local SQLite file, and the viewer's **Paper** tab shows it.
+Every weekday the Mini runs one live session that never places an order (copy trading, below, is a separate daemon that mirrors its positions): Jev with the registered filters (`settings.DEFAULT`: cutoff 0.7, 4 agreeing, 30s min hold, 200-tick stop / 100-tick target) next to the hold / random / imbalance baselines, on a live NQ L2 feed (Databento by default, or Tradovate: see "Tradovate source" below). Each session is recorded in a local SQLite file, and the viewer's **Paper** tab shows it.
 
 **Keys** in `.env` (never committed; `.env.example` lists every name): `TYPESAFE_API_KEY` (Jev) and, for the feed, `DATABENTO_API_KEY` or the `TRADOVATE_*` set. `TRADE_JEV_SOURCE` = `databento` (default) | `tradovate` | `off` picks the feed.
 
@@ -113,6 +113,7 @@ scripts/install_launchd.sh      # copies deploy/launchd/*.plist to ~/Library/Lau
 
 - `com.tradejev.paper` runs `scripts/run_paper_day.sh` on weekdays at 06:15 local time (09:15 ET on a Pacific-time Mac). The script works out ET itself: it waits until 09:15 ET if started early and does nothing after 15:55 ET. It then runs `python -m trade_jev.live --exit-at-close --no-open --port 8767`, which exits 0 once the session's outputs are written. Weekends and CME full-closure holidays (`src/trade_jev/tradingdays.py`, 2026–2027; add the next year before it starts) exit 0 and record a `holiday` row. On the shortened holiday sessions (13:00 ET halt) the session closes when the feed goes quiet.
 - `com.tradejev.view` keeps the viewer up on `http://127.0.0.1:8765`.
+- `com.tradejev.copy` (only when `accounts.yaml` exists; see "Copy trading") is the copy-trading daemon. Without `accounts.yaml` nothing about copy trading is installed or started and the paper session is unchanged.
 - Logs: `logs/paper-<day>.log` (one per ET day), `logs/view.log`. While a session runs, its own Live page is at `http://localhost:8767/live`.
 - The Mac must stay awake through the session (System Settings → Energy: prevent automatic sleeping). The script holds `caffeinate -i` while it runs.
 
@@ -132,6 +133,37 @@ uv run python -m trade_jev.live --exit-at-close --no-open             # one sess
 uv run python -m trade_jev.live --from-file 2026-06-23 --speed 0 --paper-db --exit-at-close   # rehearsal into the DB
 sqlite3 data/paper.db "select day, status, heartbeat_at from paper_sessions order by day desc limit 5"
 ```
+
+### Copy trading
+
+Paper trading stays exactly as it is (the main `TRADOVATE_*` login, 1 NQ, it never places an order) and is the **signal source**. Every account in `accounts.yaml` mirrors Jev's paper position changes at its own contract and size (e.g. 5 MNQ), with the same TP/SL in points. `accounts.yaml` is gitignored; copy `accounts.example.yaml`. **No `accounts.yaml` (or none with `enabled: true`) means no behaviour change at all**: `scripts/run_paper_day.sh` then omits `--exec-url`, and `install_launchd.sh` does not install `com.tradejev.copy`.
+
+```
+paper session (live.py) --intents/heartbeats--> copy daemon (python -m trade_jev.copytrade run, :8768)
+                                                  one worker per account --> Tradovate REST (that account's own token)
+                                                  data/copy.db  --> Resonant panel "Copy accounts", job copy-watch, tool trade_jev_copy_flatten_all
+```
+
+**Accounts.** Per account: `mode` is `dry_run` (default: records "would enter" rows, sends nothing), `demo` or `live`; `mode live` requires `env: live`, `mode demo` requires `env: demo` (`dry_run` takes either). `root` is `MNQ` or `NQ` (the paper symbol `NQZ6` becomes `MNQZ6`; anything not `NQ` + `H|M|U|Z` + a digit is refused). Credentials come from `<secrets_prefix>_*` in `.env` (names in `.env.example`); the prefix must not be `TRADOVATE`. The entry is a marketable IOC limit at the NQ touch plus/minus `slip_ticks` (default 4 ticks = 1 point, $10 on 5 MNQ, because the NQ quote prices an MNQ order), with TP and SL attached in the same `placeoso` request and then moved to the real fill (`modifyorder`); a miss is recorded and never chased.
+
+**What it does.** Entries need: account enabled, startup clean, Resonant not paused or `autonomy: off`, a fresh `LIVE` paper heartbeat, a valid token, no halt. Exits are never gated: paper exiting, a reversal, the kill switch, a lost heartbeat and the 15:56 ET end-of-day guard all flatten (liquidate, cancel every live order, read back). If the account stops out first it stays flat until paper's next signal. Per account, per ET day: `daily_loss_limit` and `daily_profit_stop` (realized + open, from the account's own fill ledger, open marked at paper's bid/ask) flatten and halt the day; so do a failed flatten, a read-back mismatch, a bracket missing after a fill, 3 rejects in a row, the entry cap and the flatten-all tool. A halt lasts until the next ET day or `python -m trade_jev.copytrade clear-halts NAME`. Link, token and kill problems block entries only and clear by themselves. A crash, hang or dead token in one account never touches the others.
+
+**Not supported / read this.**
+- **Manual trading on these accounts is not supported.** The daemon flattens any position it did not open, and halts the account for the day.
+- **A daemon restart while in a position flattens it** (startup rule), and so does a paper restart (a new `boot`). SIGTERM stops the daemon without flattening.
+- The Live page shows the runner as "disarmed" for copy accounts: the daemon arms itself from the heartbeat (mode `live`, status `LIVE`, fresh) and ignores the runner's `armed`.
+- Anything on this machine that can reach `127.0.0.1:8768` as this user can post an intent. The daemon only accepts a loopback `Host` and `Content-Type: application/json` (so a web page cannot), and a fresh `sent_wall_ns` and the matching `boot` raise the bar; they do not stop a deliberate local process.
+- Texts come from the Resonant job `copy-watch` (5 minute minimum, so up to 5 minutes late) and not during a kill or when Resonant is down. Defences that do not need a text: the account's own TP/SL at the broker, and the daemon's flatten.
+
+**Kill switch.** `resonant kill` writes Resonant's database directly and `ProcessTracker.paused` stops the extension's tools, so the daemon watches it itself every 3 s: Resonant's `GET http://127.0.0.1:7777/api/status` (`paused`, `autonomy`), and if that fails `kv.paused` in `~/.resonant/resonant.db` opened read-only. `paused` flattens every account at once; `autonomy: off` blocks entries and holds; both sources unavailable blocks entries, holds and texts once. `trade_jev_copy_flatten_all` (tool, L2) halts every account for the day and flattens, but cannot run while Resonant is killed; the terminal fallback is `uv run python -m trade_jev.copytrade flatten-all --direct` (daemon down, owner only).
+
+**Commands** (`uv run python -m trade_jev.copytrade ...`): `run`, `status`, `preflight NAME` (read-only: `account/list`, `contract/find`), `clear-halts NAME`, `flatten-all [--direct]`, `rehearse NAME` (owner only, needs a terminal, `env: demo` only, places ONE real demo order and prints pass/fail for the API assumptions below). Tokens: each account has its own store in `data/copy/<name>/` (the main `data/tradovate_token*.json` is never touched); renewals are capped at 6 per hour for the whole daemon (Tradovate limits are per IP and shared with the paper login), and the password path (all five `<PREFIX>_USERNAME/_PASSWORD/_CID/_SEC/_DEVICE_ID` set) makes one login attempt per `.env` modification.
+
+**Rollout.** (1) Merge, then in `/Users/justinhe/trade-jev`: `git pull && uv sync` (PyYAML is a new dependency and the paper job runs `uv run --frozen`) before the next 06:15 run. (2) Dry run: `cp accounts.example.yaml accounts.yaml`, first account enabled with `mode: dry_run`, `scripts/install_launchd.sh`, read `logs/copy.log`; the next session's panel shows "would enter" rows matching paper. (3) Demo: a demo account with its own login, `preflight`, then by hand in market hours `rehearse` and resolve every failed line; `mode: demo`, 1 MNQ; `launchctl kickstart -k gui/$(id -u)/com.tradejev.copy`; run several sessions and the drills (`resonant kill`/resume, the flatten-all tool, SIGTERM the daemon in a position, stop paper in a position). (4) Live: the live login, `env: live`, `mode: live`, `qty: 1`, limits, `preflight`, restart, watch the first entry in the Tradovate UI; raise to 5 by editing `qty` and restarting while flat. **Rollback:** `enabled: false` or `mode: dry_run` and restart, or `launchctl bootout gui/$(id -u)/com.tradejev.copy`; removing `accounts.yaml` makes the next paper session omit `--exec-url`.
+
+**Tradovate API assumptions** (what is documented and what is not) are listed in the pull request that added this and checked by `rehearse`: unverified are IOC on the OSO parent, child quantity on a partial fill, child status before the fill, that modifying a child keeps its OCO link, that liquidating cancels the brackets (the sweep covers either), and that the demo REST accepts a token renewed on the live auth host. `clOrdId` server-side de-duplication is never relied on.
+
+**Ledger.** `data/copy.db` (`TRADE_JEV_COPY_DB`; SQLite, WAL, the daemon is the only writer): `copy_status` (one row per account, every 5 s), `copy_signals` (one per paper intent per account, by `(boot, seq)`), `copy_orders` (written before every POST), `copy_fills`, `copy_trades`, `copy_events` (`notify=1` rows are the texts), `copy_halts`. The Resonant extension reads it read-only.
 
 ### Tradovate source
 

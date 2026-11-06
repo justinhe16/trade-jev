@@ -101,7 +101,7 @@ def _num(raw: dict, key: str, where: str, *, positive=True, required=True, defau
     if isinstance(v, bool) or not isinstance(v, (int, float)):
         raise ConfigError(f"{where}: {key} must be a number")
     if positive and v <= 0:
-        raise ConfigError(f"{where}: {key} must be positive")
+        raise ConfigError(f"{where}: {key} must be a positive number (write 1000, not -1000)")
     if not positive and v < 0:
         raise ConfigError(f"{where}: {key} must not be negative")
     return v

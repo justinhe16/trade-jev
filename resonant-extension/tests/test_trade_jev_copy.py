@@ -16,7 +16,7 @@ from typing import Any
 
 import cli
 import pytest
-from conftest import EXT_DIR, RESONANT_REPO, ns
+from conftest import EXT_DIR, ns
 from conftest import et as et_dt
 from test_trade_jev_ext import run_isolated
 from test_trade_jev_panel import resonant_validate
@@ -220,10 +220,8 @@ def test_the_panel_fits_its_byte_budget_with_busy_days(copy_db: CopyDB, tmp_path
 def test_resonant_accepts_every_copy_output(tmp_path: Path, copy_db: CopyDB) -> None:
     seed_live(copy_db)
     copy_db.trade(MON)
-    outs = {"live": panel(NOW), "past": panel(et_dt(FRI, "12:00"), "--date", MON)}
-    schema = RESONANT_REPO / "docs" / "panel.schema.json"
-    if schema.is_file() and "none" in json.loads(schema.read_text()).get("properties", {}):   # PER-286
-        outs["none"] = panel(et_dt(FRI, "12:00"), "--date", WED)
+    outs = {"live": panel(NOW), "past": panel(et_dt(FRI, "12:00"), "--date", MON),
+            "none": panel(et_dt(FRI, "12:00"), "--date", WED)}
     res = resonant_validate(tmp_path, outs, "copy")
     assert res["panel"]["command"] == ["./cli.py", "panel", "copy"] and res["panel"]["max_bytes"] == 24576
     assert res["panel"]["tz"] == "America/New_York" and res["panel"]["active"] == "*/1 9-16 * * 1-5"
@@ -453,7 +451,8 @@ def test_flatten_all_ignores_proxy_environment(data_dir: Path, monkeypatch: pyte
 
 def test_config_defaults_and_validation(data_dir: Path) -> None:
     cfg = cli.load_config()
-    assert str(cfg.copy_db_path) == "/Users/justinhe/trade-jev/data/copy.db" and cfg.copy_port == 8768
+    assert str(cfg.copy_db_path) == "/Users/justinhe/trade-jev/data/copy.db" and cfg.copy_port is None
+    assert cli.copy_port_of(cfg) == 8768
     for bad in ({"copy_port": 0}, {"copy_port": "x"}, {"copy_db_path": ""}, {"copy_accounts_path": 3}):
         (data_dir / "config.json").write_text(json.dumps(bad))
         with pytest.raises(cli.Fail):
@@ -486,3 +485,38 @@ def test_the_extension_stays_stdlib_only() -> None:
         mods = {n.names[0].name.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.Import)}
         mods |= {n.module.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module}
         assert mods <= stdlib, (f, mods - stdlib)
+
+
+# --- PR review: 504, one port source, case-insensitive enabled ----------------------------------
+
+
+def test_flatten_all_daemon_504_is_unknown_not_nothing_done(data_dir: Path) -> None:
+    d = Daemon(status=504, body={"ok": False, "error": "timed out"})
+    try:
+        point_at(data_dir, d.port)
+        out = cli.run(["copy-flatten-all"], now=NOW)
+    finally:
+        d.close()
+    assert out["flattened"] == "unknown" and "check the copy panel" in out["summary"]
+
+
+def test_the_port_comes_from_accounts_yaml_with_a_config_override(data_dir: Path, tmp_path: Path) -> None:
+    d = Daemon()
+    try:
+        cfg = json.loads((data_dir / "config.json").read_text())
+        (data_dir / "config.json").write_text(json.dumps({**cfg, "copy_accounts_path": str(tmp_path / "accounts.yaml")}))
+        (tmp_path / "accounts.yaml").write_text(f"port: {d.port}\naccounts:\n  - name: a\n    enabled: true\n")
+        assert cli.copy_port_of(cli.load_config()) == d.port
+        assert cli.run(["copy-flatten-all"], now=NOW)["flattened"] is True      # found by the yaml alone
+        (tmp_path / "accounts.yaml").write_text("accounts: []\n")
+        assert cli.copy_port_of(cli.load_config()) == 8768
+        (data_dir / "config.json").write_text(json.dumps({**cfg, "copy_port": 9123}))
+        assert cli.copy_port_of(cli.load_config()) == 9123
+    finally:
+        d.close()
+
+
+def test_enabled_true_is_case_insensitive(data_dir: Path, tmp_path: Path, copy_db: CopyDB) -> None:
+    for word in ("True", "TRUE"):
+        enable(tmp_path, f"accounts:\n  - name: a\n    enabled: {word}\n")
+        assert cli._copy_accounts_enabled(cli.load_config()) is True

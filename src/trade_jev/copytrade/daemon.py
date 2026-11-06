@@ -28,7 +28,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from trade_jev.copytrade.config import Account, CopyConfig
-from trade_jev.copytrade.executor import CopyExecutor
+from trade_jev.copytrade.executor import CopyExecutor, validate_message
 from trade_jev.copytrade.ledger import Ledger
 from trade_jev.copytrade.tokens import AccountKeepalive
 
@@ -135,7 +135,7 @@ class Daemon:
         self.executor_factory = executor_factory or (lambda a, b: CopyExecutor(a, b, ledger, now_ns=now_ns, mono=mono))
         self.workers: dict[str, Worker] = {}
         self.loop: asyncio.AbstractEventLoop | None = None
-        self.kill = "clear"
+        self.kill = "unknown"     # until the first poll completes: entries gated
         self._kill_texted = False
         self._stop = asyncio.Event()
         self.server: ThreadingHTTPServer | None = None
@@ -345,6 +345,8 @@ def make_server(daemon: Daemon, port: int) -> ThreadingHTTPServer:
                 return self._json({"error": "content-type must be application/json"}, HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
             try:
                 n = int(self.headers.get("Content-Length", 0))
+                if n < 0:
+                    raise ValueError
                 if n > MAX_BODY:
                     return self._json({"error": "too large"}, HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
                 msg = json.loads(self.rfile.read(n) or b"{}")
@@ -353,6 +355,8 @@ def make_server(daemon: Daemon, port: int) -> ThreadingHTTPServer:
             except ValueError:
                 return self._json({"error": "bad json"}, HTTPStatus.BAD_REQUEST)
             if self.path in ("/intent", "/heartbeat"):
+                if (bad := validate_message("intent" if self.path == "/intent" else "heartbeat", msg)):
+                    return self._json({"error": f"malformed message: {bad}"}, HTTPStatus.BAD_REQUEST)
                 daemon.receive("intent" if self.path == "/intent" else "heartbeat", msg)
                 return self._json({"queued": True})
             if self.path == "/flatten-all":

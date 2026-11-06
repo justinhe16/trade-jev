@@ -169,10 +169,7 @@ class DryRun:
         self.inner, self.name, self.dry = inner, f"dry-run({inner.name})", True
 
     async def position(self, fresh=False):
-        try:
-            return await self.inner.position(fresh)
-        except TypeError:
-            return await self.inner.position()
+        return await self.inner.position(fresh)
 
     async def working_orders(self):
         return await self.inner.working_orders()

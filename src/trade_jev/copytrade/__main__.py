@@ -130,12 +130,24 @@ def cmd_flatten_all(cfg, ledger, directory, direct, *, isatty=None, ask=input, h
         broker, ka = build_account(a, ledger, directory, http_factory, dotenv)
 
         async def go():
-            ack = await broker.flatten()
-            return ack
-        ack = asyncio.run(go())
-        _print(f"{a.name}: {'flat' if ack.ok else 'FAILED: ' + str(ack.error)}")
-        ledger.event(a.name, "flatten_all_direct", "ok" if ack.ok else str(ack.error), notify=False)
-        rc |= 0 if ack.ok else 1
+            if ka is not None:   # the daemon may have been down for hours: seed from .env, renew or log in first
+                try:
+                    await ka.tick()
+                except Exception:  # noqa: BLE001
+                    pass
+            return await broker.flatten()
+        try:
+            ack = asyncio.run(go())
+            err = None if ack.ok else str(ack.error)
+        except Exception as e:  # noqa: BLE001
+            err = f"{type(e).__name__}"
+        if err is None:
+            _print(f"{a.name}: flat")
+        else:
+            _print(f"{a.name}: FAILED: {err}. CLOSE IT BY HAND in the Tradovate UI (trader.tradovate.com): "
+                   "flatten the position and cancel its orders.")
+        ledger.event(a.name, "flatten_all_direct", "ok" if err is None else err, notify=False)
+        rc |= 0 if err is None else 1
     return rc
 
 
@@ -207,6 +219,14 @@ def cmd_rehearse(cfg, ledger, directory, name, *, isatty=None, ask=input, http_f
             fa = await broker.flatten()
             check("liquidate + sweep leaves flat, no orders", fa.ok, str(fa.error or ""))
             check("no live orders left", not await broker.orders(True))
+            probe = await broker.probe_unfilled_ioc(px - 100.0)
+            if "error" in probe:
+                check("IOC parent expires unfilled (probe)", False, probe["error"])
+            else:
+                check("IOC parent expired unfilled", probe["parent"] in ("Canceled", "Expired"), str(probe["parent"]))
+                _print(f"INFO Tradovate {'KEPT' if probe['children_live'] else 'cancelled'} the OSO children "
+                       f"when the IOC parent expired unfilled ({probe['children']}); the daemon sweeps either way")
+                check("sweep leaves no live orders after the unfilled probe", probe["swept"])
         except Exception as e:  # noqa: BLE001
             check("rehearsal ran", False, broker._red(e))
     asyncio.run(go())

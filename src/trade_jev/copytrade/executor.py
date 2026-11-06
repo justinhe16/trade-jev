@@ -34,10 +34,39 @@ ORDER_POLL_S = 10.0
 CASH_POLL_S = 60.0
 RETRY_FLATTEN_S = 2.0
 MARK_FRESH_S = 10.0
+QUOTE_FROZEN_S = 60.0     # an unchanged bid/ask this long is a frozen paper feed, not a mark
 EOD_FLATTEN_ET = "15:56:00"
 TEXT_CUTOFF_ET = "15:55:00"
 MAX_REJECTS = 3
 KILL_STATES = ("clear", "paused", "autonomy_off", "unknown")
+
+
+def validate_message(kind: str, msg) -> str | None:
+    """None when an intent / heartbeat from the paper runner is well-formed, else why not. A malformed message is
+    refused at the door (HTTP 400) and never reaches an account, so it can never day-halt one."""
+    if not isinstance(msg, dict):
+        return "not an object"
+    isint = lambda v: isinstance(v, int) and not isinstance(v, bool)  # noqa: E731
+    if kind == "intent":
+        if not isint(msg.get("seq")) or msg["seq"] < 1:
+            return "seq must be a positive integer"
+        if not isint(msg.get("target")) or msg["target"] not in (-1, 0, 1):
+            return "target must be -1, 0 or 1"
+        if msg.get("boot") is not None and not isinstance(msg["boot"], str):
+            return "boot must be a string"
+        if not isint(msg.get("t_ns")):
+            return "t_ns must be an integer"
+    else:
+        if msg.get("seq_last") is not None and (not isint(msg["seq_last"]) or msg["seq_last"] < 0):
+            return "seq_last must be a non-negative integer"
+        if msg.get("target") is not None and (not isint(msg["target"]) or msg["target"] not in (-1, 0, 1)):
+            return "target must be -1, 0 or 1"
+        if msg.get("boot") is not None and not isinstance(msg["boot"], str):
+            return "boot must be a string"
+        for k in ("bid", "ask"):
+            if msg.get(k) is not None and (isinstance(msg[k], bool) or not isinstance(msg[k], (int, float))):
+                return f"{k} must be a number"
+    return None
 
 
 def _et_time(t_ns: int) -> str:
@@ -52,10 +81,13 @@ class CopyExecutor(Executor):
         self.boot: str | None = None
         self.symbol: str | None = None
         self.clean = False             # startup flatten/sweep done
-        self.kill = "clear"            # clear | paused | autonomy_off | unknown (set by the daemon's kill watcher)
+        self.kill = "unknown"          # unknown until the first kill poll says otherwise; clear | paused | autonomy_off | unknown (set by the daemon's kill watcher)
         self.token_ok, self.token_expires = True, None
         self.hb: dict = {}
         self.last_rx = mono()          # stamped at the HTTP layer (note_rx), never inside the lock
+        self._quote: tuple | None = None
+        self._quote_t = mono()
+        self._orphan_alerted = False
         self.hb_ok = False             # a LIVE, fresh heartbeat was seen since the link last dropped
         self.link_lost = False
         self.trade: dict | None = None   # the open copy trade: id, side, qty, entry_px, tp_px, sl_px, ...
@@ -80,6 +112,11 @@ class CopyExecutor(Executor):
     def note_rx(self) -> None:
         """Called by the HTTP layer on receipt of any message from the paper runner."""
         self.last_rx = self.mono()
+
+    def log(self, event: str, **kw) -> None:
+        """The base class's JSON log has no file here; the lines go to stdout, which launchd sends to logs/copy.log."""
+        extra = " ".join(f"{k}={v}" for k, v in kw.items() if v is not None)[:400]
+        print(f"[copy] {time.strftime('%F %T')} {self.acct.name} {event} {extra}".rstrip(), flush=True)
 
     def event(self, kind: str, detail: str = "", notify: bool = False, seq: int | None = None) -> None:
         self.log(kind, detail=detail)
@@ -135,11 +172,16 @@ class CopyExecutor(Executor):
             return f"entries blocked: {b}"
         return None
 
-    def _mark(self) -> float | None:
-        """The paper quote for the open side (bid long, ask short); None when stale or missing."""
-        if not self.trade or self.mono() - self.last_rx > MARK_FRESH_S:
+    def _mark_for(self, side: int) -> float | None:
+        """The paper quote for a position's side (bid long, ask short), only while it can be trusted: a LIVE
+        heartbeat arrived recently AND the quote has moved within QUOTE_FROZEN_S (the heartbeat thread keeps
+        sending the last quote when the paper loop hangs). Otherwise None: open P&L is ignored."""
+        if not self.hb_ok or self.mono() - self.last_rx > MARK_FRESH_S or self.mono() - self._quote_t > QUOTE_FROZEN_S:
             return None
-        return self.hb.get("bid" if self.trade["side"] > 0 else "ask")
+        return self.hb.get("bid" if side > 0 else "ask")
+
+    def _mark(self) -> float | None:
+        return self._mark_for(self.trade["side"]) if self.trade else None
 
     def pnl_parts(self) -> tuple[float, float]:
         """(realized, open): realized from the ledger (closed trades) less the open trade's accrued entry
@@ -192,16 +234,24 @@ class CopyExecutor(Executor):
         return pos
 
     def _close_row(self, t: dict, exit_px, reason: str) -> None:
-        """Close the ledger row of trade `t` (a dict with id/side/qty/entry_px)."""
-        px = exit_px if exit_px is not None else (self._mark() if self.trade else None)
-        if px is None:
-            px = t["entry_px"]
+        """Close the ledger row of trade `t` (a dict with id/side/qty/entry_px). The exit is the real fill when the
+        broker gave one; else the trusted paper mark, else the last known quote, else the entry price, and the
+        row is then flagged `estimated`."""
         a = self.acct
         side = t["side"] if isinstance(t["side"], int) else (1 if t["side"] == "long" else -1)
+        px, estimated = exit_px, False
+        if px is None:
+            estimated = True
+            px = self._mark_for(side)
+            if px is None and self.hb:
+                px = self.hb.get("bid" if side > 0 else "ask")
+            if px is None:
+                px = t["entry_px"]
+            self.event("estimated_close", f"{reason}: no fill price from the broker, booked at {px}")
         points = (px - t["entry_px"]) * side
         gross = points * a.point_value * t["qty"]
         comm = 2 * t["qty"] * a.commission
-        self.ledger.trade_close(t["id"], self.now_ns(), px, reason, points, gross, comm, gross - comm)
+        self.ledger.trade_close(t["id"], self.now_ns(), px, reason, points, gross, comm, gross - comm, estimated)
 
     # ------------------------------------------------------------------ messages
 
@@ -211,6 +261,8 @@ class CopyExecutor(Executor):
 
     async def on_heartbeat(self, msg: dict) -> dict:
         async with self.lock:
+            if (bad := validate_message("heartbeat", msg)):
+                return {"ok": True, "ignored": f"malformed heartbeat: {bad}"}
             self._refresh_day()
             boot = msg.get("boot")
             if boot and boot != self.boot:
@@ -218,6 +270,9 @@ class CopyExecutor(Executor):
                 if self.clean and self.trade:   # a position that belongs to a previous paper run
                     await self._flatten("new paper run", "session_restart", notify=True)
             self.hb = msg
+            q = (msg.get("bid"), msg.get("ask"))
+            if q != self._quote:
+                self._quote, self._quote_t = q, self.mono()
             live = msg.get("mode") == "live" and msg.get("status") == "LIVE"
             if self.link_lost and live:
                 self.link_lost = False
@@ -256,12 +311,37 @@ class CopyExecutor(Executor):
                 await self._flatten("drift", "drift")
                 return
             await self._check_position(pos)
+        elif not pos.side and not self.trade and self.mono() - self._last_order_poll >= ORDER_POLL_S:
+            await self._poll_orphans()
+            if self.target != 0 and self.alert != "stayed flat" and not getattr(self.broker, "dry", False):
+                self.alert = "stayed flat"
+                self.event("stayed_flat", f"paper target {self.target}, account flat: staying flat (no text)")
         elif self.target != 0 and not self.trade:
             if self.alert != "stayed flat" and not getattr(self.broker, "dry", False):
                 self.alert = "stayed flat"
                 self.event("stayed_flat", f"paper target {self.target}, account flat: staying flat (no text)")
         await self._check_stops()
         await self._eod_guard()
+
+    async def _poll_orphans(self) -> None:
+        """Flat, no trade, no entry in flight (the lock is ours): any live order is an orphan that could open a
+        position against paper. Sweep it; alert if it can't be swept (once, until a sweep works)."""
+        self._last_order_poll = self.mono()
+        try:
+            live = await self.broker.orders(True)
+        except Exception as e:  # noqa: BLE001
+            self.last_error = f"can't read orders: {e}"
+            return
+        if not live:
+            self._orphan_alerted = False
+            return
+        if await self.broker.sweep():
+            self.event("orphan_swept", f"{len(live)} live order(s) on a flat account cancelled", True)
+            self._orphan_alerted = False
+            return
+        if not self._orphan_alerted:
+            self._orphan_alerted = True
+            await self.halt_day("day", f"{len(live)} live order(s) on a flat account could not be cancelled")
 
     async def _check_position(self, pos) -> None:
         a = self.acct
@@ -320,17 +400,25 @@ class CopyExecutor(Executor):
                                  exit_reason="daily_stop")
 
     async def _eod_guard(self) -> None:
-        if _et_time(self.now_ns()) >= EOD_FLATTEN_ET and self._eod_done != self.day:
+        """From 15:56 ET until flat: flatten and sweep. A transient read error retries on the next tick."""
+        if _et_time(self.now_ns()) < EOD_FLATTEN_ET or self._eod_done == self.day:
+            return
+        try:
             pos = await self._position(True)
             if pos.side or await self.broker.orders(True):
-                await self._flatten("end of day", "eod", notify=False)
-                await self.broker.sweep()
-            if not (self.pos_cache and self.pos_cache.side):
+                if await self._flatten("end of day", "eod", notify=False) == "flat":
+                    await self.broker.sweep()
+                pos = await self._position(True)
+            if not pos.side:
                 self._eod_done = self.day
+        except Exception as e:  # noqa: BLE001 — retried every tick, never a day halt
+            self.last_error = f"eod guard: {type(e).__name__}"
 
     async def on_intent(self, msg: dict) -> dict:
         async with self.lock:
             self._refresh_day()
+            if (bad := validate_message("intent", msg)):
+                return self._skip(0, f"malformed intent: {bad}")
             boot, seq = msg.get("boot"), int(msg.get("seq") or 0)
             if not boot:
                 return self._skip(seq, "no boot id")
@@ -430,6 +518,10 @@ class CopyExecutor(Executor):
         self.entries += 1
         if ack.info and (ack.info.get("partial") or ack.info.get("closed")):
             self._record_closed_at_entry(msg, ack, target, sym)
+        if ack.info and ack.info.get("partial") and not ack.ok:   # the partial fill could not be closed
+            self.need_flat = True
+            await self.halt_day("day", f"partial fill could not be closed: {ack.error}")
+            return "halted: partial fill not closed"
         if ack.missed:
             self.rejects = 0
             self.event("missed", str(ack.error), False, seq=int(msg["seq"]))
@@ -485,6 +577,7 @@ class CopyExecutor(Executor):
         ack = await self.broker.flatten()
         self.log("flatten", why=why, ack=ack.__dict__)
         if ack.dry:
+            self.need_flat = False
             return "dry-run: would flatten"
         if not ack.ok:
             self.errors += 1
@@ -506,10 +599,7 @@ class CopyExecutor(Executor):
         self.need_flat = False
         if self.trade:
             t, self.trade = self.trade, None
-            px = ack.fill_px
-            if px is None and self.hb:
-                px = self.hb.get("bid" if t["side"] > 0 else "ask")
-            self._close_row(t, px, exit_reason)
+            self._close_row(t, ack.fill_px, exit_reason)
             self._reduced = 0
         if notify:
             self.event("flattened", f"{why}", True)
@@ -525,6 +615,16 @@ class CopyExecutor(Executor):
                 return
             if self.need_flat and self.mono() - self._last_flat_try >= RETRY_FLATTEN_S:
                 await self._flatten("retry", "flatten")
+            elif ((self.kill == "paused" or self.halted == "flatten-all")
+                  and self.mono() - self._last_flat_try >= RETRY_FLATTEN_S):
+                # a kill / flatten-all flatten may have been cancelled half way: any position seen is flattened
+                try:
+                    pos = await self._position()
+                except Exception:  # noqa: BLE001
+                    pos = None
+                if pos is not None and pos.side:
+                    await self._flatten("kill" if self.kill == "paused" else "flatten-all", "kill"
+                                        if self.kill == "paused" else "flatten_all")
             if self.mono() - self.last_rx > HEARTBEAT_LOST_S:
                 if not self.link_lost:
                     self.link_lost, self.hb_ok = True, False
@@ -540,20 +640,21 @@ class CopyExecutor(Executor):
             await self._eod_guard()
 
     async def kill_flatten(self, state: str) -> None:
-        """The daemon's kill watcher saw `paused` (or flatten-all was asked)."""
+        """The daemon's kill watcher saw `paused`. `need_flat` is set BEFORE waiting for the lock or the broker, so a
+        flatten that is cancelled half way (the daemon's timeout) is retried by the watchdog until flat."""
+        self.kill = state
+        if state != "paused":
+            return
+        self.need_flat = True
         async with self.lock:
-            self.kill = state
-            if state == "paused":
-                await self._flatten("kill", "kill", notify=bool(self.trade))
-                await self.broker.sweep()
+            await self._flatten("kill", "kill", notify=bool(self.trade))
 
     async def flatten_all(self) -> str:
-        """The owner's flatten-all: halt the account for the ET day, then flatten."""
+        """The owner's flatten-all: halt the account for the ET day, then flatten (retried like a kill)."""
+        self.need_flat = True
         async with self.lock:
             await self.halt_day("day", "flatten-all", False)
-            r = await self._flatten("flatten-all", "flatten_all", notify=True)
-            await self.broker.sweep()
-            return r
+            return await self._flatten("flatten-all", "flatten_all", notify=True)
 
     def set_kill(self, state: str) -> None:
         if state not in KILL_STATES:

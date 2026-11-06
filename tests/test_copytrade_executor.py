@@ -35,6 +35,7 @@ class Rig:
         self.br = broker or FakeBroker()
         self.ledger = ledger or Ledger(tmp_path / "copy.db", now_ns=lambda: self.clk.ns)
         self.ex = CopyExecutor(acct(**kw), self.br, self.ledger, now_ns=lambda: self.clk.ns, mono=lambda: self.clk.mono)
+        self.ex.set_kill("clear")       # the daemon's first kill poll says so; the default is unknown
         self.seq = {}
 
     def run(self, coro):
@@ -508,6 +509,7 @@ def test_halts_survive_a_restart_and_roll_at_et_midnight(tmp_path):
     r.run(r.ex.halt_day("day", "stop"))
     ex2 = CopyExecutor(acct(), r.br, r.ledger, now_ns=lambda: r.clk.ns, mono=lambda: r.clk.mono)
     assert ex2.halted == "stop" and ex2.halt_kind == "day" and ex2.gate_reason() == "startup not clean"
+    ex2.set_kill("clear")
     r.run(ex2.startup())
     assert ex2.gate_reason().startswith("halted")
     r.clk.advance(24 * 3600)                           # next ET day

@@ -18,8 +18,8 @@
 #   tradovate late start (after 09:28 ET) → no catch-up replay exists: 60s of warm-up on live data,
 #     every decision HOLD until then
 # Copy trading (README "Copy trading"): when accounts.yaml exists and has an account with `enabled: true`, the
-#   session also gets --exec-url http://127.0.0.1:<copy port> (the daemon com.tradejev.copy; port from
-#   $TRADE_JEV_COPY_PORT, else accounts.yaml's `port:`, else 8768). No accounts.yaml, or none enabled: the
+#   session also gets --exec-url http://127.0.0.1:<copy port> (the daemon com.tradejev.copy; the port is
+#   accounts.yaml's `port:`, else 8768: the one source the daemon and the extension read too). No accounts.yaml, or none enabled: the
 #   command is exactly what it was before. Paper never places an order either way.
 # A lock keeps a second copy (a missed job fired on wake, a manual run) from starting a duplicate.
 #
@@ -62,11 +62,8 @@ fi
 # Copy trading link (plain grep: no Python needed to decide). `${EXEC_ARGS[@]+...}` because macOS bash 3.2 with
 # `set -u` treats an empty array as unset.
 EXEC_ARGS=()
-if [ -f accounts.yaml ] && grep -Eq '^[[:space:]-]*enabled:[[:space:]]*true' accounts.yaml; then
-    COPY_PORT="${TRADE_JEV_COPY_PORT:-}"
-    if [ -z "$COPY_PORT" ]; then
-        COPY_PORT="$(grep -E '^port:[[:space:]]*[0-9]+' accounts.yaml | head -1 | grep -Eo '[0-9]+' || true)"
-    fi
+if [ -f accounts.yaml ] && grep -Eiq '^[[:space:]-]*enabled:[[:space:]]*true' accounts.yaml; then
+    COPY_PORT="$(grep -E '^port:[[:space:]]*[0-9]+' accounts.yaml | head -1 | grep -Eo '[0-9]+' || true)"
     EXEC_ARGS=(--exec-url "http://127.0.0.1:${COPY_PORT:-8768}")
     echo "copy trading: paper session posts to ${EXEC_ARGS[1]}"
 fi

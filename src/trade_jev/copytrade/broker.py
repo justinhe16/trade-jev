@@ -36,13 +36,14 @@ from trade_jev.tradovate import TradovateError, redact
 REST = {"demo": "https://demo.tradovateapi.com/v1", "live": "https://live.tradovateapi.com/v1"}
 HTTP_TIMEOUT_S = 4.0
 TERMINAL = {"Filled", "Canceled", "Rejected", "Expired", "Completed"}
+NOT_FILLED = {"Canceled", "Rejected", "Expired"}
 LIVE = {"Working", "Suspended", "PendingNew", "PendingReplace"}
 SETTLE_S, SETTLE_STEP_S = 2.0, 0.2
 VERIFY_S = 1.0
 FLAT_WAIT_S = 3.0
 BLOCK_S = 3600.0
 MAX_PENALTY_WAIT_S = 30.0
-READ_TTL_POSITION_S, READ_TTL_FLAT_S, READ_TTL_ORDERS_S = 2.0, 30.0, 10.0
+READ_TTL_POSITION_S, READ_TTL_FLAT_S, READ_TTL_ORDERS_S = 2.0, 5.0, 10.0
 
 
 class BrokerError(Exception):
@@ -165,7 +166,7 @@ class TradovateBroker:
         fail = UnknownOutcome if order else BrokerError
         try:
             status, d = await asyncio.wait_for(
-                self.http(method, self.base + path, {"Authorization": f"Bearer {tok}"}, body), self.timeout + 1)
+                self.http(method, self.base + path, {"Authorization": f"Bearer {tok}"}, body), self.timeout + 0.5)
         except (TradovateError, asyncio.TimeoutError) as e:
             raise fail(self._red(f"{path}: {type(e).__name__}: {e}")) from None
         if status == 429:
@@ -440,9 +441,20 @@ class TradovateBroker:
                        info={"closed": True, "exit_reason": "flatten"})
         ms = (self.clock() - t0) * 1000
         if pos.qty == 0:
-            await self.sweep()
+            if status not in NOT_FILLED:
+                # the parent is Filled (or its state is unknown) but the position reads flat: ambiguous. Never
+                # sweep (that would cancel the bracket of a position that may be about to show): halt and alert.
+                self.emit("entry_ambiguous", f"entry order {status or 'unreadable'} but the position reads flat: "
+                          "bracket kept, halting", True)
+                return Ack(False, error=f"entry order {status or 'unreadable'} but the position reads flat; "
+                           "bracket left in place", ack_ms=ms, info={"ambiguous": True})
+            swept = await self.sweep()
             for x in (cl, cl_tp, cl_sl):
                 self._upd(x, state="missed" if x == cl else "canceled")
+            if not swept:   # live orphan children could open a position against the intent: not a plain miss
+                self.emit("orphan_orders", "no fill, but the bracket children could not be cancelled", True)
+                return Ack(False, error="no fill, but orphan orders could not be cancelled", ack_ms=ms,
+                           info={"orphans": True})
             return Ack(False, missed=True, error="no fill at the limit", ack_ms=ms)
         entry_px = await self._fill_px(oid, "entry", action) or pos.avg_px or limit_px
         if pos.side != side or pos.qty != qty:   # partial (or wrong side): liquidate, cancel, record as a miss
@@ -502,17 +514,45 @@ class TradovateBroker:
                                             "tp_id": ids[0], "sl_id": ids[1], "modified": modified,
                                             "recovered": recovered})
 
+    async def probe_unfilled_ioc(self, limit_px: float, tp_pts: float = 10.0, sl_pts: float = 10.0) -> dict:
+        """REHEARSE ONLY (demo, owner at a terminal): place a 1-lot OSO whose IOC buy limit is far below the market, so
+        the parent expires unfilled, and report what happens to the bracket children before sweeping. Answers: does
+        Tradovate cancel OSO children when an IOC parent expires unfilled? (The daemon never relies on it: it sweeps.)"""
+        spec = await self._spec()
+        await self._contract_ok(self.symbol)
+        limit_px = _round(limit_px)
+        d = await self._call("POST", "/order/placeoso", {
+            "accountSpec": spec, "accountId": self.acct.account_id, "action": "Buy", "symbol": self.symbol,
+            "orderQty": 1, "orderType": "Limit", "price": limit_px, "timeInForce": "IOC", "isAutomated": True,
+            "bracket1": {"action": "Sell", "orderType": "Limit", "price": _round(limit_px + tp_pts),
+                         "timeInForce": "GTC"},
+            "bracket2": {"action": "Sell", "orderType": "Stop", "stopPrice": _round(limit_px - sl_pts),
+                         "timeInForce": "GTC"}}, order=True)
+        if (f := self._failure(d)) or not isinstance(d.get("orderId"), int):
+            return {"error": f"{f[0]}: {f[1]}" if f else "no orderId"}
+        await self.sleep(1.0)
+        rows = {o["id"]: o for o in await self._raw_orders(True)}
+        kids = [rows.get(d.get("oso1Id")), rows.get(d.get("oso2Id"))]
+        out = {"parent": (rows.get(d["orderId"]) or {}).get("ordStatus"),
+               "children": [(k or {}).get("ordStatus") for k in kids]}
+        out["children_live"] = len([k for k in kids if k and k.get("ordStatus") in LIVE])
+        out["swept"] = await self.sweep()
+        return out
+
     # -- flatten / sweep
 
     async def flatten(self) -> Ack:
-        """Liquidate every open position (the position's own contract), poll flat, cancel every live order,
-        read back. A retry only follows a read-back that still shows a position."""
+        """Liquidate every open position (the position's own contract) and poll flat; ONLY once a read-back shows
+        flat, cancel every live order (never cancel protective orders while a position may exist). A retry
+        follows only a read-back that still shows a position. `fill_px` is the liquidation's real fill when
+        fill/deps has it."""
         if not self.acct.account_id:
             return Ack(True)
         self._invalidate()
         orig_side = 0
         flipped = False
         last_err = None
+        liq_ids: list[int] = []
         try:
             rows = await self._positions(True)
             orig_side = (1 if rows[0]["netPos"] > 0 else -1) if rows else 0
@@ -520,7 +560,11 @@ class TradovateBroker:
                 if not rows:
                     break
                 for r in rows:
-                    await self._liquidate(r)
+                    ok, oid, err = await self._liquidate(r)
+                    if oid is not None:
+                        liq_ids.append(oid)
+                    if not ok:
+                        last_err = err
                 end = self.clock() + FLAT_WAIT_S
                 while True:
                     rows = await self._positions(True)
@@ -530,43 +574,53 @@ class TradovateBroker:
                 if rows and (1 if rows[0]["netPos"] > 0 else -1) != orig_side:
                     flipped = True      # a bracket fill raced the liquidation and left the opposite position
                     for r in rows:
-                        await self._liquidate(r)
-                    await self._positions(True)
+                        _, oid, _ = await self._liquidate(r)
+                        if oid is not None:
+                            liq_ids.append(oid)
                     break
         except RateLimited as e:
             last_err = str(e)
         except BrokerError as e:
             last_err = self._red(e)
-        swept = await self.sweep()
         try:
-            rows = await self._positions(True)
+            rows = await self._positions(True)       # the read-back
         except BrokerError as e:
             return Ack(False, error=self._red(f"flatten read-back failed: {e}"))
-        if flipped:   # the read-back above is after the second liquidation
-            return Ack(False, error="opposite position after flatten (flattened again)"
-                       + ("" if not rows else "; STILL IN A POSITION"))
-        if rows:
-            return Ack(False, error=f"still in a position after flatten{': ' + last_err if last_err else ''}")
+        if rows:                                      # still in a position: leave the bracket alone
+            return Ack(False, error=("opposite position after flatten; STILL IN A POSITION" if flipped else
+                                     "still in a position after flatten") + (f": {last_err}" if last_err else ""))
+        swept = await self.sweep()                    # flat is confirmed: now the orders
+        px = None
+        for oid in liq_ids:
+            px = await self._fill_px(oid, "flatten", "Sell" if orig_side > 0 else "Buy")
+            if px is not None:
+                break
+        if flipped:
+            return Ack(False, fill_px=px, error="opposite position after flatten (flattened again)")
         if not swept:
-            return Ack(False, error="flat, but live orders could not be cancelled")
-        return Ack(True)
+            return Ack(False, fill_px=px, error="flat, but live orders could not be cancelled")
+        return Ack(True, fill_px=px)
 
-    async def _liquidate(self, row: dict) -> None:
+    async def _liquidate(self, row: dict) -> tuple[bool, int | None, str | None]:
+        """(accepted, liquidation order id, error). A failureReason is a refusal; a timeout is left to the read-back."""
         body = {"accountId": self.acct.account_id, "contractId": row["contractId"], "admin": False,
                 "isAutomated": True}
         for _ in range(2):
             try:
                 d = await self._call("POST", "/order/liquidateposition", body, order=True)
             except UnknownOutcome:
-                return    # the read-back decides
+                return True, None, None    # the read-back decides
             if "p-ticket" in d or "p-time" in d:
                 if d.get("p-captcha"):
                     self._block("Tradovate wants a captcha")
-                    return
+                    return False, None, "captcha required"
                 await self.sleep(min(float(d.get("p-time") or 1), MAX_PENALTY_WAIT_S))
                 body = {**body, "p-ticket": d.get("p-ticket")}
                 continue
-            return
+            if (f := self._failure(d)):
+                return False, None, self._red(f"liquidate refused: {f[0]} {f[1]}")
+            return True, d.get("orderId") if isinstance(d.get("orderId"), int) else None, None
+        return False, None, "penalty ticket not cleared"
 
     async def sweep(self) -> bool:
         """Cancel every non-terminal order on the account. TooLate (it filled or died meanwhile) is fine."""

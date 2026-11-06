@@ -108,7 +108,7 @@ def go(rig, scenario):
 
 async def ready(rig):
     assert await until(lambda: all(w.ex.clean for w in rig.d.workers.values()))
-    assert await until(lambda: rig.d.kill == "clear" or True)
+    assert await until(lambda: rig.d.kill != "unknown" and all(w.ex.kill == rig.d.kill for w in rig.d.workers.values()))
     rig.hb()
     await asyncio.sleep(0.1)
 

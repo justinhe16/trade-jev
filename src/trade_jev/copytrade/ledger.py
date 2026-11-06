@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS copy_fills(name TEXT, broker_fill_id INTEGER, day TEX
   role TEXT, contract TEXT, action TEXT, qty INTEGER, px REAL, t_ns INTEGER, PRIMARY KEY(name, broker_fill_id));
 CREATE TABLE IF NOT EXISTS copy_trades(id INTEGER PRIMARY KEY, name TEXT, day TEXT, boot TEXT, seq INTEGER,
   contract TEXT, side TEXT, qty INTEGER, entry_ns INTEGER, entry_px REAL, tp_px REAL, sl_px REAL, exit_ns INTEGER,
-  exit_px REAL, exit_reason TEXT, points REAL, gross REAL, commission REAL, pnl REAL);
+  exit_px REAL, exit_reason TEXT, points REAL, gross REAL, commission REAL, pnl REAL, estimated INTEGER);
 CREATE TABLE IF NOT EXISTS copy_events(id INTEGER PRIMARY KEY, name TEXT, day TEXT, t_ns INTEGER, kind TEXT,
   seq INTEGER, detail TEXT, notify INTEGER);
 CREATE TABLE IF NOT EXISTS copy_halts(name TEXT, day TEXT, kind TEXT, reason TEXT, t_ns INTEGER, cleared_ns INTEGER);
@@ -124,9 +124,12 @@ class Ledger:
                        "sl_px) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                        (name, day, boot, seq, contract, side, qty, entry_ns, entry_px, tp_px, sl_px)).lastrowid
 
-    def trade_close(self, tid: int, exit_ns, exit_px, reason, points, gross, commission, pnl) -> None:
-        self._x("UPDATE copy_trades SET exit_ns=?, exit_px=?, exit_reason=?, points=?, gross=?, commission=?, pnl=? "
-                "WHERE id=?", (exit_ns, exit_px, reason, points, gross, commission, pnl, tid))
+    def trade_close(self, tid: int, exit_ns, exit_px, reason, points, gross, commission, pnl,
+                    estimated: bool = False) -> None:
+        """`estimated`: the exit price is a mark or the entry price, not a real fill."""
+        self._x("UPDATE copy_trades SET exit_ns=?, exit_px=?, exit_reason=?, points=?, gross=?, commission=?, pnl=?, "
+                "estimated=? WHERE id=?", (exit_ns, exit_px, reason, points, gross, commission, pnl,
+                                           1 if estimated else 0, tid))
 
     def open_trades(self, name: str) -> list[sqlite3.Row]:
         return self._q("SELECT * FROM copy_trades WHERE name=? AND exit_ns IS NULL", (name,))

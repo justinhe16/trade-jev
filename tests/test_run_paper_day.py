@@ -54,8 +54,9 @@ def test_an_enabled_account_adds_the_exec_url(repo):
     assert run_script(repo, y) == BASE + " --exec-url http://127.0.0.1:8768"
 
 
-def test_the_copy_port_follows_the_yaml_and_the_env_override(repo):
-    y = "port: 9100\naccounts:\n  - {name: b}\n  - name: b\n    enabled: true\n"
+def test_the_copy_port_follows_the_yaml_only_and_enabled_is_case_insensitive(repo):
+    y = "port: 9100\naccounts:\n  - {name: b}\n  - name: b\n    enabled: True\n"
     assert run_script(repo, y).endswith("--exec-url http://127.0.0.1:9100")
-    assert run_script(repo, y, {"TRADE_JEV_COPY_PORT": "9200"}).endswith("--exec-url http://127.0.0.1:9200")
-    assert run_script(repo, "accounts:\n  - enabled: true\n").endswith("--exec-url http://127.0.0.1:8768")
+    # the env var is no longer a second source (the daemon and the extension never read it)
+    assert run_script(repo, y, {"TRADE_JEV_COPY_PORT": "9200"}).endswith("--exec-url http://127.0.0.1:9100")
+    assert run_script(repo, "accounts:\n  - enabled: TRUE\n").endswith("--exec-url http://127.0.0.1:8768")

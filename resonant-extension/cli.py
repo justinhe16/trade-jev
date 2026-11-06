@@ -19,8 +19,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sqlite3
 import re
+import sqlite3
 import subprocess
 import sys
 import time as clock
@@ -120,7 +120,7 @@ class Config:
     token_status_path: Path = field(default_factory=lambda: Path(DEFAULT_TOKEN_STATUS))
     copy_db_path: Path = field(default_factory=lambda: Path(DEFAULT_COPY_DB))
     copy_accounts_path: Path = field(default_factory=lambda: Path(DEFAULT_COPY_ACCOUNTS))
-    copy_port: int = DEFAULT_COPY_PORT
+    copy_port: int | None = None  # None: accounts.yaml's `port:` (the daemon's own), else DEFAULT_COPY_PORT
 
 
 def data_dir() -> Path:
@@ -153,10 +153,11 @@ def load_config() -> Config:
         raise Fail("config.json: holidays must be a list of YYYY-MM-DD strings")
     copy_db = raw.get("copy_db_path", DEFAULT_COPY_DB)
     copy_acc = raw.get("copy_accounts_path", DEFAULT_COPY_ACCOUNTS)
-    copy_port = raw.get("copy_port", DEFAULT_COPY_PORT)
+    copy_port = raw.get("copy_port")
     if not isinstance(copy_db, str) or not copy_db or not isinstance(copy_acc, str) or not copy_acc:
         raise Fail("config.json: copy_db_path and copy_accounts_path must be non-empty strings")
-    if isinstance(copy_port, bool) or not isinstance(copy_port, int) or not 1 <= copy_port <= 65535:
+    if copy_port is not None and (isinstance(copy_port, bool) or not isinstance(copy_port, int)
+                                  or not 1 <= copy_port <= 65535):
         raise Fail("config.json: copy_port must be 1..65535")
     return Config(Path(db).expanduser(), label, frozenset(holidays), Path(tok).expanduser(),
                   Path(copy_db).expanduser(), Path(copy_acc).expanduser(), copy_port)
@@ -2292,9 +2293,21 @@ def cmd_copy(cfg: Config, now: datetime, date_arg: str | None = None) -> dict[st
 
 def _copy_accounts_enabled(cfg: Config) -> bool:
     try:
-        return re.search(r"^[ \t-]*enabled:[ \t]*true", cfg.copy_accounts_path.read_text(), re.M) is not None
+        return re.search(r"^[ \t-]*enabled:[ \t]*true", cfg.copy_accounts_path.read_text(), re.M | re.I) is not None
     except OSError:
         return False
+
+
+def copy_port_of(cfg: Config) -> int:
+    """The daemon's port: an explicit ``copy_port`` in config.json, else accounts.yaml's ``port:`` (the one place the
+    daemon and run_paper_day.sh read it too), else the default."""
+    if cfg.copy_port is not None:
+        return cfg.copy_port
+    try:
+        m = re.search(r"^port:[ \t]*(\d+)", cfg.copy_accounts_path.read_text(), re.M)
+    except OSError:
+        m = None
+    return int(m.group(1)) if m and 1 <= int(m.group(1)) <= 65535 else DEFAULT_COPY_PORT
 
 
 def cmd_copy_watch(cfg: Config, now: datetime) -> dict[str, Any]:
@@ -2374,13 +2387,16 @@ def cmd_copy_flatten_all(cfg: Config, now: datetime) -> dict[str, Any]:
     """Halt every copy account for the ET day and flatten it, through the copy daemon (POST /flatten-all with its
     header). Daemon down: a clean failure (exit 1, nothing was sent); the terminal fallback is
     ``python -m trade_jev.copytrade flatten-all --direct``. A timeout may have gone through: exit 0, "unknown"."""
-    url = f"http://127.0.0.1:{cfg.copy_port}/flatten-all"
+    url = f"http://127.0.0.1:{copy_port_of(cfg)}/flatten-all"
     req = urllib.request.Request(url, b"{}", {"Content-Type": "application/json", COPY_HEADER: "flatten-all"})
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
         with opener.open(req, timeout=COPY_FLATTEN_TIMEOUT_S) as r:
             body = json.loads(r.read())
     except urllib.error.HTTPError as e:
+        if e.code == 504:  # the daemon's own timeout: the flatten is probably in progress
+            return {"flattened": "unknown", "reason": "daemon timed out",
+                    "summary": "flatten-all timed out inside the daemon; check the copy panel"}  # fmt: skip
         raise Fail(f"copy daemon refused flatten-all (HTTP {e.code}); nothing was done") from None
     except TimeoutError:
         return {"flattened": "unknown", "reason": "timed out",

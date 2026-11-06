@@ -489,19 +489,23 @@ class TradovateBroker:
                 modified = False
                 self.emit("modify_failed", self._red(f"bracket modify failed, provisional bracket kept: {e}"), False)
         self._invalidate()
-        live = 0
+        live, read_ok = 0, False
         end = self.clock() + VERIFY_S
         while True:
             try:
                 rows = await self._raw_orders(True)
                 live = len({o["id"] for o in rows if o.get("ordStatus") in LIVE
                             and (o.get("parentId") == oid or o["id"] in (o1, o2))})
-            except BrokerError:
-                live = 0
-            if live >= 2 or self.clock() >= end:
+                read_ok = True
+            except BrokerError:    # a failed read is retried inside the window; it is not "a child is missing"
+                pass
+            if (read_ok and live >= 2) or self.clock() >= end:
                 break
             await self.sleep(SETTLE_STEP_S)
-        if live < 2:
+        if not read_ok:
+            self.emit("bracket_unverified", "could not read the orders to verify the bracket; the position stays "
+                      "and the invariant check will look again", True)
+        elif live < 2:
             self.emit("bracket_missing", "bracket missing after a fill: position closed", True)
             fa = await self.flatten()
             return Ack(False, error="bracket missing after the fill; position closed"
@@ -559,13 +563,16 @@ class TradovateBroker:
             for attempt in range(3):
                 if not rows:
                     break
+                accepted = False
                 for r in rows:
                     ok, oid, err = await self._liquidate(r)
                     if oid is not None:
                         liq_ids.append(oid)
                     if not ok:
                         last_err = err
-                end = self.clock() + FLAT_WAIT_S
+                    else:
+                        accepted = True
+                end = self.clock() + (FLAT_WAIT_S if accepted else 0.0)   # a refusal needs no 3 s wait
                 while True:
                     rows = await self._positions(True)
                     if not rows or self.clock() >= end:

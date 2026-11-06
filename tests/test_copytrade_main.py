@@ -116,7 +116,7 @@ def test_preflight_is_read_only(env, capsys):
     out = capsys.readouterr().out
     assert rc == 0 and "PASS account 11 found: DEMO11" in out and "PASS contract MNQZ6 found" in out
     assert {c[0] for c in env["fake"].calls} == {"GET"}
-    assert not [c for c in env["fake"].calls if "/order/" in c[1]]
+    assert not [c for c in env["fake"].calls if "/order/" in c[1] and c[1] != "/order/list"]   # only the read
     env["fake"].read_fail.add("/contract/find")
     assert run(env, ["preflight", "a1"]) == 1
 

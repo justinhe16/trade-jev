@@ -168,6 +168,17 @@ def cmd_preflight(cfg, ledger, directory, name, symbol=None, http_factory=None, 
         except Exception as e:  # noqa: BLE001
             ok = False
             _print(f"FAIL account/list: {broker._red(e)}")
+        t0 = time.monotonic()
+        try:   # /order/list returns the account's whole history: time it against the 4.5 s call timeout
+            d = await broker._call("GET", "/order/list")
+            secs, n, size = time.monotonic() - t0, len(d.get("d") or []), len(json.dumps(d))
+            slow = secs > 2.0 or n > 2000 or size > 1_000_000
+            _print(f"{'WARN' if slow else 'PASS'} order/list: {n} rows, {size} bytes, {secs:.2f}s "
+                   f"(call timeout {broker.timeout + 0.5:g}s)" + (" - slow or large: the daemon polls it every "
+                                                                  "10 s in a position" if slow else ""))
+        except Exception as e:  # noqa: BLE001
+            ok = False
+            _print(f"FAIL order/list: {broker._red(e)}")
         sym = symbol or a.root + "Z6"
         try:
             await broker._contract_ok(sym)

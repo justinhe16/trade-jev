@@ -435,3 +435,229 @@ def test_order_list_calls_time_out_at_the_http_timeout_not_later(rig):
     with pytest.raises(cb.BrokerError):
         rig.run(rig.broker.orders(True))
     assert time.monotonic() - t < 1.0
+
+
+# ======================= round 2 =======================
+
+
+def sim(tmp_path):
+    from tests.copytrade_fakes import Clock
+    from trade_jev.copytrade.broker import TradovateBroker
+    fk, clk = FakeTradovate(), Clock()
+    base = et_to_ns("2026-10-05", "10:00:00")
+    now = lambda: base + int(clk.t * 1e9)  # noqa: E731
+    led = Ledger(tmp_path / "c.db", now_ns=now)
+    a = acct()
+    br = TradovateBroker(a, lambda: "tok", lambda: ["tok"], http=fk, ledger=led, sleep=clk.sleep, clock=clk, now_ns=now)
+    ex = CopyExecutor(a, br, led, now_ns=now, mono=clk)
+    ex.set_kill("clear")
+    return fk, clk, led, br, ex, now
+
+
+async def enter_long(ex, now):
+    assert await ex.startup()
+    ex.note_rx()
+    await ex.on_heartbeat({"boot": "b" * 8, "seq_last": 0, "target": 0, "status": "LIVE", "mode": "live",
+                           "bid": 20000.0, "ask": 20000.25})
+    r = await ex.on_intent({"seq": 1, "boot": "b" * 8, "target": 1, "mode": "live", "symbol": "NQZ6", "t_ns": now(),
+                            "sent_wall_ns": now(), "ref": {"bid": 20000.0, "ask": 20000.25},
+                            "stop_ticks": 200, "target_ticks": 100})
+    assert r["result"].startswith("entered"), r
+
+
+def hammer(tmp_path, setup, minutes=15):
+    fk, clk, led, br, ex, now = sim(tmp_path)
+    out = {}
+
+    async def go():
+        await enter_long(ex, now)
+        setup(fk)
+        n0, t0 = len(fk.calls), clk.t
+        await ex.kill_flatten("paused")
+        while clk.t - t0 < minutes * 60:
+            ex.note_rx()
+            clk.t += 1.0
+            await ex.watchdog_tick()
+        out.update(calls=len(fk.calls) - n0, secs=clk.t - t0,
+                   notify=len(led._q("SELECT * FROM copy_events WHERE notify=1")),
+                   liq=fk.n("/order/liquidateposition", "POST"), fk=fk, ex=ex, clk=clk, led=led)
+    asyncio.run(go())
+    return out
+
+
+def test_persistently_refused_liquidate_is_backed_off_and_alerts_once(tmp_path):
+    o = hammer(tmp_path, lambda fk: setattr(fk, "liquidate_fail_times", 10 ** 6))
+    per_hour = o["calls"] / o["secs"] * 3600
+    assert per_hour < 1500 and o["liq"] <= 60          # was ~14,000/h and 261 liquidates in 15 min
+    kinds = [r["kind"] for r in o["led"]._q("SELECT kind FROM copy_events WHERE notify=1")]
+    assert kinds.count("flatten_failed") == 1 and kinds.count("halt") <= 1 and len(kinds) <= 3   # was 87
+    assert "CLOSE IT BY HAND in the Tradovate UI" in o["ex"].alert
+    assert o["fk"].pos[99]["netPos"] == 5 and len([x for x in o["fk"].orders.values()
+                                                     if x.get("role") == "child" and x["ordStatus"] == "Working"]) == 2
+
+
+def test_backoff_doubles_to_a_cap_and_429_goes_to_the_cap(tmp_path):
+    fk, clk, led, br, ex, now = sim(tmp_path)
+    delays = []
+
+    async def go():
+        await enter_long(ex, now)
+        fk.liquidate_fail_times = 10 ** 6
+        await ex.kill_flatten("paused")
+        for _ in range(8):
+            delays.append(ex._next_flat - clk.t)
+            clk.t = ex._next_flat
+            ex.note_rx()
+            await ex.watchdog_tick()
+    asyncio.run(go())
+    assert delays[:6] == [2.0, 4.0, 8.0, 16.0, 32.0, 60.0] and delays[-1] == 60.0
+    fk2, clk2, led2, br2, ex2, now2 = sim(tmp_path / "b")
+    ex2._flat_backoff = 2.0
+    ex2._flatten_failed("liquidate refused: HTTP 429")
+    assert ex2._flat_backoff == 60.0
+
+
+def test_backoff_resets_once_flat_and_a_fresh_request_tries_at_once(tmp_path):
+    fk, clk, led, br, ex, now = sim(tmp_path)
+
+    async def go():
+        await enter_long(ex, now)
+        fk.liquidate_fail_times = 10 ** 6
+        await ex.kill_flatten("paused")
+        for _ in range(4):
+            clk.t = ex._next_flat
+            ex.note_rx()
+            await ex.watchdog_tick()
+        assert ex._flat_backoff > 2.0 and ex.need_flat
+        n = fk.n("/order/liquidateposition")
+        ex.note_rx()
+        await ex.watchdog_tick()
+        assert fk.n("/order/liquidateposition") == n           # inside the backoff: nothing sent
+        fk.liquidate_fail_times = 0
+        await ex.flatten_all()                                   # a fresh request tries immediately, once
+        assert fk.pos[99]["netPos"] == 0 and fk.n("/order/liquidateposition") > n
+        assert ex._flat_backoff == 2.0 and not ex.need_flat and not ex._flat_alerted
+    asyncio.run(go())
+
+
+def test_drift_and_halt_flattens_also_honour_the_backoff(tmp_path):
+    fk, clk, led, br, ex, now = sim(tmp_path)
+
+    async def go():
+        await enter_long(ex, now)
+        fk.liquidate_fail_times = 10 ** 6
+        assert (await ex._flatten("t", "drift")).startswith("halted")
+        n = fk.n("/order/liquidateposition")
+        for _ in range(5):
+            assert await ex._flatten("t", "drift") == "halted: flatten backing off"
+        assert fk.n("/order/liquidateposition") == n
+    asyncio.run(go())
+
+
+# ---- 2. preflight timing; verify reads retried
+
+def test_preflight_reports_order_list_size_and_time(tmp_path, capsys):
+    fake = FakeTradovate()
+    fake.orders = {i: {"id": i, "accountId": ACCT_ID, "ordStatus": "Filled"} for i in range(30)}
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("")
+    from trade_jev import tradovate_token as tt
+    tt.write_store(tmp_path / "copy" / "a1" / "tradovate_token.json", "t", "m", time.time() + 3600)
+    rc = cm.main(["preflight", "a1", "--symbol", "MNQZ6"], cfg=cfg.CopyConfig((acct(),)), db=tmp_path / "c.db",
+                 directory=tmp_path / "copy", dotenv=dotenv, http_factory=lambda pool: fake)
+    out = capsys.readouterr().out
+    assert rc == 0 and "PASS order/list: 31 rows," in out and "bytes" in out and "s (call timeout 4.5s)" in out
+
+
+def test_preflight_warns_when_order_list_is_slow(tmp_path, capsys, monkeypatch):
+    fake = FakeTradovate()
+    ticks = iter(range(0, 1000, 3))
+    monkeypatch.setattr(cm.time, "monotonic", lambda: next(ticks))     # each reading is 3 s later
+    from trade_jev import tradovate_token as tt
+    tt.write_store(tmp_path / "copy" / "a1" / "tradovate_token.json", "t", "m", time.time() + 3600)
+    (tmp_path / ".env").write_text("")
+    cm.main(["preflight", "a1", "--symbol", "MNQZ6"], cfg=cfg.CopyConfig((acct(),)), db=tmp_path / "c.db",
+            directory=tmp_path / "copy", dotenv=tmp_path / ".env", http_factory=lambda pool: fake)
+    assert "WARN order/list" in capsys.readouterr().out
+
+
+def test_a_failed_verify_read_is_retried_and_is_not_a_missing_bracket(rig):
+    fails = {"n": 0}
+    real = rig.fake.__call__
+
+    async def flaky(method, url, headers, body):
+        if url.endswith("/order/list") and rig.fake.n("/order/modifyorder") >= 2 and fails["n"] < 2:
+            fails["n"] += 1
+            from trade_jev.tradovate import TradovateError
+            raise TradovateError("503 blip")
+        return await real(method, url, headers, body)
+    rig.broker.http = flaky
+    rig.fake.fill_px = 24500.0
+    ack = rig.enter()
+    assert ack.ok and fails["n"] == 2 and live_orders(rig) == 2          # retried, bracket intact
+    assert rig.fake.n("/order/liquidateposition") == 0
+
+
+def test_a_verify_that_can_never_read_keeps_the_position_and_alerts(rig):
+    real = rig.fake.__call__
+
+    async def dead(method, url, headers, body):
+        if url.endswith("/order/list") and rig.fake.n("/order/modifyorder") >= 2:
+            from trade_jev.tradovate import TradovateError
+            raise TradovateError("503")
+        return await real(method, url, headers, body)
+    rig.broker.http = dead
+    rig.fake.fill_px = 24500.0
+    ack = rig.enter()
+    assert ack.ok and rig.fake.n("/order/liquidateposition") == 0
+    assert any(k == "bracket_unverified" and n for k, _, n in rig.events)
+
+
+def test_a_successful_read_with_a_missing_child_still_flattens(rig):
+    rig.fake.child_dead = True
+    ack = rig.enter()
+    assert not ack.ok and "bracket missing" in ack.error
+
+
+# ---- 3. orphan sweep needs a fresh flat read
+
+def test_orphan_sweep_is_skipped_when_a_fresh_read_shows_a_position(tmp_path):
+    class Racy(FakeBroker):
+        sweeps = 0
+
+        async def orders(self, fresh=False):
+            return [{"id": 1}, {"id": 2}]
+
+        async def sweep(self):
+            self.sweeps += 1
+            return True
+    br = Racy()
+    r = Rig(tmp_path, broker=br)
+    r.start()
+    br.sweeps = 0
+    calls = {"n": 0}
+    real = br.position
+
+    async def pos(fresh=False):
+        calls["n"] += 1
+        # the cached read says flat (reconcile), the fresh one right before the sweep shows the late fill
+        return Position(1, 5, 20000.0) if fresh else Position()
+    br.position = pos
+    r.clk.advance(11)
+    r.ex.trade = None
+    r.run(r.ex._reconcile())
+    assert br.sweeps == 0                               # never cancel protective orders of a live position
+    br.position = real
+
+
+# ---- 4. alert text
+
+def test_flatten_failure_alert_says_close_it_by_hand(tmp_path):
+    r = Rig(tmp_path)
+    r.start()
+    r.intent(1, 1)
+    r.br.fail_next.add("flatten")
+    r.intent(2, 0)
+    assert "CLOSE IT BY HAND in the Tradovate UI" in r.ex.alert
+    ev = [e for e in r.texts() if e["kind"] == "flatten_failed"]
+    assert len(ev) == 1 and "CLOSE IT BY HAND" in ev[0]["detail"]

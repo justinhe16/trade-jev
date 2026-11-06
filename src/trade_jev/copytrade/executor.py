@@ -32,7 +32,9 @@ from trade_jev.executor.core import Executor, Limits
 HEARTBEAT_LOST_S = 15.0
 ORDER_POLL_S = 10.0
 CASH_POLL_S = 60.0
-RETRY_FLATTEN_S = 2.0
+RETRY_FLATTEN_S = 2.0          # first retry delay; doubles per failed flatten up to FLATTEN_BACKOFF_MAX_S
+FLATTEN_BACKOFF_MAX_S = 60.0
+BY_HAND = "CLOSE IT BY HAND in the Tradovate UI (trader.tradovate.com): flatten the position and cancel its orders."
 MARK_FRESH_S = 10.0
 QUOTE_FROZEN_S = 60.0     # an unchanged bid/ask this long is a frozen paper feed, not a mark
 EOD_FLATTEN_ET = "15:56:00"
@@ -97,6 +99,9 @@ class CopyExecutor(Executor):
         self.day_halt_row = None
         self.need_flat = False
         self._last_flat_try = -1e9
+        self._flat_backoff = RETRY_FLATTEN_S
+        self._next_flat = -1e9
+        self._flat_alerted = False     # one alert per failing episode, not per retry
         self._last_order_poll = -1e9
         self._last_cash = -1e9
         self.cash_loss: float | None = None
@@ -141,11 +146,13 @@ class CopyExecutor(Executor):
     async def halt_day(self, kind: str, reason: str, flatten: bool = False, notify: bool = True,
                        exit_reason: str = "flatten") -> None:
         self._refresh_day()
-        if not self.day_halt_row:
+        created = not self.day_halt_row
+        if created:
             self.ledger.halt(self.acct.name, self.day, kind, reason)
             self._refresh_day()
         self.alert = reason
-        self.event("halt", f"{kind}: {reason}", notify)
+        if created:   # the halt and its text once per episode: a retry that fails again adds nothing
+            self.event("halt", f"{kind}: {reason}", notify)
         if flatten:
             await self._flatten("halt", exit_reason)
 
@@ -329,6 +336,8 @@ class CopyExecutor(Executor):
         self._last_order_poll = self.mono()
         try:
             live = await self.broker.orders(True)
+            if live and (await self._position(True)).side:    # only sweep once flat is CONFIRMED by a fresh read
+                return
         except Exception as e:  # noqa: BLE001
             self.last_error = f"can't read orders: {e}"
             return
@@ -572,31 +581,44 @@ class CopyExecutor(Executor):
 
     # ------------------------------------------------------------------ flatten
 
-    async def _flatten(self, why: str, exit_reason: str, notify: bool = False) -> str:
+    def _flatten_failed(self, error: str) -> None:
+        """Capped exponential backoff (2 s doubling to 60 s; a 429 goes straight to the cap) and ONE alert per episode."""
+        self.errors += 1
+        self.last_error = error
+        self.need_flat = True
+        self._next_flat = self.mono() + self._flat_backoff
+        self._flat_backoff = FLATTEN_BACKOFF_MAX_S if "429" in error else min(self._flat_backoff * 2, FLATTEN_BACKOFF_MAX_S)
+        self.alert = f"FLATTEN FAILED: {error}. {BY_HAND}"
+        if not self._flat_alerted:
+            self._flat_alerted = True
+            self.event("flatten_failed", f"{error}. {BY_HAND}", True)
+
+    async def _flatten(self, why: str, exit_reason: str, notify: bool = False, force: bool = False) -> str:
+        if not force and self.need_flat and self.mono() < self._next_flat:
+            return "halted: flatten backing off"      # every caller (drift, stops, watchdog) honours the backoff
         self._last_flat_try = self.mono()
+        if force:
+            self._next_flat, self._flat_backoff = -1e9, RETRY_FLATTEN_S
         ack = await self.broker.flatten()
         self.log("flatten", why=why, ack=ack.__dict__)
         if ack.dry:
             self.need_flat = False
             return "dry-run: would flatten"
         if not ack.ok:
-            self.errors += 1
-            self.last_error = str(ack.error)
-            self.need_flat = True
-            await self.halt_day("day", f"flatten failed: {ack.error}")
-            self.alert = f"FLATTEN FAILED: {ack.error}. Check the broker now."
+            await self.halt_day("day", f"flatten failed: {ack.error}", notify=False)
+            self._flatten_failed(str(ack.error))
             return "halted: flatten failed"
         try:
             pos = await self._position(True)
         except Exception as e:  # noqa: BLE001
-            self.need_flat = True
-            self.last_error = f"can't read position: {e}"
+            self._flatten_failed(f"can't read position: {e}")
             return "halted: can't confirm flat"
         if pos.side:
-            self.need_flat = True
-            await self.halt_day("day", f"still in a position after flatten: {pos.side * pos.qty:+d}")
+            await self.halt_day("day", f"still in a position after flatten: {pos.side * pos.qty:+d}", notify=False)
+            self._flatten_failed(f"still in a position after flatten: {pos.side * pos.qty:+d}")
             return "halted: still in a position"
-        self.need_flat = False
+        self.need_flat, self._flat_alerted = False, False
+        self._flat_backoff, self._next_flat = RETRY_FLATTEN_S, -1e9
         if self.trade:
             t, self.trade = self.trade, None
             self._close_row(t, ack.fill_px, exit_reason)
@@ -613,10 +635,9 @@ class CopyExecutor(Executor):
             self._refresh_day()
             if not self.clean:
                 return
-            if self.need_flat and self.mono() - self._last_flat_try >= RETRY_FLATTEN_S:
+            if self.need_flat and self.mono() >= self._next_flat:
                 await self._flatten("retry", "flatten")
-            elif ((self.kill == "paused" or self.halted == "flatten-all")
-                  and self.mono() - self._last_flat_try >= RETRY_FLATTEN_S):
+            elif ((self.kill == "paused" or self.halted == "flatten-all") and self.mono() >= self._next_flat):
                 # a kill / flatten-all flatten may have been cancelled half way: any position seen is flattened
                 try:
                     pos = await self._position()
@@ -646,15 +667,16 @@ class CopyExecutor(Executor):
         if state != "paused":
             return
         self.need_flat = True
+        self._next_flat, self._flat_backoff = -1e9, RETRY_FLATTEN_S      # a fresh request may try at once
         async with self.lock:
-            await self._flatten("kill", "kill", notify=bool(self.trade))
+            await self._flatten("kill", "kill", notify=bool(self.trade), force=True)
 
     async def flatten_all(self) -> str:
         """The owner's flatten-all: halt the account for the ET day, then flatten (retried like a kill)."""
         self.need_flat = True
         async with self.lock:
             await self.halt_day("day", "flatten-all", False)
-            return await self._flatten("flatten-all", "flatten_all", notify=True)
+            return await self._flatten("flatten-all", "flatten_all", notify=True, force=True)
 
     def set_kill(self, state: str) -> None:
         if state not in KILL_STATES:

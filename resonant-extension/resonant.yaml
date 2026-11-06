@@ -1,5 +1,9 @@
 # trade-jev: Jev paper-trading NQ on the Mini. Reads the paper runner's SQLite DB (read-only)
-# and can start or stop its launchd job. It never places orders: paper only. See README.md.
+# and can start or stop its launchd job. The paper runner never places orders. Copy trading (accounts.yaml,
+# the com.tradejev.copy daemon) mirrors Jev's paper positions on real or demo accounts: the extension only
+# READS its ledger (the `copy` panel, the copy-watch job) and has one write tool, trade_jev_copy_flatten_all,
+# which asks the daemon to halt every copy account for the day and flatten. It never places an order itself,
+# and health / recover stay paper-only. See README.md.
 name: trade-jev
 version: 1
 description: Jev paper-trading NQ on the Mini; session status, live Jev calls, P&L vs baselines, trades, start/stop.
@@ -18,6 +22,8 @@ launch_agents:
     description: "Always-on viewer at http://127.0.0.1:8765 (Replay, Live, Paper, Docs); /paper reads data/paper.db read-only. Not attached to the running live session."
   - label: com.tradejev.tvtoken
     description: "24/7 Tradovate token keep-alive: checks every minute, renews the web-session tokens before they lapse, writes data/tradovate_token_status.json."
+  - label: com.tradejev.copy
+    description: "Copy-trading daemon (installed only with accounts.yaml): mirrors Jev's paper position changes per account, flattens on kill, writes data/copy.db."
 
 tools:
   # Tool names match the evals (trade_jev_status is a plain read; start/stop ask first).
@@ -66,6 +72,15 @@ tools:
     level: L2          # not L3: a misread "stop" would end the day's session unasked
     approval_summary: stop trade-jev paper trading for today
     timeout_s: 30
+  trade_jev_copy_flatten_all:
+    description: >-
+      Emergency: halt EVERY copy-trading account for the rest of the ET day and flatten it at market
+      (cancels its orders), through the copy daemon. Fails if the daemon is down. Does nothing to paper.
+    run: ./cli.py copy-flatten-all
+    effect: write
+    level: L2          # same as start/stop: asks when the model chose it, runs when the owner typed it
+    approval_summary: halt and flatten all copy-trading accounts for today
+    timeout_s: 40
 
 jobs:
   - id: close-summary
@@ -84,6 +99,14 @@ jobs:
     schedule: "5,20,35,50 * * * *"
     tz: America/New_York
     run: ./cli.py watch
+    effect: read
+    level: L0
+    timeout_s: 60
+  - id: copy-watch
+    description: "Every 5 min: texts the copy daemon's alerts (halts, flattens, blocked entries) from data/copy.db, and if it is down in trading hours."
+    schedule: "*/5 * * * *"
+    tz: America/New_York
+    run: ./cli.py copy-watch
     effect: read
     level: L0
     timeout_s: 60
@@ -115,8 +138,20 @@ panels:
     timeout_s: 30
     max_bytes: 32768
     history: {every: daily, keep: 365d}   # PER-286: archived per ET day via `--date YYYY-MM-DD`
+  - id: copy
+    title: Copy accounts
+    description: "Copy-trading accounts today: position, P&L, entries, state (armed, halted, daemon down); missed and rejected entries; halts; token health."
+    command: [./cli.py, panel, copy]
+    refresh:
+      idle: "*/15 * * * *"
+      active: "*/1 9-16 * * 1-5"
+    tz: America/New_York
+    timeout_s: 30
+    max_bytes: 24576
+    history: {every: daily, keep: 365d}   # archived per ET day via `--date YYYY-MM-DD`
 
-# watch's "trade-jev/down" and "trade-jev/token" text at once; close-summary's daily P&L rides the hourly pulse.
+# watch's "trade-jev/down" and "trade-jev/token" text at once; close-summary's daily P&L rides the hourly pulse;
+# copy-watch's "trade-jev/copy/<account>/<kind>/<day>" and "trade-jev/copy/daemon/down/<day>" text at once too.
 report: {max_urgency: urgent}
 # health exits non-zero while today's session (trading days, 09:31-15:50 ET) is crashed, stale,
 # missing or stalled (running, but no decision for 2 min); Resonant then runs recover, which

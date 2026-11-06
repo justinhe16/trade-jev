@@ -17,6 +17,10 @@
 #     with the reason "tradovate token expired" (the keep-alive, com.tradejev.tvtoken, normally prevents it)
 #   tradovate late start (after 09:28 ET) → no catch-up replay exists: 60s of warm-up on live data,
 #     every decision HOLD until then
+# Copy trading (README "Copy trading"): when accounts.yaml exists and has an account with `enabled: true`, the
+#   session also gets --exec-url http://127.0.0.1:<copy port> (the daemon com.tradejev.copy; the port is
+#   accounts.yaml's `port:`, else 8768: the one source the daemon and the extension read too). No accounts.yaml, or none enabled: the
+#   command is exactly what it was before. Paper never places an order either way.
 # A lock keeps a second copy (a missed job fired on wake, a manual run) from starting a duplicate.
 #
 # Logs: logs/paper-<ET date>.log. The session is recorded in data/paper.db; view it at /paper.
@@ -55,9 +59,18 @@ if (( now < START )); then
     sleep $(( wait_min * 60 ))
 fi
 
+# Copy trading link (plain grep: no Python needed to decide). `${EXEC_ARGS[@]+...}` because macOS bash 3.2 with
+# `set -u` treats an empty array as unset.
+EXEC_ARGS=()
+if [ -f accounts.yaml ] && grep -Eiq '^[[:space:]-]*enabled:[[:space:]]*true' accounts.yaml; then
+    COPY_PORT="$(grep -E '^port:[[:space:]]*[0-9]+' accounts.yaml | head -1 | grep -Eo '[0-9]+' || true)"
+    EXEC_ARGS=(--exec-url "http://127.0.0.1:${COPY_PORT:-8768}")
+    echo "copy trading: paper session posts to ${EXEC_ARGS[1]}"
+fi
+
 # lockf -t 0: exit at once if another session holds the lock. caffeinate -i: no idle sleep meanwhile.
 /usr/bin/lockf -t 0 "$REPO/logs/paper.lock" \
     /usr/bin/caffeinate -i \
-    "$UV" run --frozen python -m trade_jev.live --exit-at-close --no-open --port "$PORT" && status=0 || status=$?
+    "$UV" run --frozen python -m trade_jev.live --exit-at-close --no-open --port "$PORT" ${EXEC_ARGS[@]+"${EXEC_ARGS[@]}"} && status=0 || status=$?
 echo "=== $(date '+%F %T %Z') exit $status"
 exit $status

@@ -42,6 +42,7 @@ import sys
 import threading
 import time
 import traceback
+import uuid
 import webbrowser
 from dataclasses import asdict, fields
 from datetime import date, datetime, timedelta
@@ -625,6 +626,7 @@ class Session:
         self.armed = False
         self.target = 0
         self.intent_seq = 0
+        self.boot = uuid.uuid4().hex   # per process: intent_seq restarts at 1, so copy-trading needs this to tell runs apart
         self.intents: list[dict] = []
         self.executor: dict | None = None
         self.executor_rx = 0.0
@@ -835,7 +837,7 @@ class Session:
         self.intent_seq += 1
         q = self.quote
         catch_up = bool(self.source.live and t and (time.time_ns() - t) / 1e9 > CATCH_UP_S)
-        msg = {"type": "intent", "seq": self.intent_seq, "day": e.day.day, "symbol": e.day.symbol,
+        msg = {"type": "intent", "seq": self.intent_seq, "boot": self.boot, "day": e.day.day, "symbol": e.day.symbol,
                "mode": self.mode, "t_ns": int(t), "send_ns": int(kw.get("send_ns") or t), "sent_wall_ns": time.time_ns(),
                "target": target, "reason": reason,
                "ref": {"bid": q["bid"] * TICK if q["bid"] is not None else None,
@@ -847,8 +849,11 @@ class Session:
             self.link.send("/intent", msg)
 
     def heartbeat(self) -> dict:
-        return {"type": "heartbeat", "seq_last": self.intent_seq, "target": self.target, "armed": self.armed,
-                "status": self.status_now, "mode": self.mode, "sent_wall_ns": time.time_ns()}
+        q = self.quote
+        return {"type": "heartbeat", "seq_last": self.intent_seq, "boot": self.boot, "target": self.target,
+                "armed": self.armed, "status": self.status_now, "mode": self.mode, "sent_wall_ns": time.time_ns(),
+                "bid": q["bid"] * TICK if q["bid"] is not None else None,
+                "ask": q["ask"] * TICK if q["ask"] is not None else None}
 
     def set_armed(self, armed: bool, reason: str | None = None) -> dict:
         armed = bool(armed)

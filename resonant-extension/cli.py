@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""trade-jev Resonant extension: paper status, P&L, trades, Jev decisions, start/stop, two jobs,
-and the `paper` and `chart` dashboard panels.
+"""trade-jev Resonant extension: paper status, P&L, trades, Jev decisions, start/stop, three jobs,
+the `paper`, `chart` and `copy` dashboard panels, and the copy-trading flatten-all tool.
 
 Stdlib only. Resonant runs this as ``python -I -S cli.py <cmd>`` with ``PATH=/usr/bin:/bin``
 and ``HOME``/``RESONANT_EXT_DATA`` set to the extension's data dir (never the real home).
@@ -19,10 +19,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
 import time as clock
+import urllib.error
+import urllib.request
 from collections.abc import Iterable
 from contextlib import closing
 from dataclasses import dataclass, field, replace
@@ -39,6 +42,9 @@ from emit import report  # noqa: E402
 
 DEFAULT_DB = "/Users/justinhe/trade-jev/data/paper.db"
 DEFAULT_TOKEN_STATUS = "/Users/justinhe/trade-jev/data/tradovate_token_status.json"
+DEFAULT_COPY_DB = "/Users/justinhe/trade-jev/data/copy.db"  # the copy daemon's ledger (read-only here)
+DEFAULT_COPY_ACCOUNTS = "/Users/justinhe/trade-jev/accounts.yaml"  # only grepped for `enabled: true`
+DEFAULT_COPY_PORT = 8768
 DEFAULT_LABEL = "com.tradejev.paper"
 LAUNCHCTL = "/bin/launchctl"
 LAUNCHCTL_TIMEOUT_S = 10
@@ -112,6 +118,9 @@ class Config:
     holidays: frozenset[str] = field(default_factory=frozenset)
     # looked up at call time (tests point the default at a temp file)
     token_status_path: Path = field(default_factory=lambda: Path(DEFAULT_TOKEN_STATUS))
+    copy_db_path: Path = field(default_factory=lambda: Path(DEFAULT_COPY_DB))
+    copy_accounts_path: Path = field(default_factory=lambda: Path(DEFAULT_COPY_ACCOUNTS))
+    copy_port: int | None = None  # None: accounts.yaml's `port:` (the daemon's own), else DEFAULT_COPY_PORT
 
 
 def data_dir() -> Path:
@@ -119,8 +128,8 @@ def data_dir() -> Path:
 
 
 def load_config() -> Config:
-    """``config.json`` in the data dir: ``{"db_path", "launchd_label", "holidays", "token_status_path"}``, all
-    optional. A malformed file is an error rather than a silent fallback to the default."""
+    """``config.json`` in the data dir: ``{"db_path", "launchd_label", "holidays", "token_status_path",
+    "copy_db_path", "copy_accounts_path", "copy_port"}``, all optional. A malformed file is an error rather than a silent fallback to the default."""
     path = data_dir() / "config.json"
     if not path.exists():
         return Config()
@@ -142,7 +151,16 @@ def load_config() -> Config:
         raise Fail("config.json: launchd_label must look like com.tradejev.paper")
     if not isinstance(holidays, list) or not all(isinstance(h, str) for h in holidays):
         raise Fail("config.json: holidays must be a list of YYYY-MM-DD strings")
-    return Config(Path(db).expanduser(), label, frozenset(holidays), Path(tok).expanduser())
+    copy_db = raw.get("copy_db_path", DEFAULT_COPY_DB)
+    copy_acc = raw.get("copy_accounts_path", DEFAULT_COPY_ACCOUNTS)
+    copy_port = raw.get("copy_port")
+    if not isinstance(copy_db, str) or not copy_db or not isinstance(copy_acc, str) or not copy_acc:
+        raise Fail("config.json: copy_db_path and copy_accounts_path must be non-empty strings")
+    if copy_port is not None and (isinstance(copy_port, bool) or not isinstance(copy_port, int)
+                                  or not 1 <= copy_port <= 65535):
+        raise Fail("config.json: copy_port must be 1..65535")
+    return Config(Path(db).expanduser(), label, frozenset(holidays), Path(tok).expanduser(),
+                  Path(copy_db).expanduser(), Path(copy_acc).expanduser(), copy_port)
 
 
 def connect(cfg: Config) -> sqlite3.Connection | None:
@@ -2064,13 +2082,350 @@ def chart_day_panel(cfg: Config, now: datetime, day: str) -> dict[str, Any]:
                     updated_at=data_time(sessions, now), health=health, local_url=PANEL_LOCAL_URL)  # fmt: skip
 
 
+# --- copy trading (the `copy` panel, copy-watch, copy-flatten-all) ------------------------------
+#
+# The copy daemon (src/trade_jev/copytrade, com.tradejev.copy) keeps data/copy.db: copy_status (one row per
+# account, refreshed every 5 s), copy_trades, copy_orders, copy_events (notify=1 are the texts), copy_halts.
+# Everything here reads it read-only, like paper.db. The paper commands (status, health, recover, watch) stay
+# paper-only and never look at it.
+
+COPY_STALE_S = 120  # a status row older than this: the daemon is down (it publishes every 5 s)
+COPY_ROWS = 20
+COPY_DOWN_FROM = time(9, 35)
+COPY_DOWN_UNTIL = time(15, 55)
+COPY_FLATTEN_TIMEOUT_S = 30
+COPY_HEADER = "X-Trade-Jev-Copy"
+COPY_CANT_READ = "copy.db won't open read-only (WAL side files missing?); try again later"
+COPY_TABLES = ("copy_status", "copy_trades", "copy_orders", "copy_events", "copy_halts")
+_KEY_BAD = re.compile(r"[^a-z0-9._:-]+")
+
+
+def copy_connect(cfg: Config) -> sqlite3.Connection | None:
+    """copy.db read-only, or None when it doesn't exist yet (or isn't the copy ledger). A WAL DB that won't open
+    read-only is a clean one-line failure (the run is retried later)."""
+    if not cfg.copy_db_path.exists():
+        return None
+    try:
+        conn = sqlite3.connect(cfg.copy_db_path.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
+        conn.row_factory = sqlite3.Row
+        names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    except sqlite3.Error as e:
+        if _cant_open(e):
+            raise Fail(COPY_CANT_READ) from None
+        raise
+    if not set(COPY_TABLES) <= names:
+        conn.close()
+        return None
+    return conn
+
+
+def _hm(ns: int | None) -> str | None:
+    return None if not ns else datetime.fromtimestamp(ns / 1e9, ET).strftime("%H:%M")
+
+
+def _slug(text: Any) -> str:
+    return _KEY_BAD.sub("-", str(text).lower()).strip("-")[:40] or "x"
+
+
+def _sym_pos(side: int | None, qty: int | None, contract: str | None, px: float | None) -> str:
+    if not side or not qty:
+        return "flat"
+    return f"{'+' if side > 0 else '-'}{qty} {contract or ''}".strip() + (f" @ {px:.2f}" if px else "")
+
+
+def _state_pill(r: sqlite3.Row, stale: bool) -> dict[str, str]:
+    if stale:
+        return pw.pill("daemon down", "bad")
+    if r["halted"]:
+        return pw.pill(f"halted: {r['halt_kind'] or 'day'}", "bad")
+    if r["gate_reason"]:
+        return pw.pill(str(r["gate_reason"])[:40], "warn")
+    return pw.pill("dry run" if r["mode"] == "dry_run" else "armed", "ok")
+
+
+def _missed_table(rows: list[sqlite3.Row], title: str) -> dict[str, Any]:
+    return pw.table(
+        [pw.column("t", "ET"), pw.column("name", "Account"), pw.column("kind", "What", "pill"),
+         pw.column("detail", "Why")],
+        [{"t": _hm(r["t_ns"]), "name": r["name"], "kind": pw.pill(r["kind"], "warn" if r["kind"] == "missed" else "bad"),
+          "detail": clip(r["detail"], 90)} for r in rows],
+        id="missed", title=title)  # fmt: skip
+
+
+def _trades_table(rows: list[sqlite3.Row]) -> dict[str, Any]:
+    return pw.table(
+        [pw.column("when", "ET"), pw.column("name", "Account"), pw.column("side", "Side"),
+         pw.column("qty", "Qty", "number"), pw.column("entry", "Entry", "number"),
+         pw.column("exit", "Exit", "number"), pw.column("pnl", "$", "money"), pw.column("why", "Why")],
+        [{"when": f"{_hm(r['entry_ns'])}-{_hm(r['exit_ns']) or 'open'}", "name": r["name"], "side": r["side"],
+          "qty": r["qty"], "entry": num(r["entry_px"]), "exit": num(r["exit_px"]), "pnl": num(r["pnl"]),
+          "why": r["exit_reason"]} for r in rows],
+        id="trades", title=f"Trades ({len(rows)})")  # fmt: skip
+
+
+def _halts_table(rows: list[sqlite3.Row]) -> dict[str, Any]:
+    return pw.table(
+        [pw.column("t", "ET"), pw.column("name", "Account"), pw.column("kind", "Kind"), pw.column("reason", "Reason"),
+         pw.column("state", "State", "pill")],
+        [{"t": _hm(r["t_ns"]), "name": r["name"], "kind": r["kind"], "reason": clip(r["reason"], 90),
+          "state": pw.pill("cleared" if r["cleared_ns"] else "active", "neutral" if r["cleared_ns"] else "bad")}
+         for r in rows],
+        id="halts", title="Halts")  # fmt: skip
+
+
+def _day_rows(conn: sqlite3.Connection, day: str) -> dict[str, list[sqlite3.Row]]:
+    q = lambda sql: conn.execute(sql, (day,)).fetchall()  # noqa: E731
+    return {
+        "trades": q("SELECT * FROM copy_trades WHERE day=? ORDER BY entry_ns DESC LIMIT %d" % COPY_ROWS),
+        "all_trades": q("SELECT name, pnl, exit_ns FROM copy_trades WHERE day=?"),
+        "missed": q("SELECT * FROM copy_events WHERE day=? AND kind IN ('missed','rejected') "
+                    "ORDER BY id DESC LIMIT %d" % COPY_ROWS),
+        "halts": q("SELECT * FROM copy_halts WHERE day=? ORDER BY t_ns"),
+        "orders": q("SELECT name, state, role FROM copy_orders WHERE day=? AND role='entry'"),
+        "events": q("SELECT 1 FROM copy_events WHERE day=? LIMIT 1"),
+    }
+
+
+def copy_live_view(conn: sqlite3.Connection, now: datetime) -> tuple[dict[str, Any], str | None]:
+    statuses = conn.execute("SELECT * FROM copy_status ORDER BY name").fetchall()
+    day = now.astimezone(ET).date().isoformat()
+    if not statuses:
+        return pw.view("today", f"Today, {day_label(day)}", [pw.text("no copy accounts", id="none")]), None
+    rows = _day_rows(conn, day)
+    updated = max(parse_ts(r["updated_at"]) or now for r in statuses)
+    stale = (now - updated).total_seconds() > COPY_STALE_S
+    table_rows, total, tones, tokens = [], 0.0, [], []
+    for r in statuses:
+        pnl = (r["realized"] or 0.0) + (r["open_pnl"] or 0.0) if r["day"] == day else 0.0
+        total += pnl
+        pill = _state_pill(r, stale)
+        tones.append(pill["tone"])
+        table_rows.append({"name": r["name"], "mode": f"{r['mode']}/{r['env']}",
+                           "pos": _sym_pos(r["pos_side"], r["pos_qty"], r["contract"], r["avg_px"]),
+                           "pnl": round(pnl, 2), "entries": r["entries"] if r["day"] == day else 0, "state": pill})
+        if r["token_expires_at"] or not r["token_ok"]:
+            exp = parse_ts(r["token_expires_at"])
+            tokens.append({"name": r["name"], "state": "up" if r["token_ok"] else "down",
+                           "detail": (f"expires {exp.astimezone(ET):%H:%M}" if exp else "no token") if r["token_ok"]
+                           else "token problem" + (f": {clip(r['last_error'], 60)}" if r["last_error"] else "")})
+        else:
+            tokens.append({"name": r["name"], "state": "unknown", "detail": "no token configured"})
+    widgets: list[dict[str, Any]] = [
+        pw.stat("Copy P&L", round(total, 2), format="money", health="ok" if total >= 0 else "warn",
+                hint=day_label(day), id="pnl"),
+        pw.table([pw.column("name", "Account"), pw.column("mode", "Mode"), pw.column("pos", "Position"),
+                  pw.column("pnl", "P&L $", "money"), pw.column("entries", "Entries", "number"),
+                  pw.column("state", "State", "pill")], table_rows, id="accounts", title="Accounts")]
+    if stale:
+        widgets.insert(0, pw.text(f"copy daemon down: no status for {int((now - updated).total_seconds()) // 60} min",
+                                  id="down"))
+    widgets.append(pw.status(tokens, id="tokens", title="Tokens"))
+    if rows["missed"]:
+        widgets.append(_missed_table(rows["missed"], f"Missed and rejected ({len(rows['missed'])})"))
+    if rows["halts"]:
+        widgets.append(_halts_table(rows["halts"]))
+    if rows["trades"]:
+        widgets.append(_trades_table(rows["trades"]))
+    return pw.view("today", f"Today, {day_label(day)}", widgets), (
+        "bad" if "bad" in tones else "warn" if "warn" in tones else "ok")  # fmt: skip
+
+
+def copy_day_panel(cfg: Config, now: datetime, day: str) -> dict[str, Any]:
+    """``panel copy --date D``: the same views from the day's trades, orders, events and halts; NONE when the
+    copy daemon recorded nothing on D (no DB, a weekend, a future day)."""
+    conn = copy_connect(cfg)
+    try:
+        if conn is None or day > now.astimezone(ET).date().isoformat():
+            return NONE
+        rows = _day_rows(conn, day)
+        if not (rows["all_trades"] or rows["orders"] or rows["events"] or rows["halts"]):
+            return NONE
+        per: dict[str, dict[str, Any]] = {}
+        for t in rows["all_trades"]:
+            a = per.setdefault(t["name"], {"name": t["name"], "trades": 0, "pnl": 0.0, "missed": 0, "rejected": 0})
+            if t["exit_ns"]:
+                a["trades"] += 1
+                a["pnl"] = round(a["pnl"] + (t["pnl"] or 0.0), 2)
+        for o in rows["orders"]:
+            a = per.setdefault(o["name"], {"name": o["name"], "trades": 0, "pnl": 0.0, "missed": 0, "rejected": 0})
+            if o["state"] in ("missed", "rejected"):
+                a[o["state"]] += 1
+        total = round(sum(a["pnl"] for a in per.values()), 2)
+        widgets: list[dict[str, Any]] = [
+            pw.stat("Copy P&L", total, format="money", health="ok" if total >= 0 else "warn", hint=day_label(day),
+                    id="pnl"),
+            pw.table([pw.column("name", "Account"), pw.column("trades", "Trades", "number"),
+                      pw.column("pnl", "P&L $", "money"), pw.column("missed", "Missed", "number"),
+                      pw.column("rejected", "Rejected", "number")], sorted(per.values(), key=lambda a: a["name"]),
+                     id="accounts", title="Accounts")]  # fmt: skip
+        if rows["missed"]:
+            widgets.append(_missed_table(rows["missed"], f"Missed and rejected ({len(rows['missed'])})"))
+        if rows["halts"]:
+            widgets.append(_halts_table(rows["halts"]))
+        if rows["trades"]:
+            widgets.append(_trades_table(rows["trades"]))
+        last = conn.execute("SELECT MAX(t_ns) FROM copy_events WHERE day=?", (day,)).fetchone()[0]
+        t = datetime.fromtimestamp(last / 1e9, timezone.utc) if last else now
+        health = "bad" if any(not h["cleared_ns"] for h in rows["halts"]) else None
+    finally:
+        if conn is not None:
+            conn.close()
+    return pw.panel([pw.view("today", day_label(day), widgets)], updated_at=t, health=health)
+
+
+def cmd_copy(cfg: Config, now: datetime, date_arg: str | None = None) -> dict[str, Any]:
+    """The ``copy`` dashboard panel (Copy accounts): per-account position, P&L, entries and state; missed and
+    rejected entries; halts; token health. A stale status row says the daemon is down."""
+    day = archive_day(date_arg, now)
+    if day is not None:
+        return copy_day_panel(cfg, now, day)
+    conn = copy_connect(cfg)
+    try:
+        if conn is None:
+            view, health = pw.view("today", "Copy accounts", [pw.text("no copy accounts", id="none")]), None
+        else:
+            view, health = copy_live_view(conn, now)
+    finally:
+        if conn is not None:
+            conn.close()
+    return pw.panel([view], updated_at=now, health=health)
+
+
+def _copy_accounts_enabled(cfg: Config) -> bool:
+    try:
+        return re.search(r"^[ \t-]*enabled:[ \t]*true", cfg.copy_accounts_path.read_text(), re.M | re.I) is not None
+    except OSError:
+        return False
+
+
+def copy_port_of(cfg: Config) -> int:
+    """The daemon's port: an explicit ``copy_port`` in config.json, else accounts.yaml's ``port:`` (the one place the
+    daemon and run_paper_day.sh read it too), else the default."""
+    if cfg.copy_port is not None:
+        return cfg.copy_port
+    try:
+        m = re.search(r"^port:[ \t]*(\d+)", cfg.copy_accounts_path.read_text(), re.M)
+    except OSError:
+        m = None
+    return int(m.group(1)) if m and 1 <= int(m.group(1)) <= 65535 else DEFAULT_COPY_PORT
+
+
+def cmd_copy_watch(cfg: Config, now: datetime) -> dict[str, Any]:
+    """Every 5 min: report each new ``notify=1`` copy event (the daemon's texts) as an urgent item, and an urgent
+    ``trade-jev/copy/daemon/down/<day>`` when accounts are enabled but the daemon isn't publishing during market
+    hours. The last event id and the down state are remembered in watch_state.json. The two checks are isolated."""
+    out: dict[str, Any] = {}
+    try:
+        out["events"] = _copy_events_check(cfg, now)
+    except Exception as e:  # noqa: BLE001
+        out["events"] = {"error": type(e).__name__}
+    try:
+        out["daemon"] = _copy_daemon_check(cfg, now)
+    except Exception as e:  # noqa: BLE001
+        out["daemon"] = {"error": type(e).__name__}
+    return out
+
+
+def _copy_events_check(cfg: Config, now: datetime) -> dict[str, Any]:
+    state_path = data_dir() / WATCH_STATE
+    conn = copy_connect(cfg)
+    if conn is None:
+        return {"checked": False, "reason": "no copy.db"}
+    try:
+        st = _read_state(state_path).get("copy") or {}
+        last = st.get("last_id")
+        today = now.astimezone(ET).date().isoformat()
+        if last is None:  # first run: only today's events, never a flood of history
+            rows = conn.execute("SELECT * FROM copy_events WHERE notify=1 AND day=? ORDER BY id", (today,)).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM copy_events WHERE notify=1 AND id>? ORDER BY id", (last,)).fetchall()
+        newest = conn.execute("SELECT COALESCE(MAX(id), 0) FROM copy_events").fetchone()[0]
+    finally:
+        conn.close()
+    for r in rows:
+        report(f"trade-jev/copy/{_slug(r['name'])}/{_slug(r['kind'])}/{r['day']}",
+               f"Copy {r['name']}: {clip(r['detail'], 110) or r['kind']}", urgency="urgent",
+               state={"id": r["id"]}, ttl="12h")  # fmt: skip
+    _write_state(state_path, {"copy": {**st, "last_id": max(newest, last or 0)}})
+    return {"checked": True, "reported": len(rows)}
+
+
+def _copy_daemon_check(cfg: Config, now: datetime) -> dict[str, Any]:
+    et = now.astimezone(ET)
+    day = et.date().isoformat()
+    if not is_trading_day(et.date(), cfg) or not COPY_DOWN_FROM <= et.time() <= COPY_DOWN_UNTIL:
+        return {"checked": False, "summary": "outside market hours"}
+    if not _copy_accounts_enabled(cfg):
+        return {"checked": False, "summary": "no enabled copy accounts"}
+    conn = copy_connect(cfg)
+    fresh = False
+    try:
+        if conn is not None:
+            rows = conn.execute("SELECT updated_at FROM copy_status").fetchall()
+            ts = [parse_ts(r["updated_at"]) for r in rows]
+            fresh = any(t is not None and (now - t).total_seconds() <= COPY_STALE_S for t in ts)
+    finally:
+        if conn is not None:
+            conn.close()
+    state_path = data_dir() / WATCH_STATE
+    st = _read_state(state_path).get("copy") or {}
+    key = f"trade-jev/copy/daemon/down/{day}"
+    if not fresh:
+        report(key, "Copy trading daemon down: no status from it (com.tradejev.copy)", urgency="urgent",
+               state={"day": day}, ttl="12h")  # fmt: skip
+        _write_state(state_path, {"copy": {**st, "down": day}})
+        return {"checked": True, "down": True}
+    if st.get("down"):
+        report(f"trade-jev/copy/daemon/down/{st['down']}", "Copy trading daemon healthy again", urgency="urgent",
+               clear=True, state={"day": day})  # fmt: skip
+        _write_state(state_path, {"copy": {**st, "down": None}})
+        return {"checked": True, "down": False, "cleared": True}
+    return {"checked": True, "down": False}
+
+
+def cmd_copy_flatten_all(cfg: Config, now: datetime) -> dict[str, Any]:
+    """Halt every copy account for the ET day and flatten it, through the copy daemon (POST /flatten-all with its
+    header). Daemon down: a clean failure (exit 1, nothing was sent); the terminal fallback is
+    ``python -m trade_jev.copytrade flatten-all --direct``. A timeout may have gone through: exit 0, "unknown"."""
+    url = f"http://127.0.0.1:{copy_port_of(cfg)}/flatten-all"
+    req = urllib.request.Request(url, b"{}", {"Content-Type": "application/json", COPY_HEADER: "flatten-all"})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(req, timeout=COPY_FLATTEN_TIMEOUT_S) as r:
+            body = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        if e.code == 504:  # the daemon's own timeout: the flatten is probably in progress
+            return {"flattened": "unknown", "reason": "daemon timed out",
+                    "summary": "flatten-all timed out inside the daemon; check the copy panel"}  # fmt: skip
+        raise Fail(f"copy daemon refused flatten-all (HTTP {e.code}); nothing was done") from None
+    except TimeoutError:
+        return {"flattened": "unknown", "reason": "timed out",
+                "summary": "flatten-all timed out; check the copy panel"}  # fmt: skip
+    except urllib.error.URLError as e:
+        if isinstance(e.reason, TimeoutError):
+            return {"flattened": "unknown", "reason": "timed out",
+                    "summary": "flatten-all timed out; check the copy panel"}  # fmt: skip
+        raise Fail("copy daemon is not reachable; with it down run on the Mini: "
+                   "python -m trade_jev.copytrade flatten-all --direct") from None
+    except (OSError, ValueError):
+        raise Fail("copy daemon answer unreadable; check the copy panel") from None
+    accounts = body.get("accounts") if isinstance(body, dict) else None
+    if not isinstance(accounts, dict):
+        raise Fail("copy daemon answer unreadable; check the copy panel")
+    bad = {k: v for k, v in accounts.items() if v != "flat"}
+    return {"flattened": not bad, "accounts": {str(k): clip(v, 60) for k, v in accounts.items()},
+            "summary": ("flattened and halted for today: " + ", ".join(sorted(accounts))) if not bad
+            else "flatten-all did not confirm flat: " + ", ".join(f"{k} {clip(v, 40)}" for k, v in sorted(bad.items()))}  # fmt: skip
+
+
 # --- main -------------------------------------------------------------------------------------
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="cli.py")
     sub = p.add_subparsers(dest="cmd", required=True)
-    for name in ("status", "start", "stop", "health", "recover", "close-summary", "watch"):
+    for name in ("status", "start", "stop", "health", "recover", "close-summary", "watch", "copy-watch",
+                 "copy-flatten-all"):
         sub.add_parser(name)
     pnl = sub.add_parser("pnl")
     pnl.add_argument("--date", default="")
@@ -2082,7 +2437,7 @@ def build_parser() -> argparse.ArgumentParser:
     dec.add_argument("--date", default="")
     dec.add_argument("--limit", type=int, default=0)
     pan = sub.add_parser("panel")
-    pan.add_argument("name", choices=["paper", "chart"])
+    pan.add_argument("name", choices=["paper", "chart", "copy"])
     pan.add_argument("--date", default=None)  # PER-287: a past ET day's archived view
     return p
 
@@ -2091,7 +2446,8 @@ def run(argv: list[str], now: datetime | None = None) -> dict[str, Any]:
     args = build_parser().parse_args(argv)
     cfg = load_config()
     if args.cmd == "panel":
-        return (cmd_chart if args.name == "chart" else cmd_panel)(cfg, now or now_utc(), args.date)
+        panels = {"paper": cmd_panel, "chart": cmd_chart, "copy": cmd_copy}
+        return panels[args.name](cfg, now or now_utc(), args.date)
     if args.cmd == "pnl":
         return cmd_pnl(cfg, now or now_utc(), args.date)
     if args.cmd == "trades":
@@ -2103,7 +2459,8 @@ def run(argv: list[str], now: datetime | None = None) -> dict[str, Any]:
         # close-summary reports the day it was due for; watch is about right now.
         return fn(cfg, now or (job_now() if args.cmd == "close-summary" else now_utc()))
     fn = {"status": cmd_status, "start": cmd_start, "stop": cmd_stop, "health": cmd_health,
-          "recover": cmd_recover}[args.cmd]  # fmt: skip
+          "recover": cmd_recover, "copy-watch": cmd_copy_watch,
+          "copy-flatten-all": cmd_copy_flatten_all}[args.cmd]  # fmt: skip
     return fn(cfg, now or now_utc())
 
 

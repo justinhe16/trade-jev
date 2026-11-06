@@ -194,3 +194,42 @@ def test_intents_follow_the_jev_paper_trades():
     assert [i["target"] for i in entries] == [t.side for t in trades]                # one per trade
     assert [i["paper_fill_px"] for i in entries] == [t.entry_px for t in trades]
     assert all(i["ref"]["ask"] is not None and i["mode"] == "replay" for i in intents)
+
+
+# ---- copy trading (additive message fields; paper unchanged)
+
+def _session(exec_url=None):
+    from trade_jev.live import Session
+    b = synthetic()
+    cfg = Config(cadence_s=5, start_et="09:30:00", end_et="09:35:00", stop_ticks=6, target_ticks=8)
+    return Session(None, cfg, Settings(0.6, 2, 0, 6, 8), DAY, "NQU6", MemSource(b), Script(), [], None, None, exec_url)
+
+
+def test_intents_and_heartbeats_carry_a_boot_id_and_the_quote():
+    s = _session()
+    hb0 = s.heartbeat()
+    assert hb0["bid"] is None and hb0["ask"] is None and hb0["seq_last"] == 0   # None-safe before the first quote
+    asyncio.run(s.run())
+    boots = {i["boot"] for i in s.intents}
+    assert boots == {s.boot} and len(s.boot) == 32 and int(s.boot, 16) >= 0
+    hb = s.heartbeat()
+    assert hb["boot"] == s.boot and hb["seq_last"] == len(s.intents)
+    assert hb["bid"] == s.quote["bid"] * TICK and hb["ask"] == s.quote["ask"] * TICK
+    assert _session().boot != s.boot                       # a new process (session) is a new boot
+    assert {"type", "seq_last", "target", "armed", "status", "mode", "sent_wall_ns"} <= set(hb)   # old fields stay
+
+
+def test_a_dead_exec_url_leaves_the_paper_session_identical():
+    import socket
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        dead = f"http://127.0.0.1:{sock.getsockname()[1]}"      # nothing listens here
+    plain, linked = _session(), _session(dead)
+    asyncio.run(plain.run())
+    asyncio.run(linked.run())
+    key = lambda s: [(t.side, t.entry_px, t.exit_px, t.reason, round(t.pnl, 6))  # noqa: E731
+                     for t in s.engine.results[s.engine.jev_name].trades]
+    assert key(plain) == key(linked) and len(key(plain)) > 3
+    strip = lambda s: [{k: v for k, v in i.items() if k not in ("sent_wall_ns", "boot")}  # noqa: E731
+                       for i in s.intents]
+    assert strip(plain) == strip(linked)

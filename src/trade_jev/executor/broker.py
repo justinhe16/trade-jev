@@ -18,6 +18,7 @@ class Position:
     side: int = 0        # +1 long, -1 short, 0 flat
     qty: int = 0
     avg_px: float | None = None
+    contract: str | None = None   # copy trading: the contract the position is in (None when unknown)
 
 
 @dataclass
@@ -27,6 +28,9 @@ class Ack:
     ack_ms: float = 0.0
     error: str | None = None
     dry: bool = False    # dry-run: nothing was clicked
+    missed: bool = False     # copy trading: a normal miss (no fill at the limit): not an error, never a halt
+    rejected: bool = False   # copy trading: the broker refused the order
+    info: dict | None = None  # copy trading: entry details (qty, tp_px, sl_px, order ids)
 
 
 @dataclass
@@ -63,6 +67,10 @@ class FakeBroker:
     last_px: float | None = None
     fill_px: float | None = None
     fail_next: set[str] = field(default_factory=set)
+    miss_next: bool = False          # the next entry gets no fill (Ack.missed)
+    flip_on_flatten: bool = False    # the next flatten leaves the opposite position (a bracket fill racing it)
+    last_exit: tuple[float, str] | None = None   # (px, "target" | "stop" | "flatten") of the last close
+    symbol: str | None = None
     calls: list[tuple] = field(default_factory=list)
 
     def _fail(self, op: str) -> Ack | None:
@@ -71,7 +79,7 @@ class FakeBroker:
             return Ack(False, error=f"injected {op} failure")
         return None
 
-    async def position(self) -> Position:
+    async def position(self, fresh: bool = False) -> Position:
         self.calls.append(("position",))
         if (a := self._fail("position")) is not None:
             raise RuntimeError(a.error)
@@ -93,6 +101,9 @@ class FakeBroker:
         t0 = time.monotonic()
         if (a := self._fail("enter")) is not None:
             return a
+        if self.miss_next:
+            self.miss_next = False
+            return Ack(False, error="no fill at the limit", missed=True)
         px = self.fill_px if self.fill_px is not None else limit_px
         self.pos = Position(side, qty, px)
         self.realized -= self.commission * qty
@@ -100,8 +111,9 @@ class FakeBroker:
         self.last_px = px
         return Ack(True, px, (time.monotonic() - t0) * 1000)
 
-    def _close(self, px: float) -> None:
+    def _close(self, px: float, why: str = "flatten") -> None:
         p = self.pos
+        self.last_exit = (px, why)
         self.realized += (px - p.avg_px) * p.side * self.point_value * p.qty - self.commission * p.qty
         self.pos, self.bracket, self.last_px = Position(), None, px
 
@@ -112,17 +124,41 @@ class FakeBroker:
         if not self.pos.side:
             return Ack(True)
         px = self.last_px if self.last_px is not None else self.pos.avg_px
+        side, qty = self.pos.side, self.pos.qty
         self._close(px)
+        if self.flip_on_flatten:
+            self.flip_on_flatten = False
+            self.pos = Position(-side, qty, px)
         return Ack(True, px)
 
     async def healthy(self) -> tuple[bool, str | None]:
         return True, None
 
     def hit_stop(self) -> None:
-        self._close(self.bracket[0])
+        self._close(self.bracket[0], "stop")
 
     def hit_target(self) -> None:
-        self._close(self.bracket[1])
+        self._close(self.bracket[1], "target")
+
+    # -- copy trading extras (the CopyExecutor drives these on any broker)
+
+    def set_symbol(self, symbol: str) -> None:
+        self.symbol = symbol
+
+    async def orders(self, fresh: bool = False) -> list[dict]:
+        return await self.working_orders() if self.pos.side else []
+
+    async def sweep(self) -> bool:
+        self.calls.append(("sweep",))
+        if not self.pos.side:
+            self.bracket = None
+        return True
+
+    async def exit_info(self, trade: dict) -> tuple[float, str] | None:
+        return self.last_exit
+
+    async def cash_realized(self, day: str | None = None) -> float | None:
+        return None
 
 
 class DryRun:
@@ -132,14 +168,30 @@ class DryRun:
     def __init__(self, inner):
         self.inner, self.name, self.dry = inner, f"dry-run({inner.name})", True
 
-    async def position(self):
-        return await self.inner.position()
+    async def position(self, fresh=False):
+        return await self.inner.position(fresh)
 
     async def working_orders(self):
         return await self.inner.working_orders()
 
     async def account(self):
         return await self.inner.account()
+
+    def set_symbol(self, symbol):
+        if hasattr(self.inner, "set_symbol"):
+            self.inner.set_symbol(symbol)
+
+    async def orders(self, fresh=False):
+        return await self.inner.orders(fresh) if hasattr(self.inner, "orders") else []
+
+    async def sweep(self):
+        return True   # dry: nothing was ever placed
+
+    async def exit_info(self, trade):
+        return None
+
+    async def cash_realized(self, day=None):
+        return None
 
     async def healthy(self):
         return await self.inner.healthy()

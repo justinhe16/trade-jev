@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Copy-trading daemon: each account in accounts.yaml mirrors Jev's paper position changes. Listens on
+     127.0.0.1:8768 (accounts.yaml `port`), writes data/copy.db, flattens on Resonant's kill switch.
+     A restart in a position flattens it (startup rule). Installed by scripts/install_launchd.sh ONLY when
+     accounts.yaml exists (fills in __UV__). caffeinate -i: no idle sleep while it runs. Never started by tests. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.tradejev.copy</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/caffeinate</string>
+        <string>-i</string>
+        <string>__UV__</string>
+        <string>run</string>
+        <string>--frozen</string>
+        <string>python</string>
+        <string>-m</string>
+        <string>trade_jev.copytrade</string>
+        <string>run</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/justinhe/trade-jev</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__UV_DIR__:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>StandardOutPath</key>
+    <string>/Users/justinhe/trade-jev/logs/copy.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/justinhe/trade-jev/logs/copy.log</string>
+</dict>
+</plist>

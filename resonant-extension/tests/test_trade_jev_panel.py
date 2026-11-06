@@ -255,6 +255,12 @@ res = {"panel": {"id": p.id, "command": list(p.command), "max_bytes": p.max_byte
                  "idle": p.refresh.idle, "active": p.refresh.active, "tz": p.tz}, "runs": {}}
 for f in sys.argv[4:]:
     raw = json.loads(Path(f).read_text())
+    if raw.get("none") is True and "PanelNone" in schema.get("$defs", {}):   # the `none` output has its own def
+        from resonant_sdk.panel_schema import is_none
+        jsonschema.validate(raw, {"$ref": "#/$defs/PanelNone", "$defs": schema["$defs"]})
+        assert is_none(raw)   # the scheduler checks is_none() before normalize(), which only takes real panels
+        res["runs"][Path(f).stem] = {"truncated": False, "bytes": 0}
+        continue
     jsonschema.validate(raw, schema)
     n = normalize(raw, max_bytes=p.max_bytes, tools=tools, ran_at=datetime.now(UTC))
     res["runs"][Path(f).stem] = (

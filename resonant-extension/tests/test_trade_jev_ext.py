@@ -1020,7 +1020,7 @@ def test_close_summary_stale_at_the_close_says_so(db: PaperDB, reports) -> None:
 
 # --- manifest ------------------------------------------------------------------------------
 
-AGENTS = ("com.tradejev.paper", "com.tradejev.view", "com.tradejev.tvtoken")
+AGENTS = ("com.tradejev.paper", "com.tradejev.view", "com.tradejev.tvtoken", "com.tradejev.copy")
 
 
 def test_manifest_display_metadata_stdlib() -> None:
@@ -1029,7 +1029,7 @@ def test_manifest_display_metadata_stdlib() -> None:
     text = (EXT_DIR / "resonant.yaml").read_text()
     assert "  trade_jev_decisions:\n" in text
     jobs = text.split("\njobs:\n", 1)[1].split("\npanels:", 1)[0]
-    assert jobs.count("  - id: ") == jobs.count("    description: ") == 2
+    assert jobs.count("  - id: ") == jobs.count("    description: ") == 3
     plists = {p.stem for p in (EXT_DIR.parent / "deploy" / "launchd").glob("*.plist")}
     assert plists == set(AGENTS)
     for label in AGENTS:
@@ -1063,7 +1063,7 @@ def test_manifest_validates_against_the_resonant_sdk(tmp_path: Path) -> None:
     assert proc.returncode == 0, proc.stderr[-2000:]
     m = json.loads(proc.stdout.strip().splitlines()[-1])
     assert "trade_jev_decisions" in m["tools"]
-    assert set(m["jobs"]) == {"close-summary", "watch"} and all(m["jobs"].values())
+    assert set(m["jobs"]) == {"close-summary", "watch", "copy-watch"} and all(m["jobs"].values())
     assert set(m["agents"]) == set(AGENTS) and all(m["agents"].values())
     assert all(n <= 300 for n in m["tool_desc"].values())
 

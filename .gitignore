@@ -28,3 +28,8 @@ logs/
 # Tradovate token mode: the token store, its status file, lock and temp files (secrets)
 data/tradovate_token*
 data/.tradovate_token*
+
+# copy trading: the account list (account ids, limits), its SQLite DB and per-account token stores (secrets)
+accounts.yaml
+data/copy.db*
+data/copy/

@@ -1,0 +1,25 @@
+# Copy trading. Copy to accounts.yaml (gitignored) to turn it on. Absent file = no copy trading at all and
+# the paper session behaves exactly as before. Paper trading (main TRADOVATE_* creds, 1 NQ, never places an
+# order) stays the signal source; every enabled account below mirrors Jev's paper position changes at its own
+# contract and size, with the same TP/SL points. See README "Copy trading".
+#
+# Manual trading on these accounts is not supported: the daemon flattens any position it did not open.
+
+kill_status_url: http://127.0.0.1:7777/api/status   # Resonant's status (paused, autonomy); polled every 3 s
+port: 8768                                          # the daemon's loopback port (paper posts intents here)
+
+accounts:
+  - name: mff-1                # unique; used in the DB, the token store path and the texts
+    enabled: true              # false = ignored (and paper omits --exec-url when none are enabled)
+    mode: dry_run              # dry_run (default: records "would enter", no orders) | demo | live
+    env: demo                  # demo | live; mode live requires env live, mode demo requires env demo
+    account_id: 0              # Tradovate numeric account id (preflight prints it)
+    root: MNQ                  # MNQ | NQ (the intent's NQZ6 becomes MNQZ6)
+    qty: 5                     # contracts
+    daily_loss_limit: 1000     # flatten and halt for the ET day at realized + open <= -1000 ($)
+    daily_profit_stop: 490     # flatten and halt for the ET day at realized + open >= +490 ($)
+    commission: 0.5            # $ per contract per side, for the ledger's P&L
+    # tp_points: 25            # optional: override the paper TP (points); default the paper session's
+    # sl_points: 50            # optional: override the paper SL (points)
+    # slip_ticks: 4            # optional: entry limit = touch +/- this many ticks (default 4 = 1 point)
+    secrets_prefix: COPY_MFF1  # credentials come from COPY_MFF1_* in .env (never TRADOVATE)

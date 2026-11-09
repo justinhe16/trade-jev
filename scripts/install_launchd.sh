@@ -33,7 +33,14 @@ for name in $AGENTS; do
     sed -e "s#__UV__#$UV#g" -e "s#__UV_DIR__#$(dirname "$UV")#g" "$REPO/deploy/launchd/$name.plist" > "$DEST/$name.plist"
     plutil -lint "$DEST/$name.plist"
     launchctl bootout "$DOMAIN/$name" 2>/dev/null || true
-    launchctl bootstrap "$DOMAIN" "$DEST/$name.plist"
+    # bootout returns before the old job is gone; bootstrapping too soon fails with "5: Input/output error"
+    for _ in $(seq 20); do launchctl print "$DOMAIN/$name" >/dev/null 2>&1 || break; sleep 0.5; done
+    ok=""
+    for _ in 1 2 3 4 5; do
+        if launchctl bootstrap "$DOMAIN" "$DEST/$name.plist" 2>/dev/null; then ok=1; break; fi
+        sleep 1
+    done
+    [ -n "$ok" ] || launchctl bootstrap "$DOMAIN" "$DEST/$name.plist"   # last try, error shown
     echo "loaded $name"
 done
 echo "uv: $UV"

@@ -121,6 +121,19 @@ def test_preflight_is_read_only(env, capsys):
     assert run(env, ["preflight", "a1"]) == 1
 
 
+def test_preflight_lists_the_accounts_when_the_id_is_wrong(env, capsys):
+    rc = run(env, ["preflight", "a1"], [account(account_id=12345)])
+    out = capsys.readouterr().out
+    assert rc == 1 and "FAIL account/list" in out and f"INFO account_id {ACCT_ID} name DEMO11" in out
+    assert {c[0] for c in env["fake"].calls} == {"GET"}
+
+
+def test_rehearse_flat_check_reads_the_side(env, capsys):
+    answers = iter(["a1", "24500.25", "MNQZ6"])
+    run(env, ["rehearse", "a1"], isatty=True, ask=lambda prompt: next(answers), sleep=lambda s: None)
+    assert "PASS flat before" in capsys.readouterr().out
+
+
 def test_status_prints_rows(env, capsys):
     assert run(env, ["status"]) == 0 and "no copy status rows" in capsys.readouterr().out
     Ledger(env["db"]).status({"name": "a1", "mode": "demo", "env": "demo", "root": "MNQ", "qty": 5, "pos_side": 0,

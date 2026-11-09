@@ -26,7 +26,7 @@ from pathlib import Path
 
 from trade_jev import tradovate_token as tt
 from trade_jev.copytrade import config as cfgmod
-from trade_jev.copytrade.broker import NullBroker, TradovateBroker, make_http
+from trade_jev.copytrade.broker import NullBroker, TradovateBroker, _rows, make_http
 from trade_jev.copytrade.daemon import FLATTEN_ALL_HEADER, AlreadyRunning, Daemon, lock_held, take_lock, db_kill_status
 from trade_jev.copytrade.ledger import Ledger, et_day
 from trade_jev.copytrade.tokens import AccountKeepalive, RenewBudget
@@ -168,6 +168,11 @@ def cmd_preflight(cfg, ledger, directory, name, symbol=None, http_factory=None, 
         except Exception as e:  # noqa: BLE001
             ok = False
             _print(f"FAIL account/list: {broker._red(e)}")
+            try:   # show what this token can see, so the owner can set account_id
+                for r in _rows(await broker._call("GET", "/account/list")):
+                    _print(f"INFO account_id {r.get('id')} name {r.get('name')} active {r.get('active')} ({a.env})")
+            except Exception:  # noqa: BLE001
+                pass
         t0 = time.monotonic()
         try:   # /order/list returns the account's whole history: time it against the 4.5 s call timeout
             d = await broker._call("GET", "/order/list")
@@ -220,7 +225,7 @@ def cmd_rehearse(cfg, ledger, directory, name, *, isatty=None, ask=input, http_f
     async def go():
         broker.set_symbol(sym)
         try:
-            check("flat before", not await broker.position(True))
+            check("flat before", not (await broker.position(True)).side)
             ack = await broker.enter(1, 1, px + 1.0, 40, 40)       # 10 pt TP and SL, marketable IOC limit
             check("OSO entry with IOC parent accepted and filled", ack.ok, str(ack.error or ""))
             if ack.ok:

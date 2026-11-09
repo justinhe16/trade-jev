@@ -2326,6 +2326,18 @@ def cmd_copy_watch(cfg: Config, now: datetime) -> dict[str, Any]:
     return out
 
 
+def _copy_tone(r: sqlite3.Row) -> str | None:
+    """``good`` for the daily PROFIT stop halt (good news, shown green); None for everything else.
+
+    No structured field tells the two stops apart: both are a ``halt`` event with halt kind
+    ``day`` and exit_reason ``daily_stop`` (the exit reason isn't in copy_events). The detail is
+    ``day: <reason>`` and the profit reason starts ``daily profit stop`` (executor.py), so this
+    narrow match is deliberate. The loss stop, and every other halt, stay red.
+    """
+    detail = str(r["detail"] or "")
+    return "good" if r["kind"] == "halt" and detail.startswith("day: daily profit stop") else None
+
+
 def _copy_events_check(cfg: Config, now: datetime) -> dict[str, Any]:
     state_path = data_dir() / WATCH_STATE
     conn = copy_connect(cfg)
@@ -2345,7 +2357,7 @@ def _copy_events_check(cfg: Config, now: datetime) -> dict[str, Any]:
     for r in rows:
         report(f"trade-jev/copy/{_slug(r['name'])}/{_slug(r['kind'])}/{r['day']}",
                f"Copy {r['name']}: {clip(r['detail'], 110) or r['kind']}", urgency="urgent",
-               state={"id": r["id"]}, ttl="12h")  # fmt: skip
+               state={"id": r["id"]}, ttl="12h", tone=_copy_tone(r))  # fmt: skip
     _write_state(state_path, {"copy": {**st, "last_id": max(newest, last or 0)}})
     return {"checked": True, "reported": len(rows)}
 

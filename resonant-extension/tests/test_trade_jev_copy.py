@@ -261,6 +261,16 @@ def test_events_are_reported_once_and_deduped_by_id(copy_db: CopyDB, reports: li
     assert st["copy"]["last_id"] == 4
 
 
+def test_only_the_daily_profit_stop_is_good_news(copy_db: CopyDB, reports: list[dict[str, Any]]) -> None:
+    copy_db.event(TUE, "10:00", "halt", "day: daily profit stop (+$490) hit at $492.20", name="mff-1", notify=True)
+    copy_db.event(TUE, "10:01", "halt", "day: daily loss limit (-$490) hit at $-492.20", name="mff-2", notify=True)
+    copy_db.event(TUE, "10:02", "halt", "day: 3 rejected entries in a row: x", name="mff-3", notify=True)
+    copy_db.event(TUE, "10:03", "rejected", "daily profit stop mentioned elsewhere", name="mff-4", notify=True)
+    assert watch(NOW)["events"]["reported"] == 4
+    assert [r.get("tone") for r in reports] == ["good", None, None, None]
+    assert all(r["urgency"] == "urgent" for r in reports)
+
+
 def test_a_report_key_is_always_legal(copy_db: CopyDB, reports: list[dict[str, Any]]) -> None:
     from emit import report as real_report  # the SDK's own validation of key and state
 

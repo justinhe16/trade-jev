@@ -79,6 +79,7 @@ def report(
     clear: bool = False,
     ttl: str = "24h",
     quiet: bool = False,
+    tone: str | None = None,
 ) -> bool:
     """Report a pulse item. False when not running under Resonant (no events fd).
 
@@ -87,6 +88,8 @@ def report(
     the thing is over; a clear, like an urgency change, always counts as news, and is
     then dropped. ``quiet=True``: nothing to say (all-zero counts, an empty section); the
     item is closed silently and left out of the briefing and the pulse, never sent.
+    ``tone="good"`` (the only value with an effect) shows an urgent item's marker green, for good
+    news; it changes nothing else.
     ``state`` is at most 2,000 bytes of JSON. Every call gets a unique
     dedupe key, so a repeat is never dropped at ingest: Resonant decides whether it is news.
     """
@@ -112,5 +115,7 @@ def report(
         "ttl": ttl,
         "quiet": quiet,
     }
+    if tone is not None:  # older Resonant ignores unknown data keys
+        data["tone"] = tone
     # `item:` + key (<= 120) + `:` + time_ns in hex (<= 16) stays well under the 200 limit.
     return emit("item", title, f"item:{key}:{time.time_ns():x}", data)

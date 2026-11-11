@@ -281,7 +281,7 @@ class CopyExecutor(Executor):
         except Exception as e:  # noqa: BLE001
             self._read_failed(e)
             raise
-        self._read_ok(fresh)
+        self._read_ok(fresh)       # only a fresh read starts the auto-resume clock; any success ends a failure episode
         self.pos_cache = pos
         return pos
 
@@ -733,7 +733,7 @@ class CopyExecutor(Executor):
             await self._flatten("connection back, not flat", "flatten")
             return
         try:
-            live = await self.broker.working_orders()
+            live = await self.broker.orders(True)
         except Exception as e:  # noqa: BLE001
             self._read_failed(e)
             return
@@ -741,7 +741,7 @@ class CopyExecutor(Executor):
             self._good_since = None
             return
         held = self.mono() - (self._good_since if self._good_since is not None else self.mono())
-        ok = (self.clean and not self.link_lost and self.hb_ok and self.mono() - self.last_rx <= HEARTBEAT_LOST_S
+        ok = (self.clean and self.kill == "clear" and not self.link_lost and self.hb_ok and self.mono() - self.last_rx <= HEARTBEAT_LOST_S
               and (getattr(self.broker, "dry", False) or (self.token_ok and not getattr(self.broker, "auth_failed", False))))
         if held < AUTO_RESUME_AFTER_S or not ok:
             return
@@ -755,6 +755,10 @@ class CopyExecutor(Executor):
         self.ledger.clear_halts(self.acct.name, self.day, "connection")
         self._refresh_day()
         self.alert, self._good_since = None, None
+        self._last_cash = -1e9
+        await self._check_stops()          # a stop breached during the outage halts again at once, no "resumed" text
+        if self.day_halt_row:
+            return
         self.event("auto_resume", f"connection back for {held / 60:.0f} min: resumed ({n + 1} of {MAX_AUTO_RESUMES} today)",
                    True)
 

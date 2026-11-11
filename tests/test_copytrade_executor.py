@@ -779,3 +779,13 @@ def test_a_real_halt_is_not_hidden_or_cleared_by_a_connection_halt(tmp_path):
     tick(r, 5, 80)
     assert r.ex.halted and r.ex.halt_kind == "day" and not r.events("auto_resume")
     assert r.ledger.clear_halts("a1", DAY, "connection") == 1 and r.ledger.active_halt("a1", DAY)["kind"] == "day"
+
+
+def test_a_stop_breached_during_the_outage_halts_again_instead_of_resuming(tmp_path):
+    r = Rig(tmp_path, broker=NetBroker(), daily_loss_limit=100.0)
+    r.start()
+    t = r.ledger.trade_open("a1", DAY, BOOT1, 1, "MNQZ6", "long", 5, r.clk.ns, 20000.0, None, None)
+    r.ledger.trade_close(t, r.clk.ns, 19000.0, "stop", -1000.0, -2000.0, 5.0, -2005.0)
+    r.run(r.ex.halt_day("connection", "can't confirm flat: URLError"))
+    tick(r, 5, 62)
+    assert r.ex.halt_kind == "day" and not r.events("auto_resume")

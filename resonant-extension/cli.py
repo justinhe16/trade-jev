@@ -2327,7 +2327,8 @@ def cmd_copy_watch(cfg: Config, now: datetime) -> dict[str, Any]:
 
 
 def _copy_tone(r: sqlite3.Row) -> str | None:
-    """``good`` for the daily PROFIT stop halt (good news, shown green); None for everything else.
+    """``good`` for the daily PROFIT stop halt and for ``auto_resume`` (the daemon cleared a connection halt itself:
+    good news, shown green, still texted); None for everything else.
 
     No structured field tells the two stops apart: both are a ``halt`` event with halt kind
     ``day`` and exit_reason ``daily_stop`` (the exit reason isn't in copy_events). The detail is
@@ -2335,6 +2336,8 @@ def _copy_tone(r: sqlite3.Row) -> str | None:
     narrow match is deliberate. The loss stop, and every other halt, stay red.
     """
     detail = str(r["detail"] or "")
+    if r["kind"] == "auto_resume":
+        return "good"
     return "good" if r["kind"] == "halt" and detail.startswith("day: daily profit stop") else None
 
 
@@ -2352,12 +2355,18 @@ def _copy_events_check(cfg: Config, now: datetime) -> dict[str, Any]:
         else:
             rows = conn.execute("SELECT * FROM copy_events WHERE notify=1 AND id>? ORDER BY id", (last,)).fetchall()
         newest = conn.execute("SELECT COALESCE(MAX(id), 0) FROM copy_events").fetchone()[0]
+        halted = {(h["name"], h["day"]) for h in conn.execute("SELECT name, day FROM copy_halts WHERE cleared_ns IS NULL")}
     finally:
         conn.close()
     for r in rows:
         report(f"trade-jev/copy/{_slug(r['name'])}/{_slug(r['kind'])}/{r['day']}",
                f"Copy {r['name']}: {clip(r['detail'], 110) or r['kind']}", urgency="urgent",
                state={"id": r["id"]}, ttl="12h", tone=_copy_tone(r))  # fmt: skip
+        if r["kind"] == "auto_resume":  # the connection halt is over: close its items, unless another halt is still on
+            if (r["name"], r["day"]) not in halted:
+                for k in ("halt", "flatten_failed"):
+                    report(f"trade-jev/copy/{_slug(r['name'])}/{k}/{r['day']}", "Copy: connection halt cleared",
+                           urgency="urgent", clear=True)  # fmt: skip
     _write_state(state_path, {"copy": {**st, "last_id": max(newest, last or 0)}})
     return {"checked": True, "reported": len(rows)}
 

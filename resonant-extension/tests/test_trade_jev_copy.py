@@ -530,3 +530,23 @@ def test_enabled_true_is_case_insensitive(data_dir: Path, tmp_path: Path, copy_d
     for word in ("True", "TRUE"):
         enable(tmp_path, f"accounts:\n  - name: a\n    enabled: {word}\n")
         assert cli._copy_accounts_enabled(cli.load_config()) is True
+
+
+def test_auto_resume_is_texted_green_and_clears_the_connection_items(copy_db: CopyDB,
+                                                                     reports: list[dict[str, Any]]) -> None:
+    copy_db.event(TUE, "10:00", "flatten_failed", "URLError: nodename nor servname", notify=True)
+    copy_db.event(TUE, "10:05", "auto_resume", "connection back for 5 min: resumed (1 of 3 today)", notify=True)
+    assert watch(NOW)["events"]["reported"] == 2
+    f, a, *cleared = reports
+    assert f["urgency"] == "urgent" and f.get("tone") is None
+    assert a["key"] == f"trade-jev/copy/mff-1/auto_resume/{TUE}" and a["urgency"] == "urgent" and a["tone"] == "good"
+    assert {c["key"] for c in cleared if c.get("clear")} == {f"trade-jev/copy/mff-1/halt/{TUE}",
+                                                              f"trade-jev/copy/mff-1/flatten_failed/{TUE}"}
+
+
+def test_auto_resume_keeps_the_halt_item_while_another_halt_is_active(copy_db: CopyDB,
+                                                                      reports: list[dict[str, Any]]) -> None:
+    copy_db.halt(TUE, reason="daily loss limit")
+    copy_db.event(TUE, "10:05", "auto_resume", "connection back for 5 min: resumed (1 of 3 today)", notify=True)
+    assert watch(NOW)["events"]["reported"] == 1
+    assert len(reports) == 1 and reports[0]["tone"] == "good"

@@ -623,3 +623,169 @@ def test_status_row(rig):
     assert row["contract"] == "MNQZ6" and row["open_pnl"] == 10.0
     rig.ledger.status(row)
     assert rig.ledger.statuses()[0]["name"] == "a1"
+
+
+# ---------------------------------------------------------------- failed reads, connection halts, auto-resume
+
+DNS = "/position/list: TradovateError: URLError: <urlopen error [Errno 8] nodename nor servname provided, or not known>"
+
+
+class NetBroker(FakeBroker):
+    """FakeBroker whose reads fail like a DNS outage while `down`; `flat_down`: only the flatten read-back fails."""
+    down: bool = False
+    flat_down: bool = False
+
+    async def position(self, fresh=False):
+        if self.down:
+            self.calls.append(("position",))
+            raise RuntimeError(DNS)
+        return await super().position(fresh)
+
+    async def flatten(self):
+        if self.down or self.flat_down:
+            from trade_jev.executor.broker import Ack
+            return Ack(False, error=f"flatten read-back failed: {DNS}")
+        return await super().flatten()
+
+
+def tick(rig, s=5.0, n=1):
+    for _ in range(n):
+        rig.clk.advance(s)
+        rig.hb()
+        rig.run(rig.ex.watchdog_tick())
+
+
+def conn_halted(tmp_path, **kw):
+    """A flat account halted by a DNS-style flatten read-back failure, network still down."""
+    r = Rig(tmp_path, broker=NetBroker(), **kw)
+    r.start()
+    entered(r)
+    r.br.flat_down = True                              # paper exits mid-outage: the position read worked, the read-back not
+    r.intent(2, 0)
+    r.br.down, r.br.flat_down = True, False
+    assert r.ex.halt_kind == "connection" and r.ex.need_flat
+    return r
+
+
+def test_failed_reads_log_once_per_episode_and_a_recovery_line(tmp_path):
+    r = Rig(tmp_path, broker=NetBroker())
+    r.start()
+    r.br.down = True
+    for _ in range(4):
+        r.clk.advance(10)
+        r.hb()
+    (e,) = r.events("read_failed")
+    assert "nodename nor servname" in e["detail"] and not e["notify"] and r.ex.errors == 4
+    r.br.down = False
+    r.clk.advance(10)
+    r.hb()
+    (rec,) = r.events("reads_recovered")
+    assert rec["detail"] == "position reads recovered after 4 failures over 40s" and not rec["notify"]
+    r.br.down = True                                   # a new episode logs again
+    r.hb()
+    assert len(r.events("read_failed")) == 2
+
+
+def test_dns_flatten_readback_failure_is_a_connection_halt(tmp_path):
+    r = conn_halted(tmp_path)
+    assert r.ex.status_row()["halt_kind"] == "connection" and r.events("read_failed")
+
+
+def test_non_network_flatten_failure_stays_a_day_halt(rig):
+    entered(rig)
+    rig.br.fail_next.add("flatten")
+    rig.intent(2, 0)
+    assert rig.ex.halt_kind == "day"
+
+
+def test_auto_resume_after_five_minutes_of_good_reads(tmp_path):
+    r = conn_halted(tmp_path)
+    r.br.down = False
+    tick(r, 5)                                         # retry flattens (backoff elapsed), flat confirmed
+    assert r.br.pos.side == 0 and not r.ex.need_flat and r.ex.halted
+    tick(r, 5, 58)                                     # 290 s of good reads
+    assert r.ex.halted and not r.events("auto_resume")
+    tick(r, 5, 4)
+    assert not r.ex.halted and r.ex.gate_reason() is None
+    (e,) = r.events("auto_resume")
+    assert e["notify"] and "resumed" in e["detail"] and r.ledger.active_halt("a1", DAY) is None
+    assert r.intent(3, 1)["result"].startswith("entered")
+
+
+def test_a_failed_read_resets_the_clock(tmp_path):
+    r = conn_halted(tmp_path)
+    r.br.down = False
+    tick(r, 5, 50)                                     # ~250 s
+    r.br.down = True
+    tick(r, 5)
+    r.br.down = False
+    tick(r, 5, 55)                                     # 275 s since the failure: not yet
+    assert r.ex.halted and not r.events("auto_resume")
+    tick(r, 5, 10)
+    assert not r.ex.halted and len(r.events("auto_resume")) == 1
+
+
+def test_no_resume_while_not_flat_or_orders_live_or_link_down(tmp_path):
+    r = conn_halted(tmp_path)
+    r.br.down = False
+    tick(r, 5, 5)
+    r.br.pos = r.br.pos.__class__(1, 5, 20000.0)       # a position shows up while halted: flattened, clock restarts
+    r.br.bracket = (1.0, 2.0)
+    tick(r, 5, 1)
+    assert r.br.pos.side == 0 and r.ex._good_since is None
+    r.br.bracket = (1.0, 2.0)                          # orders still live on a flat account
+    tick(r, 5, 70)
+    assert r.ex.halted
+    r.br.bracket = None
+    r.ex.hb_ok = False                                 # paper link not live
+    for _ in range(70):
+        r.clk.advance(5)
+        r.run(r.ex.watchdog_tick())
+        r.ex.hb_ok = False
+    assert r.ex.halted and not r.events("auto_resume")
+
+
+def test_at_most_three_auto_resumes_a_day_and_the_cap_is_texted(tmp_path):
+    r = Rig(tmp_path, broker=NetBroker())
+    r.start()
+    for i in range(4):
+        r.run(r.ex.halt_day("connection", "can't confirm flat: URLError"))
+        tick(r, 5, 62)
+        assert bool(r.ex.halted) == (i == 3), i
+    assert len(r.events("auto_resume")) == 3
+    (cap,) = r.events("auto_resume_capped")
+    assert cap["notify"] and "clear-halts a1" in cap["detail"]
+    tick(r, 5, 70)
+    assert len(r.events("auto_resume_capped")) == 1    # one text, not one per probe
+
+
+@pytest.mark.parametrize("reason", ["daily loss limit", "daily profit stop", "3 rejected entries in a row",
+                                    "read-back mismatch", "partial fill could not be closed", "entry failed",
+                                    "max 3 entries reached", "worker crashed", "flatten-all"])
+def test_other_halts_never_auto_resume(tmp_path, reason):
+    r = Rig(tmp_path)
+    r.start()
+    r.run(r.ex.halt_day("day", reason))
+    tick(r, 5, 80)
+    assert r.ex.halted and not r.events("auto_resume") and r.ex.halt_kind == "day"
+
+
+def test_a_real_halt_is_not_hidden_or_cleared_by_a_connection_halt(tmp_path):
+    r = Rig(tmp_path, broker=NetBroker())
+    r.start()
+    r.run(r.ex.halt_day("connection", "can't confirm flat: URLError"))
+    r.run(r.ex.halt_day("day", "daily loss limit"))
+    assert r.ex.halt_kind == "day" and len(r.ledger.active_halts("a1", DAY)) == 2
+    tick(r, 5, 80)
+    assert r.ex.halted and r.ex.halt_kind == "day" and not r.events("auto_resume")
+    assert r.ledger.clear_halts("a1", DAY, "connection") == 1 and r.ledger.active_halt("a1", DAY)["kind"] == "day"
+
+
+def test_a_stop_breached_during_the_outage_halts_again_instead_of_resuming(tmp_path):
+    r = Rig(tmp_path, broker=NetBroker(), daily_loss_limit=100.0)
+    r.start()
+    t = r.ledger.trade_open("a1", DAY, BOOT1, 1, "MNQZ6", "long", 5, r.clk.ns, 20000.0, None, None)
+    r.ledger.trade_close(t, r.clk.ns, 19000.0, "stop", -1000.0, -2000.0, 5.0, -2005.0)
+    r.run(r.ex.halt_day("connection", "can't confirm flat: URLError"))
+    tick(r, 5, 62)
+    assert r.ex.halt_kind == "day" and not r.events("auto_resume")

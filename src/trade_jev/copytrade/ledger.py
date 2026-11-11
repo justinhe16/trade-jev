@@ -150,13 +150,22 @@ class Ledger:
         self._x("INSERT INTO copy_halts VALUES (?,?,?,?,?,NULL)", (name, day, kind, str(reason)[:300], self.now_ns()))
 
     def active_halt(self, name: str, day: str) -> sqlite3.Row | None:
-        r = self._q("SELECT * FROM copy_halts WHERE name=? AND day=? AND cleared_ns IS NULL ORDER BY t_ns LIMIT 1",
-                    (name, day))
+        """The halt that shows: a real one before a `connection` one (which never hides it), then the oldest."""
+        r = self.active_halts(name, day)
         return r[0] if r else None
 
-    def clear_halts(self, name: str, day: str) -> int:
-        return self._x("UPDATE copy_halts SET cleared_ns=? WHERE name=? AND day=? AND cleared_ns IS NULL",
-                       (self.now_ns(), name, day)).rowcount
+    def active_halts(self, name: str, day: str) -> list[sqlite3.Row]:
+        return self._q("SELECT * FROM copy_halts WHERE name=? AND day=? AND cleared_ns IS NULL "
+                       "ORDER BY kind='connection', t_ns", (name, day))
+
+    def clear_halts(self, name: str, day: str, kind: str | None = None) -> int:
+        """Clear every active halt, or (the daemon's auto-resume) only those of one `kind`."""
+        return self._x("UPDATE copy_halts SET cleared_ns=? WHERE name=? AND day=? AND cleared_ns IS NULL"
+                       + (" AND kind=?" if kind else ""), (self.now_ns(), name, day, *([kind] if kind else []))).rowcount
+
+    def auto_resumes(self, name: str, day: str) -> int:
+        r = self._q("SELECT COUNT(*) AS n FROM copy_events WHERE name=? AND day=? AND kind='auto_resume'", (name, day))
+        return int(r[0]["n"])
 
     # -- status
 

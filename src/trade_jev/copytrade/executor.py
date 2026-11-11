@@ -14,6 +14,9 @@ overrides every decision, because a copy account differs in ways that the base c
   stops: realized + open <= -daily_loss_limit or >= daily_profit_stop flattens and halts the ET day (persisted).
   Halt kinds: `day` (stops, flatten failure, read-back mismatch, 3 rejects in a row, entry cap, flatten-all, a
   worker crash) lasts until the next ET day or `clear-halts`; `gate` reasons (link, token, kill) clear alone.
+  `connection` (a flatten read-back or position read that failed on the network: DNS, timeout, 5xx, 429) is the
+  ONLY halt the daemon clears itself: after AUTO_RESUME_AFTER_S of continuous good fresh reads on a flat, clean
+  account with a live paper link and a good token, at most MAX_AUTO_RESUMES a day. Any other halt stays.
 
 P&L is the account's own ledger: points x point value x qty - commission per contract per side (entry
 commission accrued at entry); the open trade is marked to the paper quote (bid for long, ask for short).
@@ -21,6 +24,7 @@ commission accrued at entry); the open trade is marked to the paper quote (bid f
 
 from __future__ import annotations
 
+import re
 import time
 from datetime import datetime
 
@@ -40,6 +44,11 @@ QUOTE_FROZEN_S = 60.0     # an unchanged bid/ask this long is a frozen paper fee
 EOD_FLATTEN_ET = "15:56:00"
 TEXT_CUTOFF_ET = "15:55:00"
 MAX_REJECTS = 3
+AUTO_RESUME_AFTER_S = 300.0    # continuous good fresh reads before a connection halt clears itself
+MAX_AUTO_RESUMES = 3           # per account per ET day
+PROBE_S = 5.0                  # a halted-for-connection account reads its position this often
+CONN_ERR = re.compile(r"URLError|TimeoutError|timed out|nodename nor servname|Errno|ConnectionError|"
+                      r"Connection (?:refused|reset)|SSLError|HTTP (?:5\d\d|429)", re.I)
 KILL_STATES = ("clear", "paused", "autonomy_off", "unknown")
 
 
@@ -69,6 +78,11 @@ def validate_message(kind: str, msg) -> str | None:
             if msg.get(k) is not None and (isinstance(msg[k], bool) or not isinstance(msg[k], (int, float))):
                 return f"{k} must be a number"
     return None
+
+
+def is_conn_error(err) -> bool:
+    """True for a network-class failure (DNS, timeout, reset, HTTP 5xx / 429): the read said nothing about the account."""
+    return bool(CONN_ERR.search(f"{type(err).__name__}: {err}"))
 
 
 def _et_time(t_ns: int) -> str:
@@ -110,6 +124,10 @@ class CopyExecutor(Executor):
         self.pos_cache = None
         self._eod_done: str | None = None
         self.kill_text_sent = False
+        self._rd_fails, self._rd_t0 = 0, 0.0      # the current episode of failed reads: count, first failure
+        self._good_since: float | None = None     # start of the unbroken run of good fresh position reads
+        self._next_probe = -1e9
+        self._cap_texted: int | None = None       # t_ns of the connection halt whose cap text went out
         self._refresh_day(force=True)
 
     # ------------------------------------------------------------------ plumbing
@@ -146,7 +164,8 @@ class CopyExecutor(Executor):
     async def halt_day(self, kind: str, reason: str, flatten: bool = False, notify: bool = True,
                        exit_reason: str = "flatten") -> None:
         self._refresh_day()
-        created = not self.day_halt_row
+        # a connection halt never hides a real one: any other kind gets its own row, which is never auto-cleared
+        created = not self.day_halt_row or (self.halt_kind == "connection" and kind != "connection")
         if created:
             self.ledger.halt(self.acct.name, self.day, kind, reason)
             self._refresh_day()
@@ -235,8 +254,34 @@ class CopyExecutor(Executor):
 
     # ------------------------------------------------------------------ account position helpers
 
+    def _red(self, err) -> str:
+        return str(getattr(self.broker, "_red", str)(str(err) or type(err).__name__))[:200]
+
+    def _read_failed(self, e: Exception | str) -> None:
+        """A broker read failed. `errors` counts every one; the log gets the FIRST of an episode (not texted) and the
+        recovery line, so an outage leaves a trace in copy.log. Any failure restarts the auto-resume clock."""
+        self.errors += 1
+        self._good_since = None
+        if not self._rd_fails:
+            self._rd_t0 = self.mono()
+            self.event("read_failed", self._red(e if isinstance(e, str) else f"{type(e).__name__}: {e}"))
+        self._rd_fails += 1
+
+    def _read_ok(self, fresh: bool) -> None:
+        if self._rd_fails:
+            n, dt = self._rd_fails, self.mono() - self._rd_t0
+            self._rd_fails = 0
+            self.event("reads_recovered", f"position reads recovered after {n} failures over {dt:.0f}s")
+        if fresh and self._good_since is None:
+            self._good_since = self.mono()
+
     async def _position(self, fresh: bool = False):
-        pos = await self.broker.position(fresh)
+        try:
+            pos = await self.broker.position(fresh)
+        except Exception as e:  # noqa: BLE001
+            self._read_failed(e)
+            raise
+        self._read_ok(fresh)
         self.pos_cache = pos
         return pos
 
@@ -302,8 +347,7 @@ class CopyExecutor(Executor):
         try:
             pos = await self._position()
         except Exception as e:  # noqa: BLE001
-            self.last_error = f"can't read position: {e}"
-            self.errors += 1
+            self.last_error = f"can't read position: {e}"      # counted and logged by _position
             return
         self.last_error = None if self.last_error and self.last_error.startswith("can't read") else self.last_error
         if self.trade and not pos.side:
@@ -340,6 +384,7 @@ class CopyExecutor(Executor):
                 return
         except Exception as e:  # noqa: BLE001
             self.last_error = f"can't read orders: {e}"
+            self._read_failed(e)
             return
         if not live:
             self._orphan_alerted = False
@@ -363,6 +408,7 @@ class CopyExecutor(Executor):
                 live = await self.broker.orders(True)
             except Exception as e:  # noqa: BLE001
                 self.last_error = f"can't read orders: {e}"
+                self._read_failed(e)
                 return
             if len(live) < 2:
                 await self.halt_day("day", f"bracket invariant: {len(live)} live sibling order(s)", True)
@@ -605,12 +651,18 @@ class CopyExecutor(Executor):
             self.need_flat = False
             return "dry-run: would flatten"
         if not ack.ok:
-            await self.halt_day("day", f"flatten failed: {ack.error}", notify=False)
-            self._flatten_failed(str(ack.error))
+            err = str(ack.error)
+            net = err.startswith("flatten read-back failed") and is_conn_error(err)   # nothing known about the account
+            if net:
+                self._read_failed(err)
+            await self.halt_day("connection" if net else "day", f"flatten failed: {err}", notify=False)
+            self._flatten_failed(err)
             return "halted: flatten failed"
         try:
             pos = await self._position(True)
         except Exception as e:  # noqa: BLE001
+            if is_conn_error(e):
+                await self.halt_day("connection", f"can't confirm flat: {self._red(e)}", notify=False)
             self._flatten_failed(f"can't read position: {e}")
             return "halted: can't confirm flat"
         if pos.side:
@@ -646,6 +698,7 @@ class CopyExecutor(Executor):
                 if pos is not None and pos.side:
                     await self._flatten("kill" if self.kill == "paused" else "flatten-all", "kill"
                                         if self.kill == "paused" else "flatten_all")
+            await self._auto_resume()
             if self.mono() - self.last_rx > HEARTBEAT_LOST_S:
                 if not self.link_lost:
                     self.link_lost, self.hb_ok = True, False
@@ -659,6 +712,51 @@ class CopyExecutor(Executor):
                     await self._flatten("heartbeat lost", "link_lost", notify=not late)
                 return
             await self._eod_guard()
+
+    async def _auto_resume(self) -> None:
+        """Holds the lock. While ONLY connection halts are active: probe a fresh position every PROBE_S; after
+        AUTO_RESUME_AFTER_S of unbroken good reads on a flat account (no orders), live link and good token, clear
+        those rows and text it. Never any other halt; a position found is flattened first (existing logic)."""
+        rows = self.ledger.active_halts(self.acct.name, self.day)
+        if not rows or any(r["kind"] != "connection" for r in rows):
+            self._good_since = None
+            return
+        if self.need_flat or self.mono() < self._next_probe:   # the flatten retry owns the account until flat
+            return
+        self._next_probe = self.mono() + PROBE_S
+        try:
+            pos = await self._position(True)
+        except Exception:  # noqa: BLE001 — logged and the clock reset by _position
+            return
+        if pos.side:
+            self._good_since = None
+            await self._flatten("connection back, not flat", "flatten")
+            return
+        try:
+            live = await self.broker.working_orders()
+        except Exception as e:  # noqa: BLE001
+            self._read_failed(e)
+            return
+        if live:
+            self._good_since = None
+            return
+        held = self.mono() - (self._good_since if self._good_since is not None else self.mono())
+        ok = (self.clean and not self.link_lost and self.hb_ok and self.mono() - self.last_rx <= HEARTBEAT_LOST_S
+              and (getattr(self.broker, "dry", False) or (self.token_ok and not getattr(self.broker, "auth_failed", False))))
+        if held < AUTO_RESUME_AFTER_S or not ok:
+            return
+        n = self.ledger.auto_resumes(self.acct.name, self.day)
+        if n >= MAX_AUTO_RESUMES:
+            if self._cap_texted != rows[0]["t_ns"]:
+                self._cap_texted = rows[0]["t_ns"]
+                self.event("auto_resume_capped", f"connection back for {held / 60:.0f} min but {n} auto-resumes already "
+                           f"used today: halt stays until you clear it (clear-halts {self.acct.name})", True)
+            return
+        self.ledger.clear_halts(self.acct.name, self.day, "connection")
+        self._refresh_day()
+        self.alert, self._good_since = None, None
+        self.event("auto_resume", f"connection back for {held / 60:.0f} min: resumed ({n + 1} of {MAX_AUTO_RESUMES} today)",
+                   True)
 
     async def kill_flatten(self, state: str) -> None:
         """The daemon's kill watcher saw `paused`. `need_flat` is set BEFORE waiting for the lock or the broker, so a

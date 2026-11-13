@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 import urllib.error
 import urllib.request
@@ -39,11 +40,19 @@ TERMINAL = {"Filled", "Canceled", "Rejected", "Expired", "Completed"}
 NOT_FILLED = {"Canceled", "Rejected", "Expired"}
 LIVE = {"Working", "Suspended", "PendingNew", "PendingReplace"}
 SETTLE_S, SETTLE_STEP_S = 2.0, 0.2
+CANCEL_RESOLVE_S = 3.0   # after a cancel, how long to wait for the parent to read terminal (IOC parents linger "Working")
+CONN_ERR = re.compile(r"URLError|TimeoutError|timed out|nodename nor servname|Errno|ConnectionError|"
+                      r"Connection (?:refused|reset)|SSLError|HTTP (?:5\d\d|429)", re.I)
 VERIFY_S = 1.0
 FLAT_WAIT_S = 3.0
 BLOCK_S = 3600.0
 MAX_PENALTY_WAIT_S = 30.0
 READ_TTL_POSITION_S, READ_TTL_FLAT_S, READ_TTL_ORDERS_S = 2.0, 5.0, 10.0
+
+
+def is_conn_error(err) -> bool:
+    """True for a network-class failure (DNS, timeout, reset, HTTP 5xx / 429): the read said nothing about the account."""
+    return bool(CONN_ERR.search(f"{type(err).__name__}: {err}"))
 
 
 class BrokerError(Exception):
@@ -412,6 +421,28 @@ class TradovateBroker:
         return Ack(False, error="entry outcome unknown (timeout); account flattened"
                    + ("" if fa.ok else f" but: {fa.error}"), info={"closed": True, "exit_reason": "flatten"})
 
+    async def _cancel_and_resolve(self, oid) -> str | None:
+        """Cancel a resting parent and wait until it reads terminal (an IOC that does not cross can read "Working" for
+        a few seconds after the cancel). Cancels a second time if it is still Working after the window. Returns the
+        last status read; a failed read raises BrokerError (the caller decides network vs other)."""
+        status = None
+        for _ in range(2):
+            try:
+                await self._call("POST", "/order/cancelorder", {"orderId": oid, "isAutomated": True}, order=True)
+            except BrokerError as e:
+                if is_conn_error(e):
+                    raise
+                # a refusal (e.g. already terminal): the status read below says which
+            end = self.clock() + CANCEL_RESOLVE_S
+            while True:
+                await self.sleep(SETTLE_STEP_S)
+                status = await self._order_status(oid)
+                if status in TERMINAL or self.clock() >= end:
+                    break
+            if status in TERMINAL:
+                break
+        return status
+
     async def _settle(self, oid, o1, o2, cls, side, qty, limit_px, tp_pts, sl_pts, t0, recovered=False) -> Ack:
         cl, cl_tp, cl_sl = cls
         action = "Buy" if side > 0 else "Sell"
@@ -425,15 +456,21 @@ class TradovateBroker:
                 break
             await self.sleep(SETTLE_STEP_S)
         try:
-            if status not in TERMINAL:   # still resting (the Day fallback): cancel it, then look again
-                await self._call("POST", "/order/cancelorder", {"orderId": oid, "isAutomated": True}, order=True)
-                await self.sleep(SETTLE_STEP_S)
+            if status not in TERMINAL:   # still resting (the Day fallback, or an IOC that lingers): cancel, then re-poll
+                status = await self._cancel_and_resolve(oid)
             pos = await self.position(fresh=True)
             for _ in range(3):   # a fill can be visible on the order before the position
                 if status == "Filled" and pos.qty != qty:
                     await self.sleep(SETTLE_STEP_S)
                     pos = await self.position(fresh=True)
         except BrokerError as e:
+            ms = (self.clock() - t0) * 1000
+            if is_conn_error(e):
+                # the broker reads are failing: the entry's fate is unknown. Leave the bracket (it protects a fill),
+                # let the executor halt for `connection` (which probes, flattens if needed, and clears itself).
+                self.emit("entry_unresolved", "cannot confirm the entry outcome: broker reads failing", False)
+                return Ack(False, error=self._red(f"entry outcome unconfirmed, broker reads failing ({e})"),
+                           ack_ms=ms, info={"connection": True})
             self.emit("entry_unexplained", "cannot read back an entry: flattening", True)
             fa = await self.flatten()
             return Ack(False, error=self._red(f"entry read-back failed ({e}); account flattened"
@@ -455,7 +492,8 @@ class TradovateBroker:
                 self.emit("orphan_orders", "no fill, but the bracket children could not be cancelled", True)
                 return Ack(False, error="no fill, but orphan orders could not be cancelled", ack_ms=ms,
                            info={"orphans": True})
-            return Ack(False, missed=True, error="no fill at the limit", ack_ms=ms)
+            return Ack(False, missed=True, error="no fill at the limit; cancelled; still copying", ack_ms=ms,
+                       info={"unfilled": True})
         entry_px = await self._fill_px(oid, "entry", action) or pos.avg_px or limit_px
         if pos.side != side or pos.qty != qty:   # partial (or wrong side): liquidate, cancel, record as a miss
             fa = await self.flatten()

@@ -52,6 +52,13 @@ class FakeTradovate:
         self.read_fail: set[str] = set()
         self.status_never_terminal = False
         self.after_place = None
+        # an IOC that does not cross lingers "Working": entry "none" parents start Working (not Canceled), and read
+        # Canceled only after `linger_cancels` accepted cancel POSTs (0 = the first cancel resolves it)
+        self.ioc_lingers = False
+        self.linger_cancels = 0     # accepted cancels that change nothing before one takes effect, plus one
+        self.stale_polls = 0        # status reads that still say Working after the cancel took effect
+        self.status_fail_after_cancel = False
+        self._cancels = 0
 
     # -- helpers
 
@@ -89,9 +96,14 @@ class FakeTradovate:
             rows.append({"id": 9999, "accountId": 777, "ordStatus": "Working", "clOrdId": "other"})   # not ours
             return 200, {"d": rows}
         if key == "/order/item":
+            if self.status_fail_after_cancel and self._cancels:
+                raise TradovateError("TimeoutError: timed out")
             o = self.orders.get(int(q["id"]))
             if o is None:
                 return 404, {"errorText": "no such order"}
+            if o.get("stale", 0) > 0:
+                o["stale"] -= 1
+                return 200, {**o, "ordStatus": "Working"}
             if self.status_never_terminal and o.get("role") == "entry":
                 return 200, {**o, "ordStatus": "Working"}
             return 200, dict(o)
@@ -160,6 +172,8 @@ class FakeTradovate:
         else:
             for k in kids:
                 k["ordStatus"] = "Canceled"
+            if self.ioc_lingers:
+                parent["ordStatus"] = "Working"
         self.orders[oid] = parent
         for k in kids:
             self.orders[k["id"]] = k
@@ -187,7 +201,12 @@ class FakeTradovate:
             return 200, {"failureReason": "TooLate", "failureText": "order is no longer working"}
         if self.cancel_fail:
             return 200, {"failureReason": "UnknownReason", "failureText": "cannot cancel"}
+        self._cancels += 1
+        if o.get("role") == "entry" and self.ioc_lingers and self._cancels <= self.linger_cancels:
+            return 200, {"failureReason": "Success", "orderId": b["orderId"]}    # accepted, still reads Working
         o["ordStatus"] = "Canceled"
+        if o.get("role") == "entry":
+            o["stale"] = self.stale_polls
         return 200, {"failureReason": "Success", "orderId": b["orderId"]}
 
     def _liquidate(self, b):

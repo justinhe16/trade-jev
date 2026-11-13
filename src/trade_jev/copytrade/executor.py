@@ -24,10 +24,10 @@ commission accrued at entry); the open trade is marked to the paper quote (bid f
 
 from __future__ import annotations
 
-import re
 import time
 from datetime import datetime
 
+from trade_jev.copytrade.broker import CONN_ERR, is_conn_error  # noqa: F401  (re-exported)
 from trade_jev.copytrade.config import Account, ConfigError, symbol_for
 from trade_jev.copytrade.ledger import Ledger, et_day
 from trade_jev.data import ET, TICK
@@ -47,8 +47,6 @@ MAX_REJECTS = 3
 AUTO_RESUME_AFTER_S = 300.0    # continuous good fresh reads before a connection halt clears itself
 MAX_AUTO_RESUMES = 3           # per account per ET day
 PROBE_S = 5.0                  # a halted-for-connection account reads its position this often
-CONN_ERR = re.compile(r"URLError|TimeoutError|timed out|nodename nor servname|Errno|ConnectionError|"
-                      r"Connection (?:refused|reset)|SSLError|HTTP (?:5\d\d|429)", re.I)
 KILL_STATES = ("clear", "paused", "autonomy_off", "unknown")
 
 
@@ -78,11 +76,6 @@ def validate_message(kind: str, msg) -> str | None:
             if msg.get(k) is not None and (isinstance(msg[k], bool) or not isinstance(msg[k], (int, float))):
                 return f"{k} must be a number"
     return None
-
-
-def is_conn_error(err) -> bool:
-    """True for a network-class failure (DNS, timeout, reset, HTTP 5xx / 429): the read said nothing about the account."""
-    return bool(CONN_ERR.search(f"{type(err).__name__}: {err}"))
 
 
 def _et_time(t_ns: int) -> str:
@@ -579,7 +572,9 @@ class CopyExecutor(Executor):
             return "halted: partial fill not closed"
         if ack.missed:
             self.rejects = 0
-            self.event("missed", str(ack.error), False, seq=int(msg["seq"]))
+            # an unfilled entry is a miss, never a halt: flat until paper's next signal, still copying
+            self.event("entry_missed" if ack.info and ack.info.get("unfilled") else "missed", str(ack.error), False,
+                       seq=int(msg["seq"]))
             return f"missed: {ack.error}"
         if ack.rejected:
             self.rejects += 1
@@ -587,6 +582,13 @@ class CopyExecutor(Executor):
             if self.rejects >= MAX_REJECTS:
                 await self.halt_day("day", f"{MAX_REJECTS} rejected entries in a row: {ack.error}")
             return f"rejected: {ack.error}"
+        if not ack.ok and ack.info and ack.info.get("connection"):
+            # broker reads failing while resolving the entry: its fate is unknown, so the bracket stays and the
+            # connection halt (probe, flatten if needed, auto-resume after 5 good minutes) takes over
+            self.need_flat = True
+            self._read_failed(str(ack.error))
+            await self.halt_day("connection", f"entry outcome unconfirmed: {ack.error}", notify=False)
+            return "halted: entry unconfirmed (connection)"
         if not ack.ok:
             self.errors += 1
             self.last_error = str(ack.error)

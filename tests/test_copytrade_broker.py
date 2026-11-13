@@ -130,6 +130,52 @@ def test_miss_no_fill(rig):
     assert rig.fake.n("/order/modifyorder") == 0
 
 
+def lingering_ioc(rig, stale=2, extra_cancels=0):
+    rig.fake.entry = "none"
+    rig.fake.ioc_lingers, rig.fake.stale_polls, rig.fake.linger_cancels = True, stale, extra_cancels
+
+
+def test_ioc_parent_reading_working_after_cancel_is_a_miss_not_ambiguous(rig):
+    lingering_ioc(rig)                    # the 2026-11-13 case: cancel accepted, the next reads still say Working
+    ack = rig.enter()
+    assert ack.missed and not ack.ok and not ack.info.get("ambiguous") and ack.info == {"unfilled": True}
+    assert rig.run(rig.broker.orders(True)) == [] and rig.fake.n("/order/cancelorder", "POST") == 1
+    assert "entry_ambiguous" not in kinds(rig)
+    assert rig.enter().missed             # nothing is blocked: the next entry goes out again
+    assert rig.fake.n("/order/placeoso", "POST") == 2
+
+
+def test_parent_working_through_the_window_gets_a_second_cancel(rig):
+    lingering_ioc(rig, stale=0, extra_cancels=1)      # the first cancel is accepted but changes nothing
+    ack = rig.enter()
+    assert ack.missed and rig.fake.n("/order/cancelorder", "POST") == 2
+    assert rig.run(rig.broker.orders(True)) == []
+
+
+def test_parent_still_working_after_two_cancels_is_ambiguous(rig):
+    lingering_ioc(rig, stale=0, extra_cancels=9)
+    ack = rig.enter()
+    assert not ack.ok and not ack.missed and ack.info == {"ambiguous": True}
+    assert rig.fake.n("/order/cancelorder", "POST") == 2 and "entry_ambiguous" in kinds(rig)
+
+
+def test_status_reads_failing_during_resolution_is_a_connection_ack(rig):
+    lingering_ioc(rig)
+    rig.fake.status_fail_after_cancel = True
+    ack = rig.enter()
+    assert not ack.ok and not ack.missed and ack.info == {"connection": True}
+    assert "entry_unresolved" in kinds(rig) and "entry_ambiguous" not in kinds(rig)
+    assert rig.fake.n("/order/cancelorder", "POST") == 1 and not rig.fake.posts("/order/liquidateposition")
+
+
+def test_filled_parent_with_flat_position_stays_ambiguous_and_keeps_the_bracket(rig):
+    rig.fake.after_place = lambda f: f.pos.clear()    # the parent reads Filled, the position never shows
+    ack = rig.enter()
+    assert not ack.ok and not ack.missed and ack.info == {"ambiguous": True}
+    assert "bracket left in place" in ack.error and "entry_ambiguous" in kinds(rig)
+    assert len(rig.run(rig.broker.orders(True))) == 2 and rig.fake.n("/order/cancelorder", "POST") == 0
+
+
 def test_partial_fill_liquidates_and_records_as_miss(rig):
     rig.fake.entry, rig.fake.partial_qty = "partial", 2
     ack = rig.enter()

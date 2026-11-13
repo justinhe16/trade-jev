@@ -175,6 +175,41 @@ def test_missed_entry_is_not_an_error_and_not_a_halt(rig):
     assert rig.ex.errors == 0 and rig.texts() == []
 
 
+def test_unfilled_entry_logs_entry_missed_and_the_next_intent_still_enters(rig):
+    from trade_jev.executor.broker import Ack
+
+    async def unfilled(*a):
+        return Ack(False, missed=True, error="no fill at the limit; cancelled; still copying",
+                   info={"unfilled": True})
+    orig, rig.br.enter = rig.br.enter, unfilled
+    r = rig.intent(1, 1)
+    assert r["result"].startswith("missed") and not rig.ex.halted and rig.trades() == []
+    (e,) = rig.events("entry_missed")
+    assert not e["notify"] and "still copying" in e["detail"] and rig.texts() == []
+    rig.br.enter = orig
+    assert rig.intent(2, 0)["result"] and rig.intent(3, 1)["result"].startswith("entered")
+
+
+def test_unconfirmed_entry_on_failing_reads_is_a_connection_halt_that_auto_resumes(tmp_path):
+    from trade_jev.executor.broker import Ack
+    r = Rig(tmp_path, broker=NetBroker())
+    r.start()
+
+    async def unconfirmed(*a):
+        return Ack(False, error="entry outcome unconfirmed, broker reads failing (TimeoutError: timed out)",
+                   info={"connection": True})
+    r.br.enter = unconfirmed
+    res = r.intent(1, 1)
+    r.br.down = True
+    assert res["result"].startswith("halted") and r.ex.halt_kind == "connection" and r.ex.need_flat
+    assert r.texts() == [] and r.ledger.active_halt("a1", DAY)["kind"] == "connection"
+    del r.br.enter
+    r.br.down = False
+    tick(r, 5)
+    tick(r, 5, 62)
+    assert not r.ex.halted and r.events("auto_resume")
+
+
 def test_three_rejects_in_a_row_halt_the_day(rig):
     from trade_jev.executor.broker import Ack
 

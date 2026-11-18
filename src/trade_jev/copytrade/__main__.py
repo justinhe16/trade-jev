@@ -35,19 +35,28 @@ from trade_jev.executor.broker import DryRun
 RESONANT_DB = "~/.resonant/resonant.db"   # opened read-only by the kill watcher's fallback, never written
 
 
-def build_account(acct, ledger, directory, http_factory=None, dotenv=None, budget=None, pools=None):
-    """(broker, keepalive) for one account. dry_run accounts get a NullBroker and a keepalive only when the
-    prefix has tokens (so the panel can show token health)."""
-    store = directory / acct.name / "tradovate_token.json"
+def build_account(acct, ledger, directory, http_factory=None, dotenv=None, budget=None, pools=None,
+                  keepalives=None, cfg=None):
+    """(broker, keepalive) for one account. The keepalive belongs to the account's login and is shared by all
+    its accounts: `keepalives` (login -> keepalive) holds it for the process, so a login is never renewed twice.
+    dry_run accounts get a NullBroker and a keepalive only when the login has tokens (so the panel can show
+    token health). `cfg` lets a new login store seed from its accounts' legacy per-account stores."""
+    keepalives = {} if keepalives is None else keepalives
     dotenv = dotenv if dotenv is not None else tt.dotenv_path()
     pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix=f"copy-{acct.name}")
     if pools is not None:
         pools[acct.name] = pool
     http = (http_factory or make_http)(pool)
-    ka = AccountKeepalive(acct.name, acct.secrets_prefix, acct.env, store, dotenv,
-                          budget or RenewBudget(directory / "renew_budget.json"), http=http)
+    store = cfgmod.login_dir(directory, acct) / "tradovate_token.json"
+    ka = keepalives.get(acct.login)
+    if ka is None:
+        legacy = [directory / a.name / "tradovate_token.json"
+                  for a in (cfg.logins().get(acct.login, []) if cfg else [acct])] if acct.explicit_login else ()
+        ka = keepalives[acct.login] = AccountKeepalive(
+            acct.login, acct.secrets_prefix, acct.env, store, dotenv,
+            budget or RenewBudget(directory / "renew_budget.json"), http=http, legacy_stores=legacy)
     if acct.mode == "dry_run":
-        return DryRun(NullBroker()), (ka if ka._seed() or store.exists() else None)
+        return DryRun(NullBroker()), (ka if ka._seed() or ka.store.exists() else None)
 
     def emit(kind, detail, notify=False):
         ledger.event(acct.name, kind, detail, notify=notify)
@@ -59,8 +68,10 @@ async def run_daemon(cfg, ledger, directory, port=None) -> int:
     budget = RenewBudget(directory / "renew_budget.json")
     dotenv = tt.dotenv_path()
 
-    # one build per account: the keepalive the broker reads is the one the daemon runs
-    built = {a.name: build_account(a, ledger, directory, dotenv=dotenv, budget=budget, pools=pools)
+    # one build per account: the keepalive the broker reads is the one the daemon runs (one per login)
+    keepalives: dict = {}      # one per login, shared by its accounts
+    built = {a.name: build_account(a, ledger, directory, dotenv=dotenv, budget=budget, pools=pools,
+                                   keepalives=keepalives, cfg=cfg)
              for a in cfg.enabled()}
     d = Daemon(cfg, ledger, lambda a, ka: built[a.name][0], lambda a: built[a.name][1],
                kill_db=lambda: db_kill_status(Path(RESONANT_DB).expanduser()))
@@ -126,11 +137,15 @@ def cmd_flatten_all(cfg, ledger, directory, direct, *, isatty=None, ask=input, h
         _print("not confirmed")
         return 1
     rc = 0
+    keepalives: dict = {}
+    ticked: set = set()      # one token check per login
     for a in live:
-        broker, ka = build_account(a, ledger, directory, http_factory, dotenv)
+        broker, ka = build_account(a, ledger, directory, http_factory, dotenv, keepalives=keepalives, cfg=cfg)
 
         async def go():
-            if ka is not None:   # the daemon may have been down for hours: seed from .env, renew or log in first
+            if ka is not None and a.login not in ticked:   # the daemon may have been down for hours:
+                # seed from .env, renew or log in first
+                ticked.add(a.login)
                 try:
                     await ka.tick()
                 except Exception:  # noqa: BLE001
@@ -154,7 +169,7 @@ def cmd_flatten_all(cfg, ledger, directory, direct, *, isatty=None, ask=input, h
 def cmd_preflight(cfg, ledger, directory, name, symbol=None, http_factory=None, dotenv=None) -> int:
     """Read-only: account/list (the id is there, with its name) and contract/find. Places nothing."""
     a = cfg.get(name)
-    broker, ka = build_account(a, ledger, directory, http_factory, dotenv)
+    broker, ka = build_account(a, ledger, directory, http_factory, dotenv, cfg=cfg)
     if a.mode == "dry_run" and not isinstance(broker, TradovateBroker):
         broker = TradovateBroker(a, ka.access_token if ka else (lambda: None), ka.secrets if ka else (lambda: ()),
                                  http=(http_factory or make_http)(None), ledger=None)
@@ -213,7 +228,7 @@ def cmd_rehearse(cfg, ledger, directory, name, *, isatty=None, ask=input, http_f
         _print("not confirmed")
         return 2
     px = float(ask("current touch price of the contract (e.g. 24500.25): ").strip())
-    broker, ka = build_account(a, ledger, directory, http_factory, dotenv)
+    broker, ka = build_account(a, ledger, directory, http_factory, dotenv, cfg=cfg)
     sym = ask(f"contract (e.g. {a.root}Z6): ").strip()
     broker = TradovateBroker(a, ka.access_token, ka.secrets, http=(http_factory or make_http)(None), ledger=None)
     results: list[tuple[str, bool, str]] = []

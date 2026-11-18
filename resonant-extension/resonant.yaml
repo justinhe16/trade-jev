@@ -140,7 +140,7 @@ panels:
     history: {every: daily, keep: 365d}   # PER-286: archived per ET day via `--date YYYY-MM-DD`
   - id: copy
     title: Copy accounts
-    description: "Copy-trading accounts today: position, P&L, entries, state (armed, halted, daemon down); missed and rejected entries; halts; token health."
+    description: "Copy-trading accounts today: position, P&L, entries, state (armed, halted, daemon down); missed and rejected entries; halts; token health per login."
     command: [./cli.py, panel, copy]
     refresh:
       idle: "*/15 * * * *"

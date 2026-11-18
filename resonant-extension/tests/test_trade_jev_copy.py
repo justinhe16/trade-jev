@@ -107,6 +107,35 @@ def test_live_panel(copy_db: CopyDB) -> None:
     assert out["health"] == "ok"
 
 
+def test_token_health_is_per_login(copy_db: CopyDB) -> None:
+    copy_db.status("mff-1", login="mff", token_expires_at=et_dt(TUE, "12:00").isoformat())
+    copy_db.status("mff-2", login="mff", token_expires_at=et_dt(TUE, "12:00").isoformat())
+    copy_db.status("solo", login="solo", token_ok=0, last_error="token expired")
+    w = widgets(panel(NOW))
+    items = {i["name"]: i for i in w["tokens"]["items"]}
+    assert set(items) == {"mff (mff-1, mff-2)", "solo"}          # one item for the shared login
+    assert items["mff (mff-1, mff-2)"]["state"] == "up" and items["solo"]["state"] == "down"
+    assert [c["key"] for c in w["accounts"]["columns"]][:2] == ["name", "login"]
+    assert {r["name"]: r["login"] for r in w["accounts"]["rows"]} == {"mff-1": "mff", "mff-2": "mff", "solo": "solo"}
+
+
+def test_a_shared_logins_failure_shows_once_and_only_for_it(copy_db: CopyDB) -> None:
+    copy_db.status("mff-1", login="mff", token_ok=0, last_error="token expired")
+    copy_db.status("mff-2", login="mff", token_ok=0, last_error="token expired")
+    copy_db.status("other", login="other", token_expires_at=et_dt(TUE, "12:00").isoformat())
+    items = {i["name"]: i["state"] for i in widgets(panel(NOW))["tokens"]["items"]}
+    assert items == {"mff (mff-1, mff-2)": "down", "other": "up"}
+
+
+def test_old_db_without_a_login_column_reads_as_before(copy_db: CopyDB) -> None:
+    seed_live(copy_db)
+    copy_db.ledger.conn.execute("ALTER TABLE copy_status DROP COLUMN login")
+    copy_db.ledger.conn.commit()
+    w = widgets(panel(NOW))
+    assert {i["name"] for i in w["tokens"]["items"]} == {"mff-1", "mff-2"}
+    assert [c["key"] for c in w["accounts"]["columns"]][:2] == ["name", "mode"]
+
+
 def test_halted_and_gated_states(copy_db: CopyDB) -> None:
     copy_db.status("a", halted=1, halt_kind="day")
     copy_db.status("b", gate_reason="kill: paused")
@@ -220,6 +249,8 @@ def test_the_panel_fits_its_byte_budget_with_busy_days(copy_db: CopyDB, tmp_path
 def test_resonant_accepts_every_copy_output(tmp_path: Path, copy_db: CopyDB) -> None:
     seed_live(copy_db)
     copy_db.trade(MON)
+    copy_db.status("mff-3", login="mff")
+    copy_db.status("mff-4", login="mff")
     outs = {"live": panel(NOW), "past": panel(et_dt(FRI, "12:00"), "--date", MON),
             "none": panel(et_dt(FRI, "12:00"), "--date", WED)}
     res = resonant_validate(tmp_path, outs, "copy")

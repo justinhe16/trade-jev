@@ -293,10 +293,12 @@ class Daemon:
         if not self.workers:
             self.build()
         self._tasks = [asyncio.create_task(self._kill_loop()), asyncio.create_task(self._publish_loop())]
+        running: set[int] = set()     # a login's keepalive is shared by its accounts: one renew loop
         for w in self.workers.values():
             w.task = asyncio.create_task(self._worker(w))
             self._tasks.append(w.task)
-            if w.keepalive is not None:
+            if w.keepalive is not None and id(w.keepalive) not in running:
+                running.add(id(w.keepalive))
                 w.ka_task = asyncio.create_task(self._keepalive(w))
                 self._tasks.append(w.ka_task)
         if port is not None:

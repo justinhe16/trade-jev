@@ -16,7 +16,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS copy_status(name TEXT PRIMARY KEY, day TEXT, updated_at TEXT, mode TEXT, env TEXT,
   root TEXT, qty INTEGER, contract TEXT, armed INTEGER, gate_reason TEXT, pos_side INTEGER, pos_qty INTEGER,
   avg_px REAL, realized REAL, open_pnl REAL, halted INTEGER, halt_kind TEXT, token_ok INTEGER,
-  token_expires_at TEXT, entries INTEGER, errors INTEGER, last_error TEXT);
+  token_expires_at TEXT, entries INTEGER, errors INTEGER, last_error TEXT, login TEXT);
 CREATE TABLE IF NOT EXISTS copy_signals(name TEXT, boot TEXT, seq INTEGER, day TEXT, target INTEGER, reason TEXT,
   t_ns INTEGER, outcome TEXT, detail TEXT, PRIMARY KEY(name, boot, seq));
 CREATE TABLE IF NOT EXISTS copy_orders(id INTEGER PRIMARY KEY, name TEXT, day TEXT, boot TEXT, seq INTEGER,
@@ -38,7 +38,7 @@ CREATE INDEX IF NOT EXISTS copy_events_day ON copy_events(day, name);
 """
 STATUS_COLS = ("name", "day", "updated_at", "mode", "env", "root", "qty", "contract", "armed", "gate_reason",
                "pos_side", "pos_qty", "avg_px", "realized", "open_pnl", "halted", "halt_kind", "token_ok",
-               "token_expires_at", "entries", "errors", "last_error")
+               "token_expires_at", "entries", "errors", "last_error", "login")
 
 
 def et_day(t_ns: int) -> str:
@@ -55,6 +55,8 @@ class Ledger:
         with self.lock:
             self.conn.execute("PRAGMA journal_mode=WAL")
             self.conn.executescript(SCHEMA)
+            if "login" not in {r[1] for r in self.conn.execute("PRAGMA table_info(copy_status)")}:
+                self.conn.execute("ALTER TABLE copy_status ADD COLUMN login TEXT")   # a DB from before logins
             self.conn.commit()
 
     def close(self) -> None:

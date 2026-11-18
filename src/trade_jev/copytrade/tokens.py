@@ -1,15 +1,16 @@
-"""Per-account Tradovate token upkeep for the copy daemon.
+"""Per-login Tradovate token upkeep for the copy daemon. A login (one credentials prefix, one token store) can
+hold several accounts; it has exactly one keepalive, shared by them all, so one session is never renewed twice.
 
-`AccountKeepalive` is the paper keep-alive (tradovate_keepalive.Keepalive) with three differences: it reads
+`LoginKeepalive` is the paper keep-alive (tradovate_keepalive.Keepalive) with three differences: it reads
 `<PREFIX>_ACCESS_TOKEN` / `<PREFIX>_MD_ACCESS_TOKEN` / `<PREFIX>_AUTH_HOST` from .env (fresh each tick), its store,
-status and lock files live in data/copy/<name>/ (the main data/tradovate_token*.json are never touched), and it
+status and lock files live in data/copy/logins/<login>/ (an implicit login: data/copy/<account>/; the main data/tradovate_token*.json are never touched), and it
 is deliberately slow: a tick every 60 s, 15 minutes between attempts while failing.
 
 Tradovate rate limits are per IP /24 and shared with the paper account: renewaccesstoken 15/hour,
 accesstokenrequest 5 failed/hour. So `RenewBudget` caps the daemon at 6 HTTP renewals per hour across all
-accounts (persisted, so a restart loop cannot burn it), and the password path (all five `<PREFIX>_USERNAME`,
+logins (persisted, so a restart loop cannot burn it), and the password path (all five `<PREFIX>_USERNAME`,
 `_PASSWORD`, `_CID`, `_SEC`, `_DEVICE_ID` set) makes exactly one login attempt per .env modification time.
-A token problem blocks that account's entries only, and clears by itself; exits and flatten still try.
+A token problem blocks that login's accounts' entries only, and clears by itself; exits and flatten still try.
 """
 
 from __future__ import annotations
@@ -62,13 +63,28 @@ class RenewBudget:
         return True
 
 
-class AccountKeepalive(Keepalive):
+class LoginKeepalive(Keepalive):
     def __init__(self, name: str, prefix: str, env: str, store, dotenv, budget: RenewBudget, http=None,
-                 clock=time.time, sleep=asyncio.sleep):
+                 clock=time.time, sleep=asyncio.sleep, legacy_stores=()):
         super().__init__(store, dotenv, None, http, clock, sleep)
-        self.name, self.prefix, self.env, self.budget = name, prefix, env, budget
+        self.name, self.prefix, self.env, self.budget = name, prefix, env, budget   # name: the login's
         self.fail_backoff = FAIL_BACKOFF_S
         self._attempt_file = Path(store).with_name("password_attempt.json")
+        self._adopt_legacy(legacy_stores)
+
+    def _adopt_legacy(self, legacy_stores) -> None:
+        """A new login store starts from the freshest still-valid per-account store of its accounts (the .env
+        token is stale in practice), before anything falls back to .env. Never overwrites a store."""
+        if self.store.exists():
+            return
+        best = None
+        for p in legacy_stores:
+            ts = tt.read_store(p)
+            if ts is not None and ts.expires_at and not ts.dead(self.clock()) and (
+                    best is None or ts.expires_at > best.expires_at):
+                best = ts
+        if best is not None:
+            tt.write_store(self.store, best.access, best.md, best.expires_at)
 
     # -- .env access (fresh each time)
 
@@ -193,3 +209,6 @@ class AccountKeepalive(Keepalive):
             if max_ticks is not None and n >= max_ticks:
                 break
             await self.sleep(self.fail_backoff if result in ("failed", "expired", "no-tokens") else TICK_S)
+
+
+AccountKeepalive = LoginKeepalive   # the old name

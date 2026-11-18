@@ -8,8 +8,17 @@
 kill_status_url: http://127.0.0.1:7777/api/status   # Resonant's status (paused, autonomy); polled every 3 s
 port: 8768                                          # the daemon's loopback port (paper posts intents here)
 
+# A login is one Tradovate sign-in: one credentials prefix, one token, one keep-alive. Several accounts under the
+# same sign-in name it with `login:` (both accounts below). An account may instead carry its own `secrets_prefix`
+# (an implicit login named after the account; the form older installs use). Exactly one of the two per account.
+# Accounts on one login must share `env`. Optional: omit `logins:` and use `secrets_prefix` per account.
+logins:
+  mff:
+    secrets_prefix: COPY_MFF1  # credentials come from COPY_MFF1_* in .env (never TRADOVATE)
+
 accounts:
-  - name: mff-1                # unique; used in the DB, the token store path and the texts
+  - name: mff-1                # unique; used in the DB and the texts
+    login: mff                 # a name from logins: (or secrets_prefix: COPY_X for the account's own login)
     enabled: true              # false = ignored (and paper omits --exec-url when none are enabled)
     mode: dry_run              # dry_run (default: records "would enter", no orders) | demo | live
     env: demo                  # demo | live; mode live requires env live, mode demo requires env demo
@@ -22,4 +31,15 @@ accounts:
     # tp_points: 25            # optional: override the paper TP (points); default the paper session's
     # sl_points: 50            # optional: override the paper SL (points)
     # slip_ticks: 4            # optional: entry limit = touch +/- this many ticks (default 4 = 1 point)
-    secrets_prefix: COPY_MFF1  # credentials come from COPY_MFF1_* in .env (never TRADOVATE)
+
+  - name: mff-2                # a second account under the same login: same token, its own orders and positions
+    login: mff
+    enabled: false
+    mode: dry_run
+    env: demo
+    account_id: 0              # unique per account
+    root: MNQ
+    qty: 5
+    daily_loss_limit: 1000
+    daily_profit_stop: 490
+    commission: 0.5

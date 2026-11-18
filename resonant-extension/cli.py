@@ -2186,6 +2186,11 @@ def _day_rows(conn: sqlite3.Connection, day: str) -> dict[str, list[sqlite3.Row]
     }
 
 
+def _login(r: sqlite3.Row) -> str:
+    """The row's login (a DB from before logins has no column: the account is its own login)."""
+    return (r["login"] if "login" in r.keys() else None) or r["name"]
+
+
 def copy_live_view(conn: sqlite3.Connection, now: datetime) -> tuple[dict[str, Any], str | None]:
     statuses = conn.execute("SELECT * FROM copy_status ORDER BY name").fetchall()
     day = now.astimezone(ET).date().isoformat()
@@ -2194,7 +2199,8 @@ def copy_live_view(conn: sqlite3.Connection, now: datetime) -> tuple[dict[str, A
     rows = _day_rows(conn, day)
     updated = max(parse_ts(r["updated_at"]) or now for r in statuses)
     stale = (now - updated).total_seconds() > COPY_STALE_S
-    table_rows, total, tones, tokens = [], 0.0, [], []
+    table_rows, total, tones, tokens, seen = [], 0.0, [], [], set()
+    shared = any(_login(r) != r["name"] for r in statuses)
     for r in statuses:
         pnl = (r["realized"] or 0.0) + (r["open_pnl"] or 0.0) if r["day"] == day else 0.0
         total += pnl
@@ -2202,18 +2208,27 @@ def copy_live_view(conn: sqlite3.Connection, now: datetime) -> tuple[dict[str, A
         tones.append(pill["tone"])
         table_rows.append({"name": r["name"], "mode": f"{r['mode']}/{r['env']}",
                            "pos": _sym_pos(r["pos_side"], r["pos_qty"], r["contract"], r["avg_px"]),
-                           "pnl": round(pnl, 2), "entries": r["entries"] if r["day"] == day else 0, "state": pill})
+                           "pnl": round(pnl, 2), "entries": r["entries"] if r["day"] == day else 0, "state": pill,
+                           **({"login": _login(r)} if shared else {})})   # a row key needs its column
+        lg = _login(r)
+        peers = [x for x in statuses if _login(x) == lg]
+        if lg in seen:      # token health is per login: one item for all its accounts
+            continue
+        seen.add(lg)
+        r = next((x for x in peers if not x["token_ok"]), peers[0])
+        who = lg if lg == r["name"] else f"{lg} ({', '.join(x['name'] for x in peers)})"
         if r["token_expires_at"] or not r["token_ok"]:
             exp = parse_ts(r["token_expires_at"])
-            tokens.append({"name": r["name"], "state": "up" if r["token_ok"] else "down",
+            tokens.append({"name": who, "state": "up" if r["token_ok"] else "down",
                            "detail": (f"expires {exp.astimezone(ET):%H:%M}" if exp else "no token") if r["token_ok"]
                            else "token problem" + (f": {clip(r['last_error'], 60)}" if r["last_error"] else "")})
         else:
-            tokens.append({"name": r["name"], "state": "unknown", "detail": "no token configured"})
+            tokens.append({"name": who, "state": "unknown", "detail": "no token configured"})
     widgets: list[dict[str, Any]] = [
         pw.stat("Copy P&L", round(total, 2), format="money", health="ok" if total >= 0 else "warn",
                 hint=day_label(day), id="pnl"),
-        pw.table([pw.column("name", "Account"), pw.column("mode", "Mode"), pw.column("pos", "Position"),
+        pw.table([pw.column("name", "Account"), *([pw.column("login", "Login")] if shared else []),
+                  pw.column("mode", "Mode"), pw.column("pos", "Position"),
                   pw.column("pnl", "P&L $", "money"), pw.column("entries", "Entries", "number"),
                   pw.column("state", "State", "pill")], table_rows, id="accounts", title="Accounts")]
     if stale:

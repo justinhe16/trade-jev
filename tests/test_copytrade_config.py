@@ -67,8 +67,9 @@ def test_top_level_validation(tmp_path):
 
 def test_example_file_loads():
     c = cfg.load(cfg.ROOT / "accounts.example.yaml")
-    (a,) = c.accounts
+    a, b = c.accounts
     assert (a.qty, a.root, a.daily_loss_limit, a.daily_profit_stop, a.mode) == (5, "MNQ", 1000.0, 490.0, "dry_run")
+    assert a.login == b.login == "mff" and b.secrets_prefix == "COPY_MFF1"
     assert c.port == 8768 and c.kill_status_url.endswith("/api/status")
 
 

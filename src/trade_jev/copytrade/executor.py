@@ -804,5 +804,6 @@ class CopyExecutor(Executor):
                 "realized": round(realized, 2), "open_pnl": round(open_, 2),
                 "halted": 1 if self.day_halt_row else 0, "halt_kind": self.halt_kind,
                 "token_ok": 1 if self.token_ok else 0, "token_expires_at": self.token_expires,
-                "entries": self.entries, "errors": self.errors, "last_error": (self.last_error or None)}
+                "entries": self.entries, "errors": self.errors, "last_error": (self.last_error or None),
+                "login": a.login}
 

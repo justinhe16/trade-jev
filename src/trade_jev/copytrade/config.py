@@ -13,7 +13,7 @@ from trade_jev import ROOT
 
 ACCOUNTS_ENV = "TRADE_JEV_ACCOUNTS"      # test / emergency override of the accounts.yaml path
 COPY_DB_ENV = "TRADE_JEV_COPY_DB"
-COPY_DIR_ENV = "TRADE_JEV_COPY_DIR"      # per-account token stores and the daemon lock
+COPY_DIR_ENV = "TRADE_JEV_COPY_DIR"      # per-login token stores and the daemon lock
 DEFAULT_KILL_URL = "http://127.0.0.1:7777/api/status"
 DEFAULT_PORT = 8768
 MODES = ("dry_run", "demo", "live")
@@ -25,11 +25,23 @@ SYMBOL_RE = re.compile(r"^NQ([HMUZ]\d)$")
 PREFIX_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,30}$")
 KNOWN = {"name", "enabled", "mode", "env", "account_id", "root", "qty", "daily_loss_limit", "daily_profit_stop",
-         "commission", "tp_points", "sl_points", "slip_ticks", "secrets_prefix"}
+         "commission", "tp_points", "sl_points", "slip_ticks", "secrets_prefix", "login"}
+LOGIN_KNOWN = {"secrets_prefix"}
 
 
 class ConfigError(ValueError):
     pass
+
+
+class _StrictLoader(yaml.SafeLoader):
+    """A repeated mapping key (two logins with one name) is an error, not last-one-wins."""
+
+    def construct_mapping(self, node, deep=False):
+        keys = [self.construct_object(k, deep=True) for k, _ in node.value]
+        dup = {k for k in keys if keys.count(k) > 1}
+        if dup:
+            raise ConfigError(f"duplicate key(s) {sorted(map(str, dup))}")
+        return super().construct_mapping(node, deep)
 
 
 @dataclass(frozen=True)
@@ -48,6 +60,12 @@ class Account:
     tp_points: float | None = None
     sl_points: float | None = None
     slip_ticks: int = DEFAULT_SLIP_TICKS
+    login: str = ""                   # the login (one credentials prefix, one token store); "" = this account's own
+    explicit_login: bool = False      # named in `logins:`; else the implicit login named after the account
+
+    def __post_init__(self):
+        if not self.login:
+            object.__setattr__(self, "login", self.name)
 
     @property
     def point_value(self) -> float:
@@ -59,6 +77,13 @@ class CopyConfig:
     accounts: tuple[Account, ...] = ()
     kill_status_url: str = DEFAULT_KILL_URL
     port: int = DEFAULT_PORT
+
+    def logins(self) -> dict[str, list[Account]]:
+        """login name -> its accounts (all of them, enabled or not), in file order."""
+        out: dict[str, list[Account]] = {}
+        for a in self.accounts:
+            out.setdefault(a.login, []).append(a)
+        return out
 
     def enabled(self) -> list[Account]:
         return [a for a in self.accounts if a.enabled]
@@ -85,6 +110,12 @@ def copy_dir(env=os.environ) -> Path:
     return Path(v).expanduser() if v else ROOT / "data" / "copy"
 
 
+def login_dir(directory: Path, acct: Account) -> Path:
+    """The login's token store directory: explicit logins under logins/, implicit ones where the account's
+    own store always lived (so existing installs do not move)."""
+    return directory / "logins" / acct.login if acct.explicit_login else directory / acct.name
+
+
 def symbol_for(root: str, paper_symbol: str) -> str:
     """The paper session's NQZ6 becomes MNQZ6 (root MNQ) or stays NQZ6 (root NQ). Anything that is not
     NQ + month code (H M U Z) + one digit is refused: ConfigError."""
@@ -107,7 +138,35 @@ def _num(raw: dict, key: str, where: str, *, positive=True, required=True, defau
     return v
 
 
-def parse_account(raw: dict, idx: int) -> Account:
+def _check_prefix(prefix, where: str) -> None:
+    if not isinstance(prefix, str) or not PREFIX_RE.match(prefix):
+        raise ConfigError(f"{where}: secrets_prefix must be UPPER_SNAKE_CASE")
+    if prefix == "TRADOVATE" or prefix.startswith("TRADOVATE_"):
+        raise ConfigError(f"{where}: secrets_prefix must not be TRADOVATE (that is the paper feed's login)")
+
+
+def parse_logins(raw) -> dict[str, str]:
+    """login name -> secrets_prefix."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigError("logins must be a mapping of name -> {secrets_prefix}")
+    out: dict[str, str] = {}
+    for name, body in raw.items():
+        if not isinstance(name, str) or not NAME_RE.match(name):
+            raise ConfigError(f"logins: name {name!r} must be letters, digits, - or _")
+        where = f"login {name}"
+        if not isinstance(body, dict):
+            raise ConfigError(f"{where} must be a mapping")
+        unknown = set(body) - LOGIN_KNOWN
+        if unknown:
+            raise ConfigError(f"{where}: unknown key(s) {sorted(unknown)}")
+        _check_prefix(body.get("secrets_prefix"), where)
+        out[name] = body["secrets_prefix"]
+    return out
+
+
+def parse_account(raw: dict, idx: int, logins: dict[str, str] | None = None) -> Account:
     where = f"accounts[{idx}]"
     if not isinstance(raw, dict):
         raise ConfigError(f"{where} must be a mapping")
@@ -142,11 +201,19 @@ def parse_account(raw: dict, idx: int) -> Account:
     qty = _num(raw, "qty", where)
     if int(qty) != qty:
         raise ConfigError(f"{where}: qty must be a whole number")
-    prefix = raw.get("secrets_prefix")
-    if not isinstance(prefix, str) or not PREFIX_RE.match(prefix):
-        raise ConfigError(f"{where}: secrets_prefix must be UPPER_SNAKE_CASE")
-    if prefix == "TRADOVATE" or prefix.startswith("TRADOVATE_"):
-        raise ConfigError(f"{where}: secrets_prefix must not be TRADOVATE (that is the paper feed's login)")
+    logins = logins or {}
+    if "login" in raw and "secrets_prefix" in raw:
+        raise ConfigError(f"{where}: give login or secrets_prefix, not both")
+    if "login" in raw:
+        login = raw["login"]
+        if not isinstance(login, str) or login not in logins:
+            raise ConfigError(f"{where}: login {login!r} is not in logins")
+        prefix, explicit = logins[login], True
+    elif "secrets_prefix" in raw:
+        prefix, login, explicit = raw["secrets_prefix"], name, False
+        _check_prefix(prefix, where)
+    else:
+        raise ConfigError(f"{where}: needs login (a name from logins) or secrets_prefix")
     slip = raw.get("slip_ticks", DEFAULT_SLIP_TICKS)
     if isinstance(slip, bool) or not isinstance(slip, int) or slip < 0:
         raise ConfigError(f"{where}: slip_ticks must be a whole number")
@@ -155,7 +222,7 @@ def parse_account(raw: dict, idx: int) -> Account:
         daily_loss_limit=float(_num(raw, "daily_loss_limit", where)),
         daily_profit_stop=float(_num(raw, "daily_profit_stop", where)),
         commission=float(_num(raw, "commission", where, positive=False)),
-        secrets_prefix=prefix, slip_ticks=slip,
+        secrets_prefix=prefix, slip_ticks=slip, login=login, explicit_login=explicit,
         tp_points=_num(raw, "tp_points", where, required=False),
         sl_points=_num(raw, "sl_points", where, required=False))
 
@@ -166,23 +233,31 @@ def load(path: Path | None = None) -> CopyConfig:
     if not p.is_file():
         return CopyConfig()
     try:
-        doc = yaml.safe_load(p.read_text()) or {}
+        doc = yaml.load(p.read_text(), _StrictLoader) or {}  # noqa: S506  (a SafeLoader)
     except (OSError, yaml.YAMLError) as e:
         raise ConfigError(f"{p.name} unreadable: {type(e).__name__}") from None
     if not isinstance(doc, dict):
         raise ConfigError(f"{p.name} must be a mapping")
-    unknown = set(doc) - {"accounts", "kill_status_url", "port"}
+    unknown = set(doc) - {"accounts", "logins", "kill_status_url", "port"}
     if unknown:
         raise ConfigError(f"{p.name}: unknown key(s) {sorted(unknown)}")
     raw = doc.get("accounts") or []
     if not isinstance(raw, list):
         raise ConfigError("accounts must be a list")
-    accts = tuple(parse_account(r, i) for i, r in enumerate(raw))
-    for what, vals in (("name", [a.name for a in accts]), ("secrets_prefix", [a.secrets_prefix for a in accts]),
+    logins = parse_logins(doc.get("logins"))
+    accts = tuple(parse_account(r, i, logins) for i, r in enumerate(raw))
+    clash = {a.login for a in accts if not a.explicit_login} & set(logins)
+    if clash:
+        raise ConfigError(f"login name(s) {sorted(clash)} are also account names using secrets_prefix directly")
+    prefixes = dict(logins) | {a.login: a.secrets_prefix for a in accts if not a.explicit_login}   # one per login
+    for what, vals in (("name", [a.name for a in accts]), ("secrets_prefix", list(prefixes.values())),
                        ("account_id", [a.account_id for a in accts if a.account_id])):
         dup = {v for v in vals if vals.count(v) > 1}
         if dup:
             raise ConfigError(f"duplicate {what}: {sorted(dup)}")
+    for login, group in CopyConfig(accts).logins().items():
+        if len({a.env for a in group}) > 1:
+            raise ConfigError(f"login {login}: its accounts must share one env")
     port = doc.get("port", DEFAULT_PORT)
     if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
         raise ConfigError("port must be 1..65535")

@@ -1067,6 +1067,17 @@ def source_from_env(env=os.environ) -> str:
     return (env.get("TRADE_JEV_SOURCE") or "databento").strip().lower()
 
 
+def _early_halt_end(cfg: Config, day: str) -> Config:
+    """On a CME early-halt day, end decisions FLATTEN_BEFORE_HALT_MIN before the halt: the session end then
+    closes paper (and the copy accounts, via the eod intent) while the market still trades."""
+    end = tradingdays.session_end_et(day, cfg.end_et)
+    if end == cfg.end_et:
+        return cfg
+    print(f"{day}: CME halts early at {tradingdays.early_halt_et(day)} ET; decisions end {end} ET and the "
+          f"session closes then", flush=True)
+    return dataclasses.replace(cfg, end_et=end)
+
+
 def skip_reason(source: str, env=os.environ, explicit: bool = False) -> str | None:
     """Why today's live run must not start a feed (names only, never secret values), or None.
     TRADE_JEV_SOURCE=off is only a default: an explicit --source (`explicit`) wins over it."""
@@ -1137,6 +1148,7 @@ async def amain(argv: list[str] | None = None) -> int:
         if day not in days:
             ap.error(f"no recorded day {day}; have {sorted(days)}")
         symbol, path = days[day]
+        cfg = _early_halt_end(cfg, day)
         source = ParquetSource(path, args.speed)
         run_dir = None if args.no_save else new_run_dir("rehearsal", day)
     else:
@@ -1158,6 +1170,7 @@ async def amain(argv: list[str] | None = None) -> int:
                 paperdb.record_skip(f"live-{day}", day, symbol, "skipped", why,
                                     source="off" if why == "TRADE_JEV_SOURCE=off" else args.source)
             return 0
+        cfg = _early_halt_end(cfg, day)
         open_ns = et_to_ns(day, cfg.start_et) - secs(max(LOOKBACKS) + 60)
         start_ns = None
         if now_ns > open_ns:  # late start: intraday replay so the 60s look-back and streaks exist

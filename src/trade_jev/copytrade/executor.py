@@ -25,11 +25,12 @@ commission accrued at entry); the open trade is marked to the paper quote (bid f
 from __future__ import annotations
 
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from trade_jev.copytrade.broker import CONN_ERR, is_conn_error  # noqa: F401  (re-exported)
 from trade_jev.copytrade.config import Account, ConfigError, symbol_for
 from trade_jev.copytrade.ledger import Ledger, et_day
+from trade_jev import tradingdays
 from trade_jev.data import ET, TICK
 from trade_jev.executor.core import Executor, Limits
 
@@ -43,6 +44,7 @@ MARK_FRESH_S = 10.0
 QUOTE_FROZEN_S = 60.0     # an unchanged bid/ask this long is a frozen paper feed, not a mark
 EOD_FLATTEN_ET = "15:56:00"
 TEXT_CUTOFF_ET = "15:55:00"
+EARLY_EOD_LAG_S = 60           # early-halt day: flatten 1 min after paper's session end (as 15:56 follows 15:55)
 MAX_REJECTS = 3
 AUTO_RESUME_AFTER_S = 300.0    # continuous good fresh reads before a connection halt clears itself
 MAX_AUTO_RESUMES = 3           # per account per ET day
@@ -80,6 +82,14 @@ def validate_message(kind: str, msg) -> str | None:
 
 def _et_time(t_ns: int) -> str:
     return datetime.fromtimestamp(t_ns / 1e9, ET).strftime("%H:%M:%S")
+
+
+def eod_flatten_et(day: str) -> str:
+    """15:56 ET; on a CME early-halt day, 1 min after paper's early session end (12:46 for a 13:00 halt)."""
+    end = tradingdays.session_end_et(day, TEXT_CUTOFF_ET)
+    if end == TEXT_CUTOFF_ET:
+        return EOD_FLATTEN_ET
+    return (datetime.strptime(end, "%H:%M:%S") + timedelta(seconds=EARLY_EOD_LAG_S)).strftime("%H:%M:%S")
 
 
 class CopyExecutor(Executor):
@@ -448,8 +458,9 @@ class CopyExecutor(Executor):
                                  exit_reason="daily_stop")
 
     async def _eod_guard(self) -> None:
-        """From 15:56 ET until flat: flatten and sweep. A transient read error retries on the next tick."""
-        if _et_time(self.now_ns()) < EOD_FLATTEN_ET or self._eod_done == self.day:
+        """From 15:56 ET (earlier on a CME early-halt day) until flat: flatten and sweep. A transient read error
+        retries on the next tick."""
+        if _et_time(self.now_ns()) < eod_flatten_et(self.day) or self._eod_done == self.day:
             return
         try:
             pos = await self._position(True)
@@ -534,7 +545,7 @@ class CopyExecutor(Executor):
         if why:
             return f"skipped: {why}"
         et = _et_time(int(msg["t_ns"]))
-        if not (self.lim.session_start_et <= et < self.lim.session_end_et):
+        if not (self.lim.session_start_et <= et < tradingdays.session_end_et(self.day, self.lim.session_end_et)):
             return f"skipped: outside session ({et} ET)"
         if self.entries >= self.lim.max_orders:
             await self.halt_day("day", f"max {self.lim.max_orders} entries reached")
@@ -710,7 +721,7 @@ class CopyExecutor(Executor):
                 except Exception:  # noqa: BLE001
                     return
                 if pos.side:
-                    late = _et_time(self.now_ns()) >= TEXT_CUTOFF_ET
+                    late = _et_time(self.now_ns()) >= tradingdays.session_end_et(self.day, TEXT_CUTOFF_ET)
                     await self._flatten("heartbeat lost", "link_lost", notify=not late)
                 return
             await self._eod_guard()

@@ -59,6 +59,18 @@ MISSING_AFTER = time(9, 35)  # no session row by this time on a trading day = do
 CHECK_FROM = time(9, 31)
 CHECK_UNTIL = time(15, 50)
 EOD = time(15, 55)
+# CME 13:15 ET early halts on NYSE trading days (trade_jev.tradingdays.EARLY_HALTS; the 13:00 halts fall on
+# NYSE_HOLIDAYS): the runner ends 15 min before the halt, so the window and EOD move with it.
+EARLY_EOD = {"2026-11-27": time(13, 0), "2026-12-24": time(13, 0), "2027-11-26": time(13, 0)}
+
+
+def eod_for(day: str) -> time:
+    return EARLY_EOD.get(day, EOD)
+
+
+def check_until_for(day: str) -> time:
+    e = eod_for(day)
+    return CHECK_UNTIL if e == EOD else (datetime.combine(date.min, e) - timedelta(minutes=5)).time()
 STALL_S = 120  # a running session whose last decision is older than this is stalled (normally every 15 s)
 GRACE_S = 360  # a new session (or the open) gets this long to log its first decision (3m42s seen live)
 CATCH_UP_MAX_S = 2700  # a late start's catch-up replay longer than this (45 min) is judged stalled
@@ -1068,8 +1080,9 @@ def session_check(cfg: Config, now: datetime) -> dict[str, Any]:
     day = et.date().isoformat()
     if not is_trading_day(et.date(), cfg):
         return {"problem": None, "why": "not a trading day"}
-    if not CHECK_FROM <= et.time() <= CHECK_UNTIL:
-        return {"problem": None, "why": "outside the session window (09:31-15:50 ET)"}
+    until = check_until_for(day)
+    if not CHECK_FROM <= et.time() <= until:
+        return {"problem": None, "why": f"outside the session window (09:31-{until:%H:%M} ET)"}
     if _stopped_today(day):
         return {"problem": None, "why": "stopped on purpose today (trade_jev_stop)"}
     try:
@@ -1185,7 +1198,7 @@ def cmd_recover(cfg: Config, now: datetime) -> dict[str, Any]:
     problem = chk["problem"]
     if not problem:
         return {"restarted": False, "summary": f"nothing to do: {chk['why']}"}
-    if now.astimezone(ET).time() >= EOD:  # session_check's window already ends before EOD
+    if now.astimezone(ET).time() >= eod_for(now.astimezone(ET).date().isoformat()):  # window ends before it
         return {"restarted": False, "summary": "nothing to do: after EOD"}
     day = now.astimezone(ET).date().isoformat()
     done = _recover_state(day)

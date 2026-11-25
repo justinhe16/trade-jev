@@ -74,6 +74,7 @@ def test_trading_days_skip_weekends_and_full_closures():
     assert tradingdays.is_trading_day(date(2026, 11, 26))                 # Thanksgiving: CME trades till 13:00 ET
     assert all(date.fromisoformat(d).weekday() < 5 for d in tradingdays.FULL_CLOSURES)
     assert {date.fromisoformat(d).year for d in tradingdays.FULL_CLOSURES} == tradingdays.COVERED_YEARS
+    assert tradingdays.covered("2027-06-01") and not tradingdays.covered("2028-01-03")
 
 
 def test_early_halts_end_the_session_15_minutes_before_the_halt():
@@ -92,7 +93,6 @@ def test_live_cfg_ends_early_on_an_early_halt_day():
     cfg = live.Config()
     assert live._early_halt_end(cfg, "2026-11-26").end_et == "12:45:00"
     assert live._early_halt_end(cfg, "2026-11-30") is cfg
-    assert tradingdays.covered("2027-06-01") and not tradingdays.covered("2028-01-03")
 
 
 # ---------------------------------------------------------------- paper DB

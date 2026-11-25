@@ -135,6 +135,12 @@ def test_health_ok_outside_the_window(db: PaperDB, hm: str) -> None:
     assert code == 0 and out["summary"] == "ok: outside the session window (09:31-15:50 ET)"
 
 
+def test_health_window_ends_early_on_a_cme_early_halt_day(db: PaperDB) -> None:
+    running(db, "2026-11-27", hb="12:40", last="12:40")  # paper closed at 13:00 for the 13:15 halt
+    code, out = health(et("2026-11-27", "13:05"))
+    assert code == 0 and out["summary"] == "ok: outside the session window (09:31-12:55 ET)"
+
+
 @pytest.mark.parametrize("day", [SAT, THANKSGIVING])
 def test_health_ok_on_weekend_and_holiday(data_dir: Path, day: str) -> None:
     code, out = health(et(day, "11:00"))

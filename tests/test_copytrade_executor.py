@@ -824,3 +824,38 @@ def test_a_stop_breached_during_the_outage_halts_again_instead_of_resuming(tmp_p
     r.run(r.ex.halt_day("connection", "can't confirm flat: URLError"))
     tick(r, 5, 62)
     assert r.ex.halt_kind == "day" and not r.events("auto_resume")
+
+
+# ---------------------------------------------------------------- CME early-halt days (MFF does not auto-liquidate)
+
+THANKSGIVING = "2026-11-26"   # CME equity futures halt 13:00 ET
+
+
+def test_early_halt_day_flattens_before_the_halt(tmp_path):
+    r = Rig(tmp_path, clock=Clock("12:30:00", day=THANKSGIVING))
+    r.start()
+    r.intent(1, 1, t_ns=et_to_ns(THANKSGIVING, "12:30:00"))
+    assert r.br.pos.side == 1
+    r.clk.advance(15 * 60)                                    # 12:45:00: paper's session end, not yet the eod guard
+    r.hb(seq_last=1, target=1)
+    assert r.br.pos.side == 1
+    r.clk.advance(65)                                         # 12:46:05
+    r.hb(seq_last=1, target=1)
+    assert r.br.pos.side == 0 and r.trades()[0]["exit_reason"] == "eod"
+    assert ("sweep",) in r.br.calls
+
+
+def test_early_halt_day_refuses_entries_after_the_early_end(tmp_path):
+    r = Rig(tmp_path, clock=Clock("12:50:00", day=THANKSGIVING))
+    r.start()
+    assert r.intent(1, 1, t_ns=et_to_ns(THANKSGIVING, "12:50:00"))["result"].startswith("skipped: outside session")
+    assert r.br.pos.side == 0
+
+
+def test_normal_day_keeps_the_1556_flatten(tmp_path):
+    r = Rig(tmp_path, hm="12:50:00")
+    r.start()
+    r.intent(1, 1, t_ns=et_to_ns(DAY, "12:50:00"))
+    r.clk.advance(60)
+    r.hb(seq_last=1, target=1)
+    assert r.br.pos.side == 1

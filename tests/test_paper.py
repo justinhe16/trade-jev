@@ -77,6 +77,24 @@ def test_trading_days_skip_weekends_and_full_closures():
     assert tradingdays.covered("2027-06-01") and not tradingdays.covered("2028-01-03")
 
 
+def test_early_halts_end_the_session_15_minutes_before_the_halt():
+    assert tradingdays.early_halt_et("2026-11-26") == "13:00:00"                       # Thanksgiving
+    assert tradingdays.session_end_et("2026-11-26", "15:55:00") == "12:45:00"
+    assert tradingdays.session_end_et("2026-11-27", "15:55:00") == "13:00:00"          # day after: 13:15 halt
+    assert tradingdays.session_end_et("2026-12-24", "15:55:00") == "13:00:00"          # Christmas Eve
+    assert tradingdays.session_end_et("2026-11-30", "15:55:00") == "15:55:00"          # normal Monday
+    assert tradingdays.session_end_et("2026-11-26", "12:00:00") == "12:00:00"          # an earlier end wins
+    assert not set(tradingdays.EARLY_HALTS) & set(tradingdays.FULL_CLOSURES)
+    assert all(tradingdays.is_trading_day(d) for d in tradingdays.EARLY_HALTS)
+    assert {date.fromisoformat(d).year for d in tradingdays.EARLY_HALTS} == tradingdays.COVERED_YEARS
+
+
+def test_live_cfg_ends_early_on_an_early_halt_day():
+    cfg = live.Config()
+    assert live._early_halt_end(cfg, "2026-11-26").end_et == "12:45:00"
+    assert live._early_halt_end(cfg, "2026-11-30") is cfg
+
+
 # ---------------------------------------------------------------- paper DB
 
 def test_schema_is_exact_and_wal(db):
